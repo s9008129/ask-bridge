@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use mcp_cli::{McpClient, McpConnection, ServerConfig, StdioClient};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,11 +11,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 const ASK_BRIDGE_CHROME_MARKER: &str = "--ask-bridge-instance";
+const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
+const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginState {
@@ -425,7 +429,7 @@ fn parse_chatgpt_agent_prompt(prompt: &str) -> Option<ChatGptAgentPrompt<'_>> {
 
 #[derive(Parser)]
 #[command(name = "ask-bridge")]
-#[command(version = "0.2.8")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(disable_version_flag = true)]
 #[command(about = "AI browser CLI - Ask ChatGPT, Gemini or Claude from your Terminal with your subscription", long_about = None)]
 struct Cli {
@@ -446,8 +450,19 @@ struct Cli {
     headless: bool,
 
     /// Create a brand new provider session by opening a new tab and closing old ones.
+    /// This is retained for backwards compatibility and is destructive.
     #[arg(long, default_value_t = false)]
     new: bool,
+
+    /// Create an isolated provider tab while preserving every tab that existed
+    /// before this invocation. Requires a UUID session id for ownership and
+    /// receipt verification.
+    #[arg(long, conflicts_with = "new")]
+    new_tab_preserve_existing: bool,
+
+    /// UUID used to name and verify the isolated session receipt.
+    #[arg(long, value_name = "UUID", requires = "new_tab_preserve_existing")]
+    session_id: Option<String>,
 
     /// Print version information.
     #[arg(
@@ -494,6 +509,12 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Commands {
+    /// Print the machine-readable capabilities of this binary.
+    Capabilities {
+        /// Emit a JSON capability document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Open Chrome browser, optionally navigate to a URL, and copy the latest response
     #[command(hide = true)]
     Open {
@@ -511,6 +532,13 @@ enum Commands {
     },
     /// Open Chrome browser and wait for manual login
     Login,
+    /// Verify the current provider session without sending a prompt.
+    #[command(name = "session-probe")]
+    SessionProbe {
+        /// Emit a machine-readable authentication result.
+        #[arg(long)]
+        json: bool,
+    },
     /// Close the managed Chrome browser instance
     Close,
     /// Set or show the global default provider used when --provider is not specified.
@@ -535,6 +563,223 @@ fn config_file_path() -> Result<PathBuf, String> {
     let mut config_path = home::home_dir().ok_or("Could not locate home directory")?;
     config_path.push(".config/ask-bridge/config.json");
     Ok(config_path)
+}
+
+fn ask_bridge_state_dir() -> Result<PathBuf, String> {
+    let mut path = home::home_dir().ok_or("Could not locate home directory")?;
+    path.push(".config/ask-bridge");
+    Ok(path)
+}
+
+fn session_receipts_dir() -> Result<PathBuf, String> {
+    Ok(ask_bridge_state_dir()?.join("sessions"))
+}
+
+fn session_receipt_path(session_id: &str) -> Result<PathBuf, String> {
+    let session_id = validate_session_id(session_id)?;
+    Ok(session_receipts_dir()?.join(format!("{}.json", session_id)))
+}
+
+fn provider_lease_path(provider: Provider) -> Result<PathBuf, String> {
+    Ok(ask_bridge_state_dir()?.join(format!("{}.lease", provider)))
+}
+
+fn validate_session_id(value: &str) -> Result<String, String> {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.to_string())
+        .map_err(|_| "session id 必須是有效 UUID".to_string())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SessionReceipt {
+    schema_version: u8,
+    capability: String,
+    session_id: String,
+    provider: String,
+    owned_page_id: usize,
+    pid: u32,
+    created_at_unix_seconds: u64,
+}
+
+struct ProviderLease {
+    file: std::fs::File,
+    _path: PathBuf,
+}
+
+impl Drop for ProviderLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn acquire_provider_lease(provider: Provider, session_id: &str) -> Result<ProviderLease, String> {
+    let path = provider_lease_path(provider)?;
+    acquire_provider_lease_at(&path, provider, session_id)
+}
+
+fn acquire_provider_lease_at(
+    path: &Path,
+    provider: Provider,
+    session_id: &str,
+) -> Result<ProviderLease, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("無法建立 ask-bridge lease 目錄：{}", error))?;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("無法開啟 {}：{}", path.display(), error))?;
+    file.try_lock_exclusive().map_err(|_| {
+        format!(
+            "{} 目前已有另一個 ask-bridge 工作；請等待該工作完成後再試",
+            provider.display_name()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("無法設定 ask-bridge lease 權限：{}", error))?;
+    }
+
+    let record = serde_json::json!({
+        "pid": std::process::id(),
+        "provider": provider.to_string(),
+        "session_id": validate_session_id(session_id)?,
+    });
+    let content = serde_json::to_vec(&record)
+        .map_err(|error| format!("無法序列化 ask-bridge lease：{}", error))?;
+    file.set_len(0)
+        .map_err(|error| format!("無法清理 ask-bridge lease：{}", error))?;
+    (&file)
+        .write_all(&content)
+        .map_err(|error| format!("無法寫入 ask-bridge lease：{}", error))?;
+    file.sync_all()
+        .map_err(|error| format!("無法同步 ask-bridge lease：{}", error))?;
+
+    Ok(ProviderLease {
+        file,
+        _path: path.to_path_buf(),
+    })
+}
+
+fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("無法判定 receipt 目錄：{}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("無法建立 receipt 目錄：{}", error))?;
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let content = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("無法序列化 session receipt：{}", error))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|error| format!("無法建立暫存 receipt：{}", error))?;
+        file.write_all(&content)
+            .map_err(|error| format!("無法寫入 session receipt：{}", error))?;
+        file.sync_all()
+            .map_err(|error| format!("無法同步 session receipt：{}", error))?;
+        std::fs::rename(&temp_path, path)
+            .map_err(|error| format!("無法原子發布 session receipt：{}", error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("無法設定 session receipt 權限：{}", error))?;
+        }
+        Ok::<(), String>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_session_receipt(
+    session_id: &str,
+    provider: Provider,
+    page_id: usize,
+) -> Result<PathBuf, String> {
+    let session_id = validate_session_id(session_id)?;
+    let path = session_receipt_path(&session_id)?;
+    if path.exists() {
+        return Err(
+            "session receipt 已存在；請使用新的 UUID，避免重用舊分頁 ownership".to_string(),
+        );
+    }
+    let created_at_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let receipt = SessionReceipt {
+        schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+        capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+        session_id,
+        provider: provider.to_string(),
+        owned_page_id: page_id,
+        pid: std::process::id(),
+        created_at_unix_seconds,
+    };
+    write_private_json(&path, &receipt)?;
+    let persisted: SessionReceipt = serde_json::from_slice(
+        &std::fs::read(&path).map_err(|error| format!("無法讀回 session receipt：{}", error))?,
+    )
+    .map_err(|error| format!("session receipt 驗證失敗：{}", error))?;
+    if persisted != receipt {
+        return Err("session receipt 驗證失敗：內容與本次工作不一致".to_string());
+    }
+    Ok(path)
+}
+
+fn capabilities_value() -> Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [ISOLATED_NEW_TAB_CAPABILITY],
+        "isolated_new_tab_v1": {
+            "flag": "--new-tab-preserve-existing",
+            "session_id_flag": "--session-id",
+            "receipt": "0600-json",
+            "ownership": "exact-page-id",
+            "lease": "provider-scoped-cross-process"
+        }
+    })
+}
+
+fn print_capabilities(json_output: bool) -> Result<(), String> {
+    let value = capabilities_value();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&value)
+                .map_err(|error| format!("無法輸出 capabilities：{}", error))?
+        );
+    } else {
+        println!("ask-bridge capabilities");
+        println!("  {}", ISOLATED_NEW_TAB_CAPABILITY);
+        println!("  safe flag: --new-tab-preserve-existing");
+    }
+    Ok(())
 }
 
 fn parse_configured_provider(content: &str) -> Result<Option<Provider>, String> {
@@ -725,6 +970,18 @@ struct Page {
     url: String,
     selected: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedPageBinding {
+    session_id: String,
+    page_id: usize,
+}
+
+/// A safe invocation has exactly one browser page that it may mutate. The
+/// binding is process-local and is enforced again before every page-bound MCP
+/// call, so a manually selected tab or a second legacy invocation cannot turn
+/// a request into a different-tab mutation.
+static OWNED_PAGE_BINDING: std::sync::Mutex<Option<OwnedPageBinding>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Copy, Debug)]
 struct PageLoginState {
@@ -1869,7 +2126,7 @@ fn mcp_error_is_transport(message: &str) -> bool {
         || lower.contains("failed to start chrome-devtools mcp server")
 }
 
-fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+fn call_mcp_tool_raw(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
     let _stderr_guard = if FORWARD_MCP_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
         None
     } else {
@@ -1895,6 +2152,73 @@ fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, St
             Err(error)
         }
     }
+}
+
+fn bind_owned_page(session_id: &str, page_id: usize) -> Result<(), String> {
+    let session_id = validate_session_id(session_id)?;
+    let mut binding = OWNED_PAGE_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if binding.is_some() {
+        return Err("本程序已有 active owned page；不得覆寫分頁 ownership".to_string());
+    }
+    *binding = Some(OwnedPageBinding {
+        session_id,
+        page_id,
+    });
+    Ok(())
+}
+
+fn clear_owned_page() {
+    let mut binding = OWNED_PAGE_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *binding = None;
+}
+
+fn owned_page_binding() -> Option<OwnedPageBinding> {
+    OWNED_PAGE_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn page_bound_mcp_tool(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "list_pages" | "new_page" | "select_page" | "close_page"
+    )
+}
+
+fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+    if let Some(binding) = owned_page_binding() {
+        if tool == "close_page" || tool == "new_page" {
+            return Err(format!(
+                "isolated session {} 不允許 {}，以免破壞既有或未受管頁籤",
+                binding.session_id, tool
+            ));
+        }
+        if tool == "select_page" {
+            let requested_page_id = args.get("pageId").and_then(Value::as_u64);
+            if requested_page_id != Some(binding.page_id as u64) {
+                return Err(format!(
+                    "isolated session {} 只能選取 owned page ID {}",
+                    binding.session_id, binding.page_id
+                ));
+            }
+        }
+        if page_bound_mcp_tool(tool) {
+            call_mcp_tool_raw(
+                config_path,
+                "select_page",
+                serde_json::json!({
+                    "pageId": binding.page_id,
+                    "bringToFront": false
+                }),
+            )?;
+        }
+    }
+    call_mcp_tool_raw(config_path, tool, args)
 }
 
 fn parse_pages(text: &str) -> Vec<Page> {
@@ -2065,6 +2389,150 @@ fn validate_provider_feature_support(provider: Provider, cli: &Cli) -> Result<()
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declares_isolated_capability_and_parses_safe_flags() {
+        let capabilities = capabilities_value();
+        assert_eq!(
+            capabilities["capabilities"][0].as_str(),
+            Some(ISOLATED_NEW_TAB_CAPABILITY)
+        );
+        assert_eq!(
+            capabilities["isolated_new_tab_v1"]["flag"].as_str(),
+            Some("--new-tab-preserve-existing")
+        );
+        assert!(
+            capabilities["version"]
+                .as_str()
+                .unwrap()
+                .contains("preserve")
+        );
+
+        let cli = Cli::try_parse_from([
+            "ask-bridge",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(cli.new_tab_preserve_existing);
+        assert_eq!(
+            cli.session_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ask-bridge",
+                "--session-id",
+                "00000000-0000-4000-8000-000000000001",
+                "prompt"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ask-bridge",
+                "--new",
+                "--new-tab-preserve-existing",
+                "--session-id",
+                "00000000-0000-4000-8000-000000000001",
+                "prompt",
+            ])
+            .is_err()
+        );
+        let probe = Cli::try_parse_from(["ask-bridge", "session-probe", "--json"]).unwrap();
+        assert!(matches!(
+            probe.command,
+            Some(Commands::SessionProbe { json: true })
+        ));
+    }
+
+    #[test]
+    fn private_session_receipt_is_atomic_and_mode_600_on_unix() {
+        let root = std::env::temp_dir().join(format!("ask-bridge-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("receipt.json");
+        let receipt = SessionReceipt {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+            session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            provider: "chatgpt".to_string(),
+            owned_page_id: 42,
+            pid: 123,
+            created_at_unix_seconds: 1,
+        };
+        write_private_json(&path, &receipt).unwrap();
+        let persisted: SessionReceipt =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted, receipt);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_lease_is_exclusive_and_private() {
+        let root = std::env::temp_dir().join(format!("ask-bridge-lease-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("chatgpt.lease");
+        let first = acquire_provider_lease_at(
+            &path,
+            Provider::ChatGpt,
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .unwrap();
+        assert!(
+            acquire_provider_lease_at(
+                &path,
+                Provider::ChatGpt,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(first);
+        let second = acquire_provider_lease_at(
+            &path,
+            Provider::ChatGpt,
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .unwrap();
+        drop(second);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn isolated_binding_rejects_other_page_mutations_and_close() {
+        clear_owned_page();
+        bind_owned_page("00000000-0000-4000-8000-000000000001", 7).unwrap();
+        assert_eq!(owned_page_binding().unwrap().page_id, 7);
+        assert!(bind_owned_page("00000000-0000-4000-8000-000000000002", 8).is_err());
+        assert!(call_mcp_tool("unused", "close_page", serde_json::json!({"pageId": 2})).is_err());
+        assert!(
+            call_mcp_tool(
+                "unused",
+                "new_page",
+                serde_json::json!({"url": "https://example.test"})
+            )
+            .is_err()
+        );
+        assert!(call_mcp_tool("unused", "select_page", serde_json::json!({"pageId": 8})).is_err());
+        clear_owned_page();
+    }
 
     #[test]
     fn validates_chrome_devtools_mcp_node_versions() {
@@ -4987,6 +5455,107 @@ fn submit_prompt_to_provider(
     submit_regular_prompt(config_path, provider, prompt)
 }
 
+fn list_pages(config_path: &str) -> Result<Vec<Page>, String> {
+    let list_res = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))?;
+    let text = list_res
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|array| array.first())
+        .and_then(|object| object.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Invalid list_pages response structure: {:?}", list_res))?;
+    Ok(parse_pages(text))
+}
+
+fn ensure_isolated_provider_tab(
+    config_path: &str,
+    provider: Provider,
+    session_id: &str,
+    headless: bool,
+    verbose: bool,
+) -> Result<usize, String> {
+    let session_id = validate_session_id(session_id)?;
+    clear_owned_page();
+    let existing_pages = list_pages(config_path)?;
+    let existing_ids: std::collections::HashSet<usize> =
+        existing_pages.iter().map(|page| page.id).collect();
+
+    if verbose {
+        println!(
+            "Opening an isolated {} tab; preserving {} existing tab(s)...",
+            provider.display_name(),
+            existing_pages.len()
+        );
+    }
+    // Use the raw call while the new page is not owned yet. Once the new page
+    // id is established, call_mcp_tool enforces the exact binding.
+    call_mcp_tool_raw(
+        config_path,
+        "new_page",
+        serde_json::json!({"url": provider.home_url()}),
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut candidate_id: Option<usize> = None;
+    while Instant::now() < deadline {
+        let pages = list_pages(config_path)?;
+        if candidate_id.is_none() {
+            let new_ids: Vec<usize> = pages
+                .iter()
+                .filter(|page| !existing_ids.contains(&page.id))
+                .map(|page| page.id)
+                .collect();
+            if new_ids.len() > 1 {
+                return Err(
+                    "isolated_new_tab_v1 找到多個未預期的新 page ID；停止以避免誤選分頁"
+                        .to_string(),
+                );
+            }
+            candidate_id = new_ids.first().copied();
+        }
+
+        let Some(page_id) = candidate_id else {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        };
+        let Some(page) = pages.iter().find(|page| page.id == page_id) else {
+            return Err("owned page 在分頁清單中消失；停止，不重用其他分頁".to_string());
+        };
+        if !provider.owns_url(&page.url) {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        call_mcp_tool_raw(
+            config_path,
+            "select_page",
+            serde_json::json!({
+                "pageId": page_id,
+                "bringToFront": !headless
+            }),
+        )?;
+        bind_owned_page(&session_id, page_id)?;
+        if let Err(error) = write_session_receipt(&session_id, provider, page_id) {
+            clear_owned_page();
+            return Err(error);
+        }
+        if verbose {
+            println!(
+                "Owned {} page ID {} for session {}.",
+                provider.display_name(),
+                page_id,
+                session_id
+            );
+        }
+        return Ok(page_id);
+    }
+
+    Err(format!(
+        "Timeout waiting for an exact new {} page; no existing tab was reused",
+        provider.display_name()
+    ))
+}
+
 fn ensure_provider_tab(
     config_path: &str,
     provider: Provider,
@@ -5456,12 +6025,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(Commands::Capabilities { json }) = &cli.command {
+        print_capabilities(*json).map_err(|error| format!("Capabilities failed: {}", error))?;
+        return Ok(());
+    }
+
     let provider = match resolve_provider(cli.provider) {
         Ok(provider) => provider,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
+    };
+
+    let safe_session_id = if cli.new_tab_preserve_existing {
+        Some(
+            cli.session_id
+                .as_deref()
+                .ok_or_else(|| "--new-tab-preserve-existing 必須搭配 --session-id".to_string())
+                .and_then(validate_session_id)?,
+        )
+    } else {
+        None
+    };
+    if safe_session_id.is_some() && cli.command.is_some() {
+        return Err(
+            "--new-tab-preserve-existing 只支援直接送出 prompt；subcommand 不會啟用安全分頁模式"
+                .into(),
+        );
+    }
+    // Keep the lease alive for the entire invocation, including attachment
+    // upload and response polling. Unlocking earlier would let another
+    // process steal the selected page between two MCP calls.
+    let _provider_lease = if let Some(session_id) = safe_session_id.as_deref() {
+        Some(acquire_provider_lease(provider, session_id)?)
+    } else {
+        None
     };
 
     if let Err(e) = validate_provider_feature_support(provider, &cli) {
@@ -5681,9 +6280,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
+            Commands::SessionProbe { json } => {
+                let provider_name = match provider {
+                    Provider::ChatGpt => "chatgpt",
+                    Provider::Gemini => "gemini",
+                    Provider::Claude => "claude",
+                };
+                let (authenticated, state) =
+                    match ensure_provider_tab(&config_path, provider, false, is_headless, false) {
+                        Ok(()) => match check_login_status(&config_path, provider, false) {
+                            Ok(LoginState::LoggedIn) => (true, "logged_in"),
+                            Ok(LoginState::LoggedOut) => (false, "logged_out"),
+                            Ok(LoginState::Unknown) => (false, "unknown"),
+                            Err(_) => (false, "unknown"),
+                        },
+                        Err(_) => (false, "unknown"),
+                    };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "authenticated": authenticated,
+                            "state": state,
+                            "provider": provider_name,
+                        })
+                    );
+                } else if authenticated {
+                    println!("{} session probe: authenticated", provider.display_name());
+                } else {
+                    println!(
+                        "{} session probe: authentication not confirmed",
+                        provider.display_name()
+                    );
+                }
+                if !authenticated {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             Commands::Close => unreachable!("close command is handled before Chrome startup"),
             Commands::Config => unreachable!("config command is handled before Chrome startup"),
             Commands::Update => unreachable!("update command is handled before Chrome startup"),
+            Commands::Capabilities { .. } => {
+                unreachable!("capabilities is handled before Chrome startup")
+            }
             Commands::Dump => {
                 let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
                 println!("All pages: {:?}", list_res);
@@ -5797,13 +6437,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    if let Err(e) = ensure_provider_tab(
-        &config_path,
-        provider,
-        cli.new,
-        is_headless,
-        command_verbose,
-    ) {
+    let tab_result = if let Some(session_id) = safe_session_id.as_deref() {
+        ensure_isolated_provider_tab(
+            &config_path,
+            provider,
+            session_id,
+            is_headless,
+            command_verbose,
+        )
+        .map(|_| ())
+    } else {
+        ensure_provider_tab(
+            &config_path,
+            provider,
+            cli.new,
+            is_headless,
+            command_verbose,
+        )
+    };
+    if let Err(e) = tab_result {
         eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
         std::process::exit(1);
     }

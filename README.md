@@ -203,6 +203,35 @@ ask-bridge "誰是保哥？" --new
 
 此模式會開啟新的所選 provider 分頁，並清理先前同一 provider 的分頁。
 
+`--new` 是為了相容舊版而保留的 destructive 行為。若要建立新分頁並保留
+所有 invocation 開始前已存在的分頁，請使用安全模式：
+
+```bash
+SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+ask-bridge --provider chatgpt \
+  --new-tab-preserve-existing --session-id "$SESSION_ID" \
+  "請整理這份附件。" --file transcript.md
+```
+
+安全模式會以精確 page ID 綁定本次新分頁，並在
+`~/.config/ask-bridge/sessions/<session-id>.json` 寫入權限為 `0600` 的
+session receipt。它不會關閉 ChatGPT、Gemini 或其他既有分頁；同一 provider
+的另一個安全模式程序若正在執行，會因跨程序 lease 而 fail-closed。此模式
+要求有效 UUID，且只支援直接送出 prompt，不會套用到 debug subcommand。
+
+整合工具應先檢查機器可讀能力宣告：
+
+```bash
+ask-bridge capabilities --json
+```
+
+只有輸出包含 `isolated_new_tab_v1` 才能啟用上述安全模式。登入後可用唯讀
+session probe 驗證目前登入狀態，不會送出 prompt：
+
+```bash
+ask-bridge session-probe --provider chatgpt --json
+```
+
 ### 4. Headless 模式
 
 一般提問預設使用 headless Chrome，也就是 `--headless=true`。Chrome 會在背景執行，不會搶走焦點或跳出視窗。
