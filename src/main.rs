@@ -5489,7 +5489,12 @@ fn build_typed_attachment_probe_script(
             composer.parentElement?.parentElement?.parentElement ||
             composer.parentElement ||
             document.body;
+        // ChatGPT file attachments use class "group/file-tile" (and legacy
+        // data-testid/class patterns).  Each tile's textContent contains the
+        // filename.  Image tiles contain an <img> with positive natural
+        // dimensions but no filename text.
         const docSelector = [
+            '[class*="file-tile"]',
             '[data-testid*="file-chip"]',
             '[data-testid*="file-pill"]',
             '[data-testid*="file-preview"]',
@@ -5499,7 +5504,11 @@ fn build_typed_attachment_probe_script(
             '[class*="file-preview"]',
             '[class*="file-thumbnail"]'
         ].join(',');
-        const docCandidates = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
+        const allTiles = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
+        // Only keep tiles that are leaf-level (no child tile inside them).
+        const docCandidates = allTiles.filter((t) =>
+            !allTiles.some((o) => o !== t && t.contains(o))
+        );
         const textFor = (el) => [
             el.innerText, el.textContent,
             el.getAttribute('aria-label'), el.getAttribute('title')
@@ -5509,6 +5518,9 @@ fn build_typed_attachment_probe_script(
             expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
         }
         const observedCounts = new Map();
+        let documentCount = 0;
+        // A tile counts as a document if its text contains one of the
+        // expected filenames.  Otherwise it's an image tile.
         for (const candidate of docCandidates) {
             const text = textFor(candidate);
             const matches = Array.from(expectedCounts.keys())
@@ -5516,11 +5528,11 @@ fn build_typed_attachment_probe_script(
                 .sort((a, b) => b.length - a.length);
             if (matches.length > 0) {
                 const name = matches[0];
-                observedCounts.set(name, (observedCounts.get(name) || 0) + 1);
+                const prev = observedCounts.get(name) || 0;
+                observedCounts.set(name, prev + 1);
+                documentCount += 1;
             }
         }
-        let documentCount = 0;
-        for (const [, count] of observedCounts) documentCount += Math.min(count, 1);
         // Count image previews: visible <img> inside the composer root with
         // positive natural dimensions.  These are the ChatGPT image-attachment
         // thumbnails that do not expose a filename.
@@ -7966,6 +7978,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(summary) => {
                 if let Some(ref probe) = summary {
                     if let Some(path) = receipt_path.as_deref() {
+                        // Drive the receipt state machine first so the
+                        // additive attachment_probe fields are preserved by
+                        // the subsequent write_attachment_probe_receipt call.
+                        let _ = record_session_receipt_event(
+                            path,
+                            SessionReceiptEvent::AttachmentsVerified,
+                        );
                         let _ = write_attachment_probe_receipt(path, probe);
                     }
                     println!(
@@ -7973,6 +7992,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         probe.expected_documents, probe.expected_images
                     );
                 } else {
+                    // Documents-only path: still record the verified event.
+                    if let Some(path) = receipt_path.as_deref() {
+                        let _ = record_session_receipt_event(
+                            path,
+                            SessionReceiptEvent::AttachmentsVerified,
+                        );
+                    }
                     println!("Attachments verified (documents only).");
                 }
                 std::process::exit(0);
