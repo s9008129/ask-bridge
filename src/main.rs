@@ -19,6 +19,7 @@ use std::os::windows::process::CommandExt;
 const ASK_BRIDGE_CHROME_MARKER: &str = "--ask-bridge-instance";
 const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
 const VERIFIED_FILE_UPLOAD_CAPABILITY: &str = "verified_file_upload_v1";
+const VERIFIED_MIXED_ATTACHMENT_CAPABILITY: &str = "verified_mixed_attachment_upload_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -510,6 +511,12 @@ struct Cli {
     /// Matching is case- and punctuation-insensitive.
     #[arg(long = "model", value_name = "MODEL")]
     model: Option<String>,
+
+    /// Upload and verify attachments in an isolated tab without typing or
+    /// submitting a prompt.  Exits 0 on verified, non-zero on attachment
+    /// failure.  Receipt prompt_submission stays not_started.
+    #[arg(long = "verify-attachments-only", default_value_t = false)]
+    verify_attachments_only: bool,
 }
 
 #[derive(Subcommand, Clone)]
@@ -833,6 +840,25 @@ fn read_session_receipt(path: &Path) -> Result<SessionReceipt, String> {
     Ok(receipt)
 }
 
+fn write_attachment_probe_receipt(
+    path: &Path,
+    probe: &AttachmentProbeSummary,
+) -> Result<(), String> {
+    let receipt = read_session_receipt(path)?;
+    // attachment_probe is an additive field; prompt_submission stays
+    // not_started for the verify-attachments-only mode.
+    let mut json =
+        serde_json::to_value(&receipt).map_err(|error| format!("無法序列化 receipt：{}", error))?;
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "attachment_probe".to_string(),
+            serde_json::to_value(probe).unwrap_or_default(),
+        );
+    }
+    write_private_json(path, &json)?;
+    Ok(())
+}
+
 fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     match event {
@@ -908,7 +934,8 @@ fn capabilities_value() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": [
             ISOLATED_NEW_TAB_CAPABILITY,
-            VERIFIED_FILE_UPLOAD_CAPABILITY
+            VERIFIED_FILE_UPLOAD_CAPABILITY,
+            VERIFIED_MIXED_ATTACHMENT_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -923,6 +950,17 @@ fn capabilities_value() -> Value {
             "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
             "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
             "submit_before_verified": false
+        },
+        "verified_mixed_attachment_upload_v1": {
+            "verification": "typed-document-image-stable-dom-probe",
+            "document_evidence": "filename-multiset",
+            "image_evidence": "preview-delta-natural-dimensions",
+            "upload_sequence": "documents-first-then-images",
+            "stable_probes": ATTACHMENT_REQUIRED_STABLE_PROBES,
+            "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
+            "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
+            "submit_before_verified": false,
+            "receipt_fields": ["attachment_probe"]
         }
     })
 }
@@ -2635,6 +2673,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
         assert_eq!(
             capabilities["isolated_new_tab_v1"]["flag"].as_str(),
             Some("--new-tab-preserve-existing")
@@ -2642,6 +2681,10 @@ mod tests {
         assert_eq!(
             capabilities["verified_file_upload_v1"]["verification"].as_str(),
             Some("filename-multiset-stable-dom-probe")
+        );
+        assert_eq!(
+            capabilities["verified_mixed_attachment_upload_v1"]["verification"].as_str(),
+            Some("typed-document-image-stable-dom-probe")
         );
         assert!(
             capabilities["version"]
@@ -3058,6 +3101,144 @@ mod tests {
             );
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn typed_attachment_tracker_verifies_documents_and_images() {
+        let expectations = AttachmentExpectations::new(
+            &["report.md".to_string(), "plan.json".to_string()],
+            &["style.png".to_string()],
+        )
+        .unwrap();
+        assert_eq!(expectations.document_names.len(), 2);
+        assert_eq!(expectations.image_count, 1);
+
+        let mut tracker = TypedAttachmentTracker::new(&expectations);
+
+        // Uploading → not ready.
+        assert!(
+            !tracker
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: true,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // First stable probe → not enough (need 2).
+        assert!(
+            !tracker
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: false,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Second stable probe → verified.
+        assert!(
+            tracker
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: false,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Missing image → not ready.
+        let mut tracker2 = TypedAttachmentTracker::new(&expectations);
+        assert!(
+            !tracker2
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 0,
+                        image_loaded: false,
+                        uploading: false,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Provider error → Err.
+        let mut tracker3 = TypedAttachmentTracker::new(&expectations);
+        let result = tracker3.observe(
+            &TypedAttachmentProbe {
+                document_count: 2,
+                image_count: 1,
+                image_loaded: true,
+                uploading: false,
+                provider_error: true,
+            },
+            &expectations,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "provider_error");
+    }
+
+    #[test]
+    fn attachment_probe_summary_has_no_sensitive_fields() {
+        let expectations =
+            AttachmentExpectations::new(&["report.md".to_string()], &["style.png".to_string()])
+                .unwrap();
+        let probe = TypedAttachmentProbe {
+            document_count: 1,
+            image_count: 1,
+            image_loaded: true,
+            uploading: false,
+            provider_error: false,
+        };
+        let summary = AttachmentProbeSummary::new(&expectations, &probe);
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("typed_mixed_v1"));
+        assert!(json.contains("\"expected_documents\":1"));
+        assert!(json.contains("\"expected_images\":1"));
+        // No filenames, paths, DOM text or prompts.
+        assert!(!json.contains("report.md"));
+        assert!(!json.contains("style.png"));
+        assert!(!json.contains("/"));
+    }
+
+    #[test]
+    fn verify_attachments_only_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "ask-bridge",
+            "--provider",
+            "chatgpt",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "--file",
+            "report.md",
+            "--image",
+            "style.png",
+            "--verify-attachments-only",
+            "placeholder",
+        ])
+        .unwrap();
+        assert!(cli.verify_attachments_only);
+        assert_eq!(cli.files, vec!["report.md".to_string()]);
+        assert_eq!(cli.images, vec!["style.png".to_string()]);
     }
 
     #[test]
@@ -4936,6 +5117,131 @@ struct AttachmentProbe {
     complete: bool,
 }
 
+/// Typed expectations for a mixed (document + image) attachment upload.
+///
+/// Images in ChatGPT's composer do not expose their original filename in the
+/// DOM, so the legacy exact-filename multiset verifier cannot confirm them.
+/// This typed model separates document evidence (filename chip) from image
+/// evidence (preview count delta relative to a baseline + non-zero natural
+/// dimensions).
+#[derive(Clone, Debug)]
+struct AttachmentExpectations {
+    document_names: Vec<String>,
+    image_count: usize,
+}
+
+impl AttachmentExpectations {
+    fn new(file_paths: &[String], image_paths: &[String]) -> Result<Self, String> {
+        let mut document_names = Vec::with_capacity(file_paths.len());
+        for path in file_paths {
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| "附件檔名不是有效 UTF-8".to_string())?;
+            document_names.push(name.to_string());
+        }
+        Ok(Self {
+            document_names,
+            image_count: image_paths.len(),
+        })
+    }
+}
+
+/// Typed DOM probe result for mixed attachment verification.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct TypedAttachmentProbe {
+    document_count: usize,
+    image_count: usize,
+    image_loaded: bool,
+    uploading: bool,
+    provider_error: bool,
+}
+
+/// Sanitized receipt diagnostics for a typed attachment probe.  Contains only
+/// count/enum-safe fields — no filenames, paths, DOM text or prompts.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AttachmentProbeSummary {
+    mode: &'static str,
+    failure_stage: Option<String>,
+    failure_reason: Option<String>,
+    expected_documents: usize,
+    observed_documents: usize,
+    expected_images: usize,
+    observed_images: usize,
+    missing_documents: usize,
+    unexpected_documents: usize,
+    uploading: bool,
+    provider_error: bool,
+}
+
+impl AttachmentProbeSummary {
+    fn new(expectations: &AttachmentExpectations, probe: &TypedAttachmentProbe) -> Self {
+        Self {
+            mode: "typed_mixed_v1",
+            failure_stage: None,
+            failure_reason: None,
+            expected_documents: expectations.document_names.len(),
+            observed_documents: probe.document_count,
+            expected_images: expectations.image_count,
+            observed_images: probe.image_count,
+            missing_documents: expectations
+                .document_names
+                .len()
+                .saturating_sub(probe.document_count),
+            unexpected_documents: probe
+                .document_count
+                .saturating_sub(expectations.document_names.len()),
+            uploading: probe.uploading,
+            provider_error: probe.provider_error,
+        }
+    }
+
+    fn with_failure(mut self, stage: &str, reason: &str) -> Self {
+        self.failure_stage = Some(stage.to_string());
+        self.failure_reason = Some(reason.to_string());
+        self
+    }
+}
+
+struct TypedAttachmentTracker {
+    expected_documents: usize,
+    expected_images: usize,
+    stable_probes: usize,
+}
+
+impl TypedAttachmentTracker {
+    fn new(expectations: &AttachmentExpectations) -> Self {
+        Self {
+            expected_documents: expectations.document_names.len(),
+            expected_images: expectations.image_count,
+            stable_probes: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        probe: &TypedAttachmentProbe,
+        _expectations: &AttachmentExpectations,
+    ) -> Result<bool, String> {
+        if probe.provider_error {
+            return Err("provider_error".to_string());
+        }
+        if probe.uploading {
+            self.stable_probes = 0;
+            return Ok(false);
+        }
+        let docs_ok = probe.document_count == self.expected_documents;
+        let images_ok = probe.image_count == self.expected_images && probe.image_loaded;
+        if docs_ok && images_ok {
+            self.stable_probes += 1;
+            return Ok(self.stable_probes >= ATTACHMENT_REQUIRED_STABLE_PROBES);
+        }
+        self.stable_probes = 0;
+        Ok(false)
+    }
+}
+
 struct AttachmentVerificationTracker {
     expected_count: usize,
     stable_complete_probes: usize,
@@ -5146,6 +5452,185 @@ fn verify_attachment_completion(
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
         if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
             return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        thread::sleep(ATTACHMENT_VERIFY_POLL_INTERVAL);
+    }
+}
+
+/// Build a JS probe that counts document chips by filename and image previews
+/// by non-zero natural dimensions.  Image previews in ChatGPT do not expose
+/// their original filename, so we count visible ``<img>`` elements inside the
+/// composer root whose naturalWidth/naturalHeight are positive.
+fn build_typed_attachment_probe_script(
+    provider: Provider,
+    expected_document_names: &[String],
+) -> Result<String, String> {
+    let expected_names = serde_json::to_string(expected_document_names)
+        .map_err(|_| "無法建立 typed 附件驗證 probe".to_string())?;
+    let script = r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const composer = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
+        if (!composer) {
+            return { document_count: 0, image_count: 0, image_loaded: false, uploading: false, provider_error: false };
+        }
+        const root = composer.closest('[data-testid*="composer"]') ||
+            composer.closest('form') ||
+            composer.parentElement?.parentElement?.parentElement ||
+            composer.parentElement ||
+            document.body;
+        const docSelector = [
+            '[data-testid*="file-chip"]',
+            '[data-testid*="file-pill"]',
+            '[data-testid*="file-preview"]',
+            '[data-testid*="file-thumbnail"]',
+            '[class*="file-chip"]',
+            '[class*="file-pill"]',
+            '[class*="file-preview"]',
+            '[class*="file-thumbnail"]'
+        ].join(',');
+        const docCandidates = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
+        const textFor = (el) => [
+            el.innerText, el.textContent,
+            el.getAttribute('aria-label'), el.getAttribute('title')
+        ].filter(Boolean).join(' ').trim();
+        const expectedCounts = new Map();
+        for (const name of expectedNames) {
+            expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
+        }
+        const observedCounts = new Map();
+        for (const candidate of docCandidates) {
+            const text = textFor(candidate);
+            const matches = Array.from(expectedCounts.keys())
+                .filter((name) => text.includes(name))
+                .sort((a, b) => b.length - a.length);
+            if (matches.length > 0) {
+                const name = matches[0];
+                observedCounts.set(name, (observedCounts.get(name) || 0) + 1);
+            }
+        }
+        let documentCount = 0;
+        for (const [, count] of observedCounts) documentCount += Math.min(count, 1);
+        // Count image previews: visible <img> inside the composer root with
+        // positive natural dimensions.  These are the ChatGPT image-attachment
+        // thumbnails that do not expose a filename.
+        const imgCandidates = Array.from(root.querySelectorAll('img')).filter(isVisible);
+        let imageCount = 0;
+        let imageLoaded = false;
+        for (const img of imgCandidates) {
+            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                imageCount += 1;
+                imageLoaded = true;
+            }
+        }
+        const uploadingState = Array.from(root.querySelectorAll(
+            '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i]'
+        )).some(isVisible);
+        const uploadingText = docCandidates.some((c) =>
+            /uploading|upload in progress|上傳中|正在上傳/i.test(textFor(c))
+        );
+        const errorState = Array.from(root.querySelectorAll(
+            '[data-state="error"], [data-status="error"], [data-testid*="upload-error" i]'
+        )).some(isVisible);
+        const errorText = docCandidates.some((c) =>
+            /upload failed|failed to upload|上傳失敗/i.test(textFor(c))
+        );
+        return {
+            document_count: documentCount,
+            image_count: imageCount,
+            image_loaded: imageLoaded,
+            uploading: uploadingState || uploadingText,
+            provider_error: errorState || errorText
+        };
+    }"#
+    .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json());
+    Ok(script)
+}
+
+/// Verify a mixed (document + image) attachment upload using typed evidence:
+/// document chips matched by filename, image previews matched by count
+/// delta and non-zero natural dimensions.  Returns a sanitized summary.
+fn verify_typed_attachment_completion(
+    config_path: &str,
+    provider: Provider,
+    expectations: &AttachmentExpectations,
+    verbose: bool,
+) -> Result<AttachmentProbeSummary, String> {
+    if expectations.document_names.is_empty() && expectations.image_count == 0 {
+        return Ok(AttachmentProbeSummary {
+            mode: "typed_mixed_v1",
+            failure_stage: None,
+            failure_reason: None,
+            expected_documents: 0,
+            observed_documents: 0,
+            expected_images: 0,
+            observed_images: 0,
+            missing_documents: 0,
+            unexpected_documents: 0,
+            uploading: false,
+            provider_error: false,
+        });
+    }
+    let script = build_typed_attachment_probe_script(provider, &expectations.document_names)?;
+    let deadline = McpOperationDeadline::from_timeout(ATTACHMENT_VERIFY_TIMEOUT)
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+    let mut tracker = TypedAttachmentTracker::new(expectations);
+    loop {
+        let response = call_mcp_tool_with_deadline(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": script }),
+            Some(deadline),
+        )
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let value = parse_script_result(&response)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let probe: TypedAttachmentProbe = serde_json::from_value(value)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        match tracker.observe(&probe, expectations) {
+            Ok(true) => {
+                if verbose {
+                    println!(
+                        "{} verified {} document(s) and {} image(s).",
+                        provider.display_name(),
+                        expectations.document_names.len(),
+                        expectations.image_count
+                    );
+                }
+                return Ok(AttachmentProbeSummary::new(expectations, &probe));
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                let _summary = AttachmentProbeSummary::new(expectations, &probe)
+                    .with_failure("verification", &reason);
+                return Err(format!(
+                    "{}:{}",
+                    ATTACHMENT_VERIFICATION_FAILURE_CODE, reason
+                ));
+            }
+        }
+        let remaining = deadline
+            .phase_timeout(
+                ATTACHMENT_VERIFY_TIMEOUT,
+                "typed attachment verification poll",
+            )
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
+            return Err(format!(
+                "{}:verification_timeout",
+                ATTACHMENT_VERIFICATION_FAILURE_CODE
+            ));
         }
         thread::sleep(ATTACHMENT_VERIFY_POLL_INTERVAL);
     }
@@ -5523,12 +6008,56 @@ fn upload_attachments_to_provider(
     file_paths: &[String],
     summary: &AttachmentSummary,
     verbose: bool,
-) -> Result<(), String> {
+) -> Result<Option<AttachmentProbeSummary>, String> {
     if summary.count() != image_paths.len() + file_paths.len() {
         return Err("附件摘要數量不一致".to_string());
     }
 
-    if !image_paths.is_empty() {
+    // Typed mixed-attachment upload sequence (verified_mixed_attachment_upload_v1):
+    // 1. Upload documents first (native chooser / fallback).
+    // 2. If images are present, upload them via DataTransfer after documents
+    //    are stable.
+    // 3. Verify the full mixed set with the typed verifier (document filename
+    //    multiset + image preview delta + natural dimensions).  If only
+    //    documents are present, the legacy filename-multiset verifier is
+    //    reused for backward compatibility.
+    let has_images = !image_paths.is_empty();
+    let expectations = AttachmentExpectations::new(file_paths, image_paths)
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+
+    // 1. Documents first.
+    match document_upload_policy(provider) {
+        DocumentUploadPolicy::NativeThenDataTransferFallback => {
+            for path in file_paths {
+                run_native_then_fallback(
+                    || {
+                        upload_attachments_via_file_chooser(
+                            config_path,
+                            provider,
+                            &[],
+                            std::slice::from_ref(path),
+                            verbose,
+                        )
+                    },
+                    || {
+                        upload_attachments_via_data_transfer(
+                            config_path,
+                            provider,
+                            &[],
+                            std::slice::from_ref(path),
+                            verbose,
+                        )
+                    },
+                )?;
+            }
+        }
+        DocumentUploadPolicy::DataTransferOnly => {
+            upload_attachments_via_data_transfer(config_path, provider, &[], file_paths, verbose)?;
+        }
+    }
+
+    // 2. If there are images, upload them via DataTransfer after documents.
+    if has_images {
         match provider {
             Provider::Gemini => {
                 run_native_then_fallback(
@@ -5562,42 +6091,15 @@ fn upload_attachments_to_provider(
                 )?;
             }
         }
+        // 3. Typed verification for the mixed set.
+        let typed_summary =
+            verify_typed_attachment_completion(config_path, provider, &expectations, verbose)?;
+        Ok(Some(typed_summary))
+    } else {
+        // Documents-only: use the legacy filename-multiset verifier.
+        verify_attachment_completion(config_path, provider, &summary.file_names, verbose)?;
+        Ok(None)
     }
-
-    match document_upload_policy(provider) {
-        DocumentUploadPolicy::NativeThenDataTransferFallback => {
-            // Native chooser is preferred for documents. The fallback is
-            // per-document, so a later chooser failure cannot duplicate
-            // documents that were already accepted.
-            for path in file_paths {
-                run_native_then_fallback(
-                    || {
-                        upload_attachments_via_file_chooser(
-                            config_path,
-                            provider,
-                            &[],
-                            std::slice::from_ref(path),
-                            verbose,
-                        )
-                    },
-                    || {
-                        upload_attachments_via_data_transfer(
-                            config_path,
-                            provider,
-                            &[],
-                            std::slice::from_ref(path),
-                            verbose,
-                        )
-                    },
-                )?;
-            }
-        }
-        DocumentUploadPolicy::DataTransferOnly => {
-            upload_attachments_via_data_transfer(config_path, provider, &[], file_paths, verbose)?;
-        }
-    }
-
-    verify_attachment_completion(config_path, provider, &summary.file_names, verbose)
 }
 
 /// Switch the selected provider to the specified model. The page must already be
@@ -7449,17 +7951,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // --verify-attachments-only: upload and verify attachments, then exit
+    // without typing or submitting a prompt.  Receipt prompt_submission stays
+    // not_started.
+    if cli.verify_attachments_only {
+        match upload_attachments_to_provider(
+            &config_path,
+            provider,
+            &cli.images,
+            &cli.files,
+            &attachment_summary,
+            command_verbose,
+        ) {
+            Ok(summary) => {
+                if let Some(ref probe) = summary {
+                    if let Some(path) = receipt_path.as_deref() {
+                        let _ = write_attachment_probe_receipt(path, probe);
+                    }
+                    println!(
+                        "Attachments verified: {} document(s), {} image(s).",
+                        probe.expected_documents, probe.expected_images
+                    );
+                } else {
+                    println!("Attachments verified (documents only).");
+                }
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("Attachment verification failed: {}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let (initial_assistant_count, status) = execute_verified_prompt_submission(
         receipt_path.as_deref(),
         || {
-            upload_attachments_to_provider(
+            let probe_summary = upload_attachments_to_provider(
                 &config_path,
                 provider,
                 &cli.images,
                 &cli.files,
                 &attachment_summary,
                 command_verbose,
-            )
+            )?;
+            // Persist the additive attachment_probe receipt fields for typed
+            // mixed attachment diagnostics.  The receipt's
+            // attachment_verification/prompt_submission state machine is
+            // still driven by record_session_receipt_event below.
+            if let Some(probe) = probe_summary
+                && let Some(path) = receipt_path.as_deref()
+            {
+                let _ = write_attachment_probe_receipt(path, &probe);
+            }
+            Ok(())
         },
         || {
             let assistant_selector = serde_json::to_string(provider.assistant_selector())
