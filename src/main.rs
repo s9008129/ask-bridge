@@ -18,7 +18,12 @@ use std::os::windows::process::CommandExt;
 
 const ASK_BRIDGE_CHROME_MARKER: &str = "--ask-bridge-instance";
 const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
-const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 1;
+const VERIFIED_FILE_UPLOAD_CAPABILITY: &str = "verified_file_upload_v1";
+const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
+const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
+const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+const ATTACHMENT_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const ATTACHMENT_REQUIRED_STABLE_PROBES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginState {
@@ -590,15 +595,70 @@ fn validate_session_id(value: &str) -> Result<String, String> {
         .map_err(|_| "session id 必須是有效 UUID".to_string())
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AttachmentVerification {
+    Pending,
+    Verified,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PromptSubmission {
+    NotStarted,
+    IntentRecorded,
+    Submitted,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct SessionReceipt {
     schema_version: u8,
     capability: String,
-    session_id: String,
-    provider: String,
-    owned_page_id: usize,
-    pid: u32,
-    created_at_unix_seconds: u64,
+    capabilities: Vec<String>,
+    attachment_verification: AttachmentVerification,
+    attachment_count: usize,
+    attachment_total_bytes: u64,
+    prompt_submission: PromptSubmission,
+    failure_code: Option<String>,
+}
+
+impl SessionReceipt {
+    fn new(attachment_count: usize, attachment_total_bytes: u64) -> Self {
+        Self {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+            capabilities: vec![
+                ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+                VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
+            ],
+            attachment_verification: AttachmentVerification::Pending,
+            attachment_count,
+            attachment_total_bytes,
+            prompt_submission: PromptSubmission::NotStarted,
+            failure_code: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionReceiptEvent {
+    AttachmentsVerified,
+    AttachmentsFailed,
+    PromptIntentRecorded,
+    PromptSubmitted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachmentSummary {
+    file_names: Vec<String>,
+    total_bytes: u64,
+}
+
+impl AttachmentSummary {
+    fn count(&self) -> usize {
+        self.file_names.len()
+    }
 }
 
 struct ProviderLease {
@@ -623,8 +683,12 @@ fn acquire_provider_lease_at(
     session_id: &str,
 ) -> Result<ProviderLease, String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("無法建立 ask-bridge lease 目錄：{}", error))?;
+        ensure_private_directory(parent)?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("ask-bridge lease 路徑不是受信任的 regular file".to_string());
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -671,16 +735,49 @@ fn acquire_provider_lease_at(
     })
 }
 
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("受保護狀態目錄不是可信任的 directory".to_string());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .map_err(|error| format!("無法建立受保護狀態目錄：{}", error))?;
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("無法驗證受保護狀態目錄：{}", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("受保護狀態目錄建立後不是可信任的 directory".to_string());
+            }
+        }
+        Err(error) => return Err(format!("無法檢查受保護狀態目錄：{}", error)),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("無法設定受保護狀態目錄權限：{}", error))?;
+    }
+    Ok(())
+}
+
 fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("無法判定 receipt 目錄：{}", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|error| format!("無法建立 receipt 目錄：{}", error))?;
+    ensure_private_directory(parent)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("受保護 JSON 目標不是可信任的 regular file".to_string());
+    }
 
     let temp_path = parent.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        Uuid::new_v4()
     ));
     let content = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("無法序列化 session receipt：{}", error))?;
@@ -706,6 +803,11 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String>
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| format!("無法設定 session receipt 權限：{}", error))?;
+            let parent_directory = std::fs::File::open(parent)
+                .map_err(|error| format!("無法開啟 receipt 目錄以同步：{}", error))?;
+            parent_directory
+                .sync_all()
+                .map_err(|error| format!("無法同步 receipt 目錄：{}", error))?;
         }
         Ok::<(), String>(())
     })();
@@ -715,36 +817,85 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String>
     result
 }
 
+fn read_session_receipt(path: &Path) -> Result<SessionReceipt, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("無法讀取 session receipt metadata：{}", error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("session receipt 不是可信任的 regular file".to_string());
+    }
+    let receipt: SessionReceipt = serde_json::from_slice(
+        &std::fs::read(path).map_err(|error| format!("無法讀取 session receipt：{}", error))?,
+    )
+    .map_err(|error| format!("session receipt 格式無效：{}", error))?;
+    if receipt.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
+        return Err("session receipt schema version 不相容".to_string());
+    }
+    Ok(receipt)
+}
+
+fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    match event {
+        SessionReceiptEvent::AttachmentsVerified => {
+            if receipt.attachment_verification != AttachmentVerification::Pending
+                || receipt.prompt_submission != PromptSubmission::NotStarted
+            {
+                return Err("附件驗證狀態轉移不合法".to_string());
+            }
+            receipt.attachment_verification = AttachmentVerification::Verified;
+            receipt.failure_code = None;
+        }
+        SessionReceiptEvent::AttachmentsFailed => {
+            if receipt.attachment_verification != AttachmentVerification::Pending
+                || receipt.prompt_submission != PromptSubmission::NotStarted
+            {
+                return Err("prompt intent 後不得標記附件為安全失敗".to_string());
+            }
+            receipt.attachment_verification = AttachmentVerification::Failed;
+            receipt.failure_code = Some(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        SessionReceiptEvent::PromptIntentRecorded => {
+            if receipt.attachment_verification != AttachmentVerification::Verified
+                || receipt.prompt_submission != PromptSubmission::NotStarted
+            {
+                return Err("附件尚未驗證或 prompt 已開始，拒絕記錄新的 submit intent".to_string());
+            }
+            receipt.prompt_submission = PromptSubmission::IntentRecorded;
+        }
+        SessionReceiptEvent::PromptSubmitted => {
+            if receipt.prompt_submission != PromptSubmission::IntentRecorded {
+                return Err("沒有 durable intent，拒絕標記 prompt submitted".to_string());
+            }
+            receipt.prompt_submission = PromptSubmission::Submitted;
+        }
+    }
+    write_private_json(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("session receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
 fn write_session_receipt(
     session_id: &str,
-    provider: Provider,
-    page_id: usize,
+    attachment_count: usize,
+    attachment_total_bytes: u64,
 ) -> Result<PathBuf, String> {
     let session_id = validate_session_id(session_id)?;
     let path = session_receipt_path(&session_id)?;
-    if path.exists() {
-        return Err(
-            "session receipt 已存在；請使用新的 UUID，避免重用舊分頁 ownership".to_string(),
-        );
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(
+                "session receipt 已存在；請使用新的 UUID，避免重用舊分頁 ownership".to_string(),
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("無法檢查 session receipt：{}", error)),
     }
-    let created_at_unix_seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let receipt = SessionReceipt {
-        schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
-        capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
-        session_id,
-        provider: provider.to_string(),
-        owned_page_id: page_id,
-        pid: std::process::id(),
-        created_at_unix_seconds,
-    };
+    let receipt = SessionReceipt::new(attachment_count, attachment_total_bytes);
     write_private_json(&path, &receipt)?;
-    let persisted: SessionReceipt = serde_json::from_slice(
-        &std::fs::read(&path).map_err(|error| format!("無法讀回 session receipt：{}", error))?,
-    )
-    .map_err(|error| format!("session receipt 驗證失敗：{}", error))?;
+    let persisted = read_session_receipt(&path)?;
     if persisted != receipt {
         return Err("session receipt 驗證失敗：內容與本次工作不一致".to_string());
     }
@@ -753,15 +904,25 @@ fn write_session_receipt(
 
 fn capabilities_value() -> Value {
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "version": env!("CARGO_PKG_VERSION"),
-        "capabilities": [ISOLATED_NEW_TAB_CAPABILITY],
+        "capabilities": [
+            ISOLATED_NEW_TAB_CAPABILITY,
+            VERIFIED_FILE_UPLOAD_CAPABILITY
+        ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
             "session_id_flag": "--session-id",
             "receipt": "0600-json",
             "ownership": "exact-page-id",
             "lease": "provider-scoped-cross-process"
+        },
+        "verified_file_upload_v1": {
+            "verification": "filename-multiset-stable-dom-probe",
+            "stable_probes": ATTACHMENT_REQUIRED_STABLE_PROBES,
+            "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
+            "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
+            "submit_before_verified": false
         }
     })
 }
@@ -777,6 +938,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
     } else {
         println!("ask-bridge capabilities");
         println!("  {}", ISOLATED_NEW_TAB_CAPABILITY);
+        println!("  {}", VERIFIED_FILE_UPLOAD_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -845,26 +1007,11 @@ fn resolve_provider(cli_provider: Option<Provider>) -> Result<Provider, String> 
 
 fn write_global_provider_config(provider: Provider) -> Result<(), String> {
     let config_path = config_file_path()?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create config directory {}: {}",
-                parent.to_string_lossy(),
-                e
-            )
-        })?;
-    }
-
-    let content =
-        serde_json::to_string_pretty(&serde_json::json!({"provider": provider.to_string()}))
-            .map_err(|e| format!("Failed to serialize provider config: {}", e))?;
-    std::fs::write(&config_path, format!("{}\n", content)).map_err(|e| {
-        format!(
-            "Failed to write config file {}: {}",
-            config_path.to_string_lossy(),
-            e
-        )
-    })?;
+    write_private_json(
+        &config_path,
+        &serde_json::json!({"provider": provider.to_string()}),
+    )
+    .map_err(|error| format!("Failed to write private provider config: {}", error))?;
 
     println!(
         "Set default provider to '{}' in {}",
@@ -1061,12 +1208,7 @@ fn check_node_runtime() -> Result<(), String> {
 /// (2026-07-11). Bump this version deliberately and re-run the e2e check.
 const MCP_PACKAGE_SPEC: &str = "chrome-devtools-mcp@1.5.0";
 
-fn build_chrome_devtools_server_config(
-    quiet_mcp: bool,
-    headless: bool,
-    log_path: &str,
-    is_windows: bool,
-) -> Value {
+fn build_chrome_devtools_server_config(quiet_mcp: bool, headless: bool, is_windows: bool) -> Value {
     let mut mcp_args = vec![
         "-y".to_string(),
         MCP_PACKAGE_SPEC.to_string(),
@@ -1079,8 +1221,6 @@ fn build_chrome_devtools_server_config(
     if headless {
         mcp_args.push("--headless".to_string());
     }
-    mcp_args.push("--logFile".to_string());
-    mcp_args.push(log_path.to_string());
 
     let mut chrome_devtools_server = serde_json::json!({
         "command": if is_windows { "npx.cmd" } else { "npx" },
@@ -1105,25 +1245,27 @@ fn build_chrome_devtools_server_config(
 }
 
 fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
-    let mut config_dir = home::home_dir().ok_or("Could not locate home directory")?;
-    config_dir.push(".config/ask-bridge");
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("Failed to create config directory: {}", e))?;
-
-    let log_path = config_dir
-        .join("chrome-devtools-mcp.log")
-        .to_string_lossy()
-        .to_string();
-
-    config_dir.push("mcp_servers.json");
-    let config_path = config_dir.to_string_lossy().to_string();
-
-    let chrome_devtools_server = build_chrome_devtools_server_config(
+    let config_dir = ask_bridge_state_dir()?;
+    let config_path = write_mcp_config_at(
+        &config_dir,
         quiet_mcp,
         headless,
-        &log_path,
         cfg!(target_os = "windows"),
-    );
+    )?;
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+fn write_mcp_config_at(
+    config_dir: &Path,
+    quiet_mcp: bool,
+    headless: bool,
+    is_windows: bool,
+) -> Result<PathBuf, String> {
+    ensure_private_directory(config_dir)?;
+    let config_path = config_dir.join("mcp_servers.json");
+
+    let chrome_devtools_server =
+        build_chrome_devtools_server_config(quiet_mcp, headless, is_windows);
 
     let config_content = serde_json::json!({
         "mcpServers": {
@@ -1131,10 +1273,8 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
         }
     });
 
-    let content_str = serde_json::to_string_pretty(&config_content).map_err(|e| e.to_string())?;
-
-    std::fs::write(&config_path, content_str)
-        .map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
+    write_private_json(&config_path, &config_content)
+        .map_err(|e| format!("Failed to write private mcp_servers.json: {}", e))?;
 
     Ok(config_path)
 }
@@ -2020,7 +2160,48 @@ const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
+#[derive(Clone, Copy, Debug)]
+struct McpOperationDeadline {
+    expires_at: Instant,
+}
+
+impl McpOperationDeadline {
+    fn from_timeout(timeout: Duration) -> Result<Self, String> {
+        Self::from_start(Instant::now(), timeout)
+    }
+
+    fn from_start(started_at: Instant, timeout: Duration) -> Result<Self, String> {
+        let expires_at = started_at
+            .checked_add(timeout)
+            .ok_or_else(|| "MCP operation deadline overflow".to_string())?;
+        Ok(Self { expires_at })
+    }
+
+    fn phase_timeout(self, cap: Duration, phase: &str) -> Result<Duration, String> {
+        self.phase_timeout_at(Instant::now(), cap, phase)
+    }
+
+    fn phase_timeout_at(
+        self,
+        now: Instant,
+        cap: Duration,
+        phase: &str,
+    ) -> Result<Duration, String> {
+        let remaining = self.expires_at.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return Err(format!("MCP operation deadline exhausted before {}", phase));
+        }
+        Ok(remaining.min(cap))
+    }
+}
+
+fn mcp_session_connect(
+    config_path: &str,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<McpSession, String> {
+    if let Some(deadline) = deadline {
+        deadline.phase_timeout(MCP_CONNECT_TIMEOUT, "MCP config load")?;
+    }
     let client = McpClient::load(Some(config_path))
         .map_err(|e| format!("Failed to load MCP config: {}", e))?;
     let server_config = client
@@ -2049,10 +2230,14 @@ fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
                 _ => client.connect("chrome-devtools").await,
             }
         };
-        match tokio::time::timeout(MCP_CONNECT_TIMEOUT, connect_future).await {
+        let connect_timeout = match deadline {
+            Some(deadline) => deadline.phase_timeout(MCP_CONNECT_TIMEOUT, "MCP session connect")?,
+            None => MCP_CONNECT_TIMEOUT,
+        };
+        match tokio::time::timeout(connect_timeout, connect_future).await {
             Err(_) => Err(format!(
                 "Failed to start chrome-devtools MCP server: timed out after {}s",
-                MCP_CONNECT_TIMEOUT.as_secs()
+                connect_timeout.as_secs()
             )),
             Ok(result) => {
                 result.map_err(|e| format!("Failed to start chrome-devtools MCP server: {}", e))
@@ -2066,7 +2251,10 @@ fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
     })
 }
 
-fn mcp_session_reset(slot: &mut Option<McpSession>) {
+fn mcp_session_reset(
+    slot: &mut Option<McpSession>,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<(), String> {
     if let Some(session) = slot.take() {
         let McpSession {
             connection,
@@ -2076,9 +2264,23 @@ fn mcp_session_reset(slot: &mut Option<McpSession>) {
         // Best-effort close (kills the child); if even that stalls, dropping
         // the runtime stops the background tasks and the orphaned child exits
         // on stdin EOF.
+        let close_timeout = match deadline {
+            Some(deadline) => {
+                match deadline.phase_timeout(MCP_CLOSE_TIMEOUT, "MCP session reset") {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        drop(connection);
+                        drop(runtime);
+                        return Err(error);
+                    }
+                }
+            }
+            None => MCP_CLOSE_TIMEOUT,
+        };
         let _ = runtime
-            .block_on(async { tokio::time::timeout(MCP_CLOSE_TIMEOUT, connection.close()).await });
+            .block_on(async { tokio::time::timeout(close_timeout, connection.close()).await });
     }
+    Ok(())
 }
 
 fn mcp_session_call(
@@ -2086,23 +2288,28 @@ fn mcp_session_call(
     config_path: &str,
     tool: &str,
     args: Value,
+    call_timeout: Duration,
+    deadline: Option<McpOperationDeadline>,
 ) -> Result<Value, String> {
     let needs_connect = slot
         .as_ref()
         .map(|session| session.config_path != config_path)
         .unwrap_or(true);
     if needs_connect {
-        mcp_session_reset(slot);
-        *slot = Some(mcp_session_connect(config_path)?);
+        mcp_session_reset(slot, deadline)?;
+        *slot = Some(mcp_session_connect(config_path, deadline)?);
     }
     let session = slot.as_ref().expect("session connected above");
+    let tool_timeout = match deadline {
+        Some(deadline) => deadline.phase_timeout(call_timeout, "MCP tool call")?,
+        None => call_timeout,
+    };
     session.runtime.block_on(async {
-        match tokio::time::timeout(MCP_CALL_TIMEOUT, session.connection.call_tool(tool, args)).await
-        {
+        match tokio::time::timeout(tool_timeout, session.connection.call_tool(tool, args)).await {
             Err(_) => Err(format!(
                 "MCP tool '{}' timed out after {}s",
                 tool,
-                MCP_CALL_TIMEOUT.as_secs()
+                tool_timeout.as_secs()
             )),
             Ok(result) => result.map_err(|e| format!("mcp-cli library call failed: {}", e)),
         }
@@ -2120,6 +2327,7 @@ fn mcp_session_call(
 fn mcp_error_is_transport(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("timed out")
+        || lower.contains("deadline exhausted")
         || lower.contains("failed to send request to process stdin")
         || lower.contains("server process exited unexpectedly")
         || lower.contains("stdio response receiver canceled")
@@ -2127,6 +2335,15 @@ fn mcp_error_is_transport(message: &str) -> bool {
 }
 
 fn call_mcp_tool_raw(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+    call_mcp_tool_raw_with_deadline(config_path, tool, args, None)
+}
+
+fn call_mcp_tool_raw_with_deadline(
+    config_path: &str,
+    tool: &str,
+    args: Value,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<Value, String> {
     let _stderr_guard = if FORWARD_MCP_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
         None
     } else {
@@ -2139,11 +2356,18 @@ fn call_mcp_tool_raw(config_path: &str, tool: &str, args: Value) -> Result<Value
     let mut slot = MCP_SESSION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match mcp_session_call(&mut slot, config_path, tool, args) {
+    match mcp_session_call(
+        &mut slot,
+        config_path,
+        tool,
+        args,
+        MCP_CALL_TIMEOUT,
+        deadline,
+    ) {
         Ok(value) => Ok(value),
         Err(error) => {
             if mcp_error_is_transport(&error) {
-                mcp_session_reset(&mut slot);
+                let _ = mcp_session_reset(&mut slot, deadline);
                 return Err(format!(
                     "{} (MCP session was reset; re-run the command)",
                     error
@@ -2191,6 +2415,15 @@ fn page_bound_mcp_tool(tool: &str) -> bool {
 }
 
 fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+    call_mcp_tool_with_deadline(config_path, tool, args, None)
+}
+
+fn call_mcp_tool_with_deadline(
+    config_path: &str,
+    tool: &str,
+    args: Value,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<Value, String> {
     if let Some(binding) = owned_page_binding() {
         if tool == "close_page" || tool == "new_page" {
             return Err(format!(
@@ -2208,17 +2441,18 @@ fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, St
             }
         }
         if page_bound_mcp_tool(tool) {
-            call_mcp_tool_raw(
+            call_mcp_tool_raw_with_deadline(
                 config_path,
                 "select_page",
                 serde_json::json!({
                     "pageId": binding.page_id,
                     "bringToFront": false
                 }),
+                deadline,
             )?;
         }
     }
-    call_mcp_tool_raw(config_path, tool, args)
+    call_mcp_tool_raw_with_deadline(config_path, tool, args, deadline)
 }
 
 fn parse_pages(text: &str) -> Vec<Page> {
@@ -2285,7 +2519,7 @@ fn tool_text(val: &Value) -> Result<String, String> {
         .and_then(|obj| obj.get("text"))
         .and_then(|t| t.as_str())
         .map(|text| text.to_string())
-        .ok_or_else(|| format!("Could not extract text field from tool result: {:?}", val))
+        .ok_or_else(|| "Could not extract text field from tool result".to_string())
 }
 
 fn take_snapshot_text(config_path: &str) -> Result<String, String> {
@@ -2391,15 +2625,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn declares_isolated_capability_and_parses_safe_flags() {
+    fn declares_verified_upload_and_isolated_capabilities() {
         let capabilities = capabilities_value();
-        assert_eq!(
-            capabilities["capabilities"][0].as_str(),
-            Some(ISOLATED_NEW_TAB_CAPABILITY)
-        );
+        let advertised = capabilities["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert_eq!(
             capabilities["isolated_new_tab_v1"]["flag"].as_str(),
             Some("--new-tab-preserve-existing")
+        );
+        assert_eq!(
+            capabilities["verified_file_upload_v1"]["verification"].as_str(),
+            Some("filename-multiset-stable-dom-probe")
         );
         assert!(
             capabilities["version"]
@@ -2451,29 +2693,391 @@ mod tests {
     #[test]
     fn private_session_receipt_is_atomic_and_mode_600_on_unix() {
         let root = std::env::temp_dir().join(format!("ask-bridge-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("receipt.json");
-        let receipt = SessionReceipt {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
-            capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
-            session_id: "00000000-0000-4000-8000-000000000001".to_string(),
-            provider: "chatgpt".to_string(),
-            owned_page_id: 42,
-            pid: 123,
-            created_at_unix_seconds: 1,
-        };
+        let path = root.join("sessions").join("receipt.json");
+        let receipt = SessionReceipt::new(2, 57_081);
         write_private_json(&path, &receipt).unwrap();
         let persisted: SessionReceipt =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted, receipt);
+        assert_eq!(persisted.schema_version, 2);
+        assert_eq!(
+            persisted.attachment_verification,
+            AttachmentVerification::Pending
+        );
+        assert_eq!(persisted.prompt_submission, PromptSubmission::NotStarted);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_lifecycle_is_auditable_without_sensitive_values() {
+        let root = make_test_dir("receipt_lifecycle");
+        let path = root.join("receipt.json");
+        let canary = "PRIVATE-PROMPT-BASE64-FILENAME-ACCOUNT";
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join(format!("{canary}.md"));
+        std::fs::write(&source, canary.as_bytes()).unwrap();
+        let summary = summarize_attachments(&[], &[source.to_string_lossy().to_string()]).unwrap();
+        write_private_json(
+            &path,
+            &SessionReceipt::new(summary.count(), summary.total_bytes),
+        )
+        .unwrap();
+
+        record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+        let crash_receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(
+            crash_receipt.prompt_submission,
+            PromptSubmission::IntentRecorded
+        );
+        assert_eq!(
+            crash_receipt.attachment_verification,
+            AttachmentVerification::Verified
+        );
+
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+        let submitted = read_session_receipt(&path).unwrap();
+        assert_eq!(submitted.prompt_submission, PromptSubmission::Submitted);
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        assert!(!serialized.contains(canary));
+        let object = serde_json::from_str::<Value>(&serialized)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        for forbidden_key in [
+            "prompt",
+            "content",
+            "base64",
+            "path",
+            "file_name",
+            "account",
+            "provider",
+            "owned_page_id",
+            "pid",
+        ] {
+            assert!(
+                !object.contains_key(forbidden_key),
+                "receipt leaked forbidden key {forbidden_key}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_json_rejects_symlink_destination_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = make_test_dir("private_json_symlink");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let victim = root.join("victim.json");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        let destination = real.join("receipt.json");
+        symlink(&victim, &destination).unwrap();
+        assert!(write_private_json(&destination, &SessionReceipt::new(0, 0)).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+
+        let linked_parent = root.join("linked");
+        symlink(&real, &linked_parent).unwrap();
+        assert!(
+            write_private_json(
+                &linked_parent.join("other.json"),
+                &SessionReceipt::new(0, 0)
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attachment_probe_requires_two_stable_complete_observations() {
+        let pending = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: true,
+            has_error: false,
+            complete: false,
+        };
+        let complete = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 2,
+            missing_count: 0,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: false,
+            complete: true,
+        };
+        let mut tracker = AttachmentVerificationTracker::new(2);
+        assert!(!tracker.observe(pending).unwrap());
+        assert!(!tracker.observe(complete.clone()).unwrap());
+        assert!(tracker.observe(complete).unwrap());
+        assert_eq!(ATTACHMENT_VERIFY_POLL_INTERVAL, Duration::from_millis(500));
+        assert_eq!(ATTACHMENT_VERIFY_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(ATTACHMENT_REQUIRED_STABLE_PROBES, 2);
+    }
+
+    #[test]
+    fn attachment_probe_fails_closed_on_error_or_wrong_multiset() {
+        let mut tracker = AttachmentVerificationTracker::new(2);
+        let error = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: true,
+            complete: false,
+        };
+        assert!(tracker.observe(error).is_err());
+
+        let wrong_multiset = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 3,
+            missing_count: 0,
+            unexpected_count: 1,
+            uploading: false,
+            has_error: false,
+            complete: false,
+        };
+        assert!(!tracker.observe(wrong_multiset).unwrap());
+    }
+
+    #[test]
+    fn mcp_connect_and_tool_share_one_deterministic_deadline() {
+        let started_at = Instant::now();
+        let deadline =
+            McpOperationDeadline::from_start(started_at, Duration::from_millis(100)).unwrap();
+
+        assert_eq!(
+            deadline
+                .phase_timeout_at(started_at, MCP_CONNECT_TIMEOUT, "connect")
+                .unwrap(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            deadline
+                .phase_timeout_at(
+                    started_at + Duration::from_millis(70),
+                    MCP_CALL_TIMEOUT,
+                    "tool",
+                )
+                .unwrap(),
+            Duration::from_millis(30)
+        );
+        let exhausted = deadline
+            .phase_timeout_at(
+                started_at + Duration::from_millis(100),
+                MCP_CALL_TIMEOUT,
+                "tool",
+            )
+            .unwrap_err();
+        assert!(exhausted.contains("deadline exhausted"));
+    }
+
+    #[test]
+    fn attachment_dom_probe_uses_filename_multiset_and_structured_states() {
+        let script =
+            build_attachment_probe_script(Provider::ChatGpt, &["same.md".into(), "same.md".into()])
+                .unwrap();
+        assert!(script.contains("expectedNames"));
+        assert!(script.contains("missing_count"));
+        assert!(script.contains("unexpected_count"));
+        assert!(script.contains("uploading"));
+        assert!(script.contains("has_error"));
+        assert!(script.contains("same.md"));
+    }
+
+    #[test]
+    fn native_upload_success_skips_fallback_and_failure_uses_it_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        run_native_then_fallback(
+            || {
+                calls.borrow_mut().push("native");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["native"]);
+
+        calls.borrow_mut().clear();
+        run_native_then_fallback(
+            || {
+                calls.borrow_mut().push("native");
+                Err("native unavailable".to_string())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["native", "fallback"]);
+    }
+
+    #[test]
+    fn chatgpt_document_policy_is_native_first_with_data_transfer_only_as_fallback() {
+        assert_eq!(
+            document_upload_policy(Provider::ChatGpt),
+            DocumentUploadPolicy::NativeThenDataTransferFallback
+        );
+    }
+
+    #[test]
+    fn attachment_failure_keeps_prompt_not_started_and_never_submits() {
+        let root = make_test_dir("attachment_fail_gate");
+        let path = root.join("receipt.json");
+        write_private_json(&path, &SessionReceipt::new(1, 123)).unwrap();
+        let submit_count = std::cell::Cell::new(0);
+        let result = execute_verified_prompt_submission(
+            Some(&path),
+            || Err("upload did not stabilize".to_string()),
+            || Ok(7usize),
+            || {
+                submit_count.set(submit_count.get() + 1);
+                Ok("submitted".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(submit_count.get(), 0);
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(
+            receipt.attachment_verification,
+            AttachmentVerification::Failed
+        );
+        assert_eq!(receipt.prompt_submission, PromptSubmission::NotStarted);
+        assert_eq!(
+            receipt.failure_code.as_deref(),
+            Some(ATTACHMENT_VERIFICATION_FAILURE_CODE)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uploading_missing_error_and_timeout_gates_never_submit() {
+        let not_verified = |probe: AttachmentProbe| {
+            let mut tracker = AttachmentVerificationTracker::new(2);
+            match tracker.observe(probe) {
+                Ok(true) => Ok(()),
+                Ok(false) | Err(_) => Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string()),
+            }
+        };
+        let uploading = not_verified(AttachmentProbe {
+            expected_count: 2,
+            observed_count: 2,
+            missing_count: 0,
+            unexpected_count: 0,
+            uploading: true,
+            has_error: false,
+            complete: false,
+        });
+        let missing = not_verified(AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: false,
+            complete: false,
+        });
+        let upload_error = not_verified(AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: true,
+            complete: false,
+        });
+        let started_at = Instant::now();
+        let deadline =
+            McpOperationDeadline::from_start(started_at, Duration::from_millis(10)).unwrap();
+        let timeout = deadline
+            .phase_timeout_at(
+                started_at + Duration::from_millis(10),
+                MCP_CALL_TIMEOUT,
+                "attachment verification",
+            )
+            .map(|_| ());
+
+        for (case, gate_result) in [
+            ("uploading", uploading),
+            ("missing", missing),
+            ("error", upload_error),
+            ("timeout", timeout),
+        ] {
+            let root = make_test_dir(&format!("attachment_{case}_gate"));
+            let path = root.join("receipt.json");
+            write_private_json(&path, &SessionReceipt::new(2, 123)).unwrap();
+            let submit_count = std::cell::Cell::new(0);
+            let result = execute_verified_prompt_submission(
+                Some(&path),
+                || gate_result,
+                || Ok(0usize),
+                || {
+                    submit_count.set(submit_count.get() + 1);
+                    Ok("submitted".to_string())
+                },
+            );
+
+            assert!(result.is_err(), "{case} must fail closed");
+            assert_eq!(submit_count.get(), 0, "{case} must never submit");
+            let receipt = read_session_receipt(&path).unwrap();
+            assert_eq!(
+                receipt.attachment_verification,
+                AttachmentVerification::Failed,
+                "{case}"
+            );
+            assert_eq!(
+                receipt.prompt_submission,
+                PromptSubmission::NotStarted,
+                "{case}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn submit_failure_after_durable_intent_remains_unknown() {
+        let root = make_test_dir("submit_intent_gate");
+        let path = root.join("receipt.json");
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        let result = execute_verified_prompt_submission(
+            Some(&path),
+            || Ok(()),
+            || Ok(0usize),
+            || Err("browser submit state unknown".to_string()),
+        );
+        assert!(result.is_err());
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(
+            receipt.attachment_verification,
+            AttachmentVerification::Verified
+        );
+        assert_eq!(receipt.prompt_submission, PromptSubmission::IntentRecorded);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2578,7 +3182,7 @@ mod tests {
         // `@latest` makes every npx spawn re-resolve the dist-tag against the
         // npm registry; combined with mcp-cli's timeout-less request wait this
         // hung whole runs (2026-07-11). The package spec must pin a version.
-        let config = build_chrome_devtools_server_config(true, true, "/tmp/mcp.log", false);
+        let config = build_chrome_devtools_server_config(true, true, false);
         let args = config["args"].as_array().expect("args array");
         let pkg = args
             .iter()
@@ -2678,10 +3282,10 @@ mod tests {
                 .collect()
         }
 
-        let log_path = r"C:\Temp\ask bridge\chrome-devtools-mcp.log";
-        let quiet_windows = build_chrome_devtools_server_config(true, true, log_path, true);
-        let verbose_windows = build_chrome_devtools_server_config(false, true, log_path, true);
-        let quiet_unix = build_chrome_devtools_server_config(true, true, log_path, false);
+        let privacy_canary = "PRIVATE-PROMPT-BASE64-CANARY";
+        let quiet_windows = build_chrome_devtools_server_config(true, true, true);
+        let verbose_windows = build_chrome_devtools_server_config(false, true, true);
+        let quiet_unix = build_chrome_devtools_server_config(true, true, false);
         let quiet_args = config_args(&quiet_windows);
         let verbose_args = config_args(&verbose_windows);
 
@@ -2692,11 +3296,13 @@ mod tests {
             MCP_PACKAGE_SPEC,
             "--browser-url=http://127.0.0.1:9223",
             "--headless",
-            "--logFile",
-            log_path,
         ] {
             assert!(quiet_args.contains(&required));
             assert!(verbose_args.contains(&required));
+        }
+        for args in [&quiet_args, &verbose_args] {
+            assert!(!args.contains(&"--logFile"));
+            assert!(!args.iter().any(|arg| arg.contains(privacy_canary)));
         }
         assert!(quiet_args.contains(&"--no-usage-statistics"));
         assert!(quiet_args.contains(&"--no-performance-crux"));
@@ -2705,6 +3311,30 @@ mod tests {
         assert!(!quiet_args.iter().any(|arg| arg.contains("2>nul")));
         assert_eq!(quiet_windows["env"]["CI"].as_str(), Some("1"));
         assert!(verbose_windows.get("env").is_none());
+    }
+
+    #[test]
+    fn private_mcp_config_has_no_raw_log_and_uses_private_permissions() {
+        let root = make_test_dir("private_mcp_config");
+        let config_dir = root.join("state");
+        let path = write_mcp_config_at(&config_dir, true, true, false).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("--logFile"));
+        assert!(!content.contains("chrome-devtools-mcp.log"));
+        assert!(!content.contains("PRIVATE-PROMPT-BASE64-CANARY"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4267,61 +4897,258 @@ fn display_image_in_terminal(image_path: &str) {
     let _ = Command::new("kitty").args(["icat", image_path]).status();
 }
 
-fn wait_for_attachment_indicator(
+fn summarize_attachments(
+    image_paths: &[String],
+    file_paths: &[String],
+) -> Result<AttachmentSummary, String> {
+    let mut file_names = Vec::with_capacity(image_paths.len() + file_paths.len());
+    let mut total_bytes = 0u64;
+    for path in image_paths.iter().chain(file_paths.iter()) {
+        let metadata = std::fs::metadata(path)
+            .map_err(|_| "無法讀取其中一個附件；尚未開啟 provider 分頁".to_string())?;
+        if !metadata.is_file() {
+            return Err("附件必須是 regular file；尚未開啟 provider 分頁".to_string());
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| "附件總大小超出可表示範圍".to_string())?;
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "附件檔名不是有效 UTF-8".to_string())?;
+        file_names.push(file_name.to_string());
+    }
+    Ok(AttachmentSummary {
+        file_names,
+        total_bytes,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AttachmentProbe {
+    expected_count: usize,
+    observed_count: usize,
+    missing_count: usize,
+    unexpected_count: usize,
+    uploading: bool,
+    has_error: bool,
+    complete: bool,
+}
+
+struct AttachmentVerificationTracker {
+    expected_count: usize,
+    stable_complete_probes: usize,
+}
+
+impl AttachmentVerificationTracker {
+    fn new(expected_count: usize) -> Self {
+        Self {
+            expected_count,
+            stable_complete_probes: 0,
+        }
+    }
+
+    fn observe(&mut self, probe: AttachmentProbe) -> Result<bool, String> {
+        if probe.expected_count != self.expected_count {
+            return Err("附件 DOM probe 回報的預期數量不一致".to_string());
+        }
+        if probe.has_error {
+            return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        let ready = probe.complete
+            && !probe.uploading
+            && probe.observed_count == self.expected_count
+            && probe.missing_count == 0
+            && probe.unexpected_count == 0;
+        if !ready {
+            self.stable_complete_probes = 0;
+            return Ok(false);
+        }
+        self.stable_complete_probes += 1;
+        Ok(self.stable_complete_probes >= ATTACHMENT_REQUIRED_STABLE_PROBES)
+    }
+}
+
+fn build_attachment_probe_script(
+    provider: Provider,
+    expected_file_names: &[String],
+) -> Result<String, String> {
+    let expected_names = serde_json::to_string(expected_file_names)
+        .map_err(|_| "無法建立附件驗證 probe".to_string())?;
+    let script = r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+        if (!composer) {
+            return {
+                expected_count: expectedNames.length,
+                observed_count: 0,
+                missing_count: expectedNames.length,
+                unexpected_count: 0,
+                uploading: false,
+                has_error: true,
+                complete: false
+            };
+        }
+        const root = composer.closest('[data-testid*="composer"]') ||
+            composer.closest('form') ||
+            composer.parentElement?.parentElement?.parentElement ||
+            composer.parentElement ||
+            document.body;
+        const candidateSelector = [
+            '[data-testid*="attachment"]',
+            '[data-testid*="file-chip"]',
+            '[data-testid*="file-pill"]',
+            '[data-testid*="file-preview"]',
+            '[data-testid*="file-thumbnail"]',
+            '[class*="attachment"]',
+            '[class*="file-chip"]',
+            '[class*="file-pill"]',
+            '[class*="file-preview"]',
+            '[class*="file-thumbnail"]',
+            '[aria-label*="attachment" i]'
+        ].join(',');
+        const textFor = (el) => [
+            el.innerText,
+            el.textContent,
+            el.getAttribute('aria-label'),
+            el.getAttribute('title')
+        ].filter(Boolean).join(' ').trim();
+        const candidates = Array.from(root.querySelectorAll(candidateSelector)).filter(isVisible);
+        const leaves = candidates.filter((candidate) =>
+            !candidates.some((other) => other !== candidate && candidate.contains(other))
+        );
+        const expectedCounts = new Map();
+        for (const name of expectedNames) {
+            expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
+        }
+        const observedCounts = new Map();
+        let unmatchedVisibleCandidates = 0;
+        for (const candidate of leaves) {
+            const text = textFor(candidate);
+            const matches = Array.from(expectedCounts.keys())
+                .filter((name) => text.includes(name))
+                .sort((left, right) => right.length - left.length);
+            if (matches.length > 0) {
+                const name = matches[0];
+                observedCounts.set(name, (observedCounts.get(name) || 0) + 1);
+            } else {
+                unmatchedVisibleCandidates += 1;
+            }
+        }
+        if (observedCounts.size === 0) {
+            const rootText = root.innerText || root.textContent || '';
+            for (const [name] of expectedCounts) {
+                let count = 0;
+                let offset = 0;
+                while (name && (offset = rootText.indexOf(name, offset)) !== -1) {
+                    count += 1;
+                    offset += name.length;
+                }
+                if (count > 0) observedCounts.set(name, count);
+            }
+            unmatchedVisibleCandidates = 0;
+        }
+        let missingCount = 0;
+        let unexpectedCount = unmatchedVisibleCandidates;
+        let observedCount = unmatchedVisibleCandidates;
+        for (const [name, expected] of expectedCounts) {
+            const observed = observedCounts.get(name) || 0;
+            observedCount += observed;
+            missingCount += Math.max(0, expected - observed);
+            unexpectedCount += Math.max(0, observed - expected);
+        }
+        const uploadingState = Array.from(root.querySelectorAll(
+            '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i], [data-testid*="progress" i]'
+        )).some(isVisible);
+        const uploadingText = leaves.some((candidate) =>
+            /uploading|upload in progress|上傳中|正在上傳|上传中|正在上传/i.test(textFor(candidate))
+        );
+        const errorState = Array.from(root.querySelectorAll(
+            '[data-state="error"], [data-status="error"], [data-testid*="upload-error" i], [aria-label*="upload failed" i]'
+        )).some(isVisible);
+        const errorText = leaves.some((candidate) =>
+            /upload failed|failed to upload|上傳失敗|上传失败/i.test(textFor(candidate))
+        );
+        const uploading = uploadingState || uploadingText;
+        const hasError = errorState || errorText;
+        const complete = missingCount === 0 &&
+            unexpectedCount === 0 &&
+            observedCount === expectedNames.length &&
+            !uploading &&
+            !hasError;
+        return {
+            expected_count: expectedNames.length,
+            observed_count: observedCount,
+            missing_count: missingCount,
+            unexpected_count: unexpectedCount,
+            uploading,
+            has_error: hasError,
+            complete
+        };
+    }"#
+    .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        provider.composer_selectors_json(),
+    );
+    Ok(script)
+}
+
+fn verify_attachment_completion(
     config_path: &str,
     provider: Provider,
-    path: &str,
+    expected_file_names: &[String],
     verbose: bool,
 ) -> Result<(), String> {
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path);
-    let file_stem = Path::new(path)
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_name);
-    let file_name_json = serde_json::to_string(file_name)
-        .map_err(|e| format!("Failed to serialize file name: {}", e))?;
-    let file_stem_json = serde_json::to_string(file_stem)
-        .map_err(|e| format!("Failed to serialize file stem: {}", e))?;
-    let js = r#"() => {
-        const fileName = __FILE_NAME__;
-        const fileStem = __FILE_STEM__;
-        const text = document.body.innerText || '';
-        return text.includes(fileName) || text.includes(fileStem);
-    }"#
-    .replace("__FILE_NAME__", &file_name_json)
-    .replace("__FILE_STEM__", &file_stem_json);
-
-    for _ in 0..30 {
-        let check_res = call_mcp_tool(
+    if expected_file_names.is_empty() {
+        return Ok(());
+    }
+    let script = build_attachment_probe_script(provider, expected_file_names)?;
+    let deadline = McpOperationDeadline::from_timeout(ATTACHMENT_VERIFY_TIMEOUT)
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+    let mut tracker = AttachmentVerificationTracker::new(expected_file_names.len());
+    loop {
+        let response = call_mcp_tool_with_deadline(
             config_path,
             "evaluate_script",
-            serde_json::json!({ "function": js }),
-        )?;
-        if parse_script_result(&check_res)
-            .ok()
-            .and_then(|p| p.as_bool())
-            .unwrap_or(false)
-        {
+            serde_json::json!({ "function": script }),
+            Some(deadline),
+        )
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let value = parse_script_result(&response)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let probe: AttachmentProbe = serde_json::from_value(value)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if tracker.observe(probe)? {
             if verbose {
                 println!(
-                    "{} accepted attachment '{}'",
+                    "{} verified {} attachment(s).",
                     provider.display_name(),
-                    file_name
+                    expected_file_names.len()
                 );
             }
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(500));
+        let remaining = deadline
+            .phase_timeout(ATTACHMENT_VERIFY_TIMEOUT, "attachment verification poll")
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
+            return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        thread::sleep(ATTACHMENT_VERIFY_POLL_INTERVAL);
     }
-
-    Err(format!(
-        "Timed out waiting for {} to show attachment '{}'",
-        provider.display_name(),
-        file_name
-    ))
 }
 
 fn upload_attachments_via_file_chooser(
@@ -4331,16 +5158,14 @@ fn upload_attachments_via_file_chooser(
     file_paths: &[String],
     verbose: bool,
 ) -> Result<(), String> {
-    for (path, verify_filename) in image_paths
-        .iter()
-        .map(|path| (path, false))
-        .chain(file_paths.iter().map(|path| (path, true)))
-    {
+    let total = image_paths.len() + file_paths.len();
+    for (index, path) in image_paths.iter().chain(file_paths.iter()).enumerate() {
         let canonical_path = std::fs::canonicalize(path)
-            .map_err(|e| format!("Failed to resolve file '{}': {}", path, e))?;
+            .map_err(|_| "Failed to resolve an attachment for native upload".to_string())?;
         let file_path = canonical_path.to_string_lossy().to_string();
 
-        let snapshot = take_snapshot_text(config_path)?;
+        let snapshot = take_snapshot_text(config_path)
+            .map_err(|_| "Native attachment upload menu was unavailable".to_string())?;
         let menu_uid = match provider {
             Provider::Gemini => {
                 find_snapshot_uid(&snapshot, &["上傳與工具"], &["更多", "雲端", "drive"])
@@ -4364,10 +5189,12 @@ fn upload_attachments_via_file_chooser(
                 "uid": menu_uid,
                 "includeSnapshot": false
             }),
-        )?;
+        )
+        .map_err(|_| "Native attachment upload menu did not open".to_string())?;
         thread::sleep(Duration::from_millis(500));
 
-        let snapshot = take_snapshot_text(config_path)?;
+        let snapshot = take_snapshot_text(config_path)
+            .map_err(|_| "Native attachment upload chooser was unavailable".to_string())?;
         let upload_uid = match provider {
             Provider::Gemini => find_snapshot_uid(&snapshot, &["上傳檔案"], &["雲端", "drive"])
                 .or_else(|| find_snapshot_uid(&snapshot, &["upload", "file"], &["drive"])),
@@ -4381,9 +5208,10 @@ fn upload_attachments_via_file_chooser(
 
         if verbose {
             println!(
-                "Uploading attachment '{}' to {}...",
-                file_path,
-                provider.display_name()
+                "Uploading attachment {}/{} to {} with the native file chooser...",
+                index + 1,
+                total,
+                provider.display_name(),
             );
         }
         call_mcp_tool(
@@ -4394,15 +5222,43 @@ fn upload_attachments_via_file_chooser(
                 "filePath": file_path,
                 "includeSnapshot": false
             }),
-        )?;
-        if verify_filename {
-            wait_for_attachment_indicator(config_path, provider, path, verbose)?;
-        } else {
-            thread::sleep(Duration::from_millis(800));
-        }
+        )
+        .map_err(|_| "Native attachment upload did not start".to_string())?;
     }
 
     Ok(())
+}
+
+fn run_native_then_fallback<Native, Fallback>(
+    native: Native,
+    fallback: Fallback,
+) -> Result<(), String>
+where
+    Native: FnOnce() -> Result<(), String>,
+    Fallback: FnOnce() -> Result<(), String>,
+{
+    match native() {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fallback()?;
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentUploadPolicy {
+    NativeThenDataTransferFallback,
+    DataTransferOnly,
+}
+
+fn document_upload_policy(provider: Provider) -> DocumentUploadPolicy {
+    match provider {
+        Provider::ChatGpt | Provider::Claude => {
+            DocumentUploadPolicy::NativeThenDataTransferFallback
+        }
+        Provider::Gemini => DocumentUploadPolicy::DataTransferOnly,
+    }
 }
 
 /// Map a file extension to a MIME type. Covers common image and document formats.
@@ -4488,7 +5344,7 @@ fn mime_type_for_extension(ext: &str) -> &'static str {
 /// Upload local image and/or document files to the provider prompt composer using the
 /// best available provider-specific upload mechanism.
 /// Returns an error string if any attachment fails to upload.
-fn upload_attachments_to_provider(
+fn upload_attachments_via_data_transfer(
     config_path: &str,
     provider: Provider,
     image_paths: &[String],
@@ -4500,37 +5356,11 @@ fn upload_attachments_to_provider(
         return Ok(());
     }
 
-    let data_transfer_image_paths: &[String] = if provider == Provider::Gemini
-        && !image_paths.is_empty()
-    {
-        match upload_attachments_via_file_chooser(config_path, provider, image_paths, &[], verbose)
-        {
-            Ok(()) => &[],
-            Err(e) => {
-                if verbose {
-                    eprintln!(
-                        "Warning: {} image file chooser upload failed, trying DataTransfer fallback: {}",
-                        provider.display_name(),
-                        e
-                    );
-                }
-                image_paths
-            }
-        }
-    } else {
-        image_paths
-    };
-
-    let data_transfer_total = data_transfer_image_paths.len() + file_paths.len();
-    if data_transfer_total == 0 {
-        return Ok(());
-    }
-
     if verbose {
         println!(
             "Attaching {} attachment(s) ({} image(s), {} file(s)) to the prompt...",
-            data_transfer_total,
-            data_transfer_image_paths.len(),
+            total,
+            image_paths.len(),
             file_paths.len()
         );
     }
@@ -4539,9 +5369,8 @@ fn upload_attachments_to_provider(
     // We pass raw base64 + mime and decode in JS to avoid `fetch(data:...)` which ChatGPT's
     // Content-Security-Policy blocks (results in "Failed to fetch").
     let mut files_json = Vec::new();
-    for path in data_transfer_image_paths.iter().chain(file_paths.iter()) {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+    for path in image_paths.iter().chain(file_paths.iter()) {
+        let bytes = std::fs::read(path).map_err(|_| "Failed to read an attachment".to_string())?;
         let ext = Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -4562,7 +5391,7 @@ fn upload_attachments_to_provider(
     }
 
     let files_json_str = serde_json::to_string(&files_json)
-        .map_err(|e| format!("Failed to serialize attachment data: {}", e))?;
+        .map_err(|_| "Failed to serialize attachment data".to_string())?;
     let composer_selectors = provider.composer_selectors_json();
     // Build JS without raw strings to avoid r#"..."# termination conflicts
     let js = "() => {\n".to_string()
@@ -4641,9 +5470,11 @@ fn upload_attachments_to_provider(
         config_path,
         "evaluate_script",
         serde_json::json!({ "function": js }),
-    )?;
+    )
+    .map_err(|_| "Failed to initiate attachment upload script".to_string())?;
 
-    let start_parsed = parse_script_result(&start_res)?;
+    let start_parsed = parse_script_result(&start_res)
+        .map_err(|_| "Failed to initiate attachment upload script".to_string())?;
     if !start_parsed.as_bool().unwrap_or(false) {
         return Err("Failed to initiate attachment upload script".to_string());
     }
@@ -4657,7 +5488,8 @@ fn upload_attachments_to_provider(
             config_path,
             "evaluate_script",
             serde_json::json!({ "function": "() => window.__upload_images_status || 'pending'" }),
-        )?;
+        )
+        .map_err(|_| "Attachment upload status was unavailable".to_string())?;
         if let Some(s) = parse_script_result(&check_res)
             .ok()
             .and_then(|p| p.as_str().map(|r| r.to_string()))
@@ -4668,7 +5500,7 @@ fn upload_attachments_to_provider(
     }
 
     if status.starts_with("error:") {
-        return Err(format!("Attachment upload failed: {}", status));
+        return Err("Attachment upload failed".to_string());
     }
     if status == "pending" {
         return Err("Timed out waiting for attachments to upload".to_string());
@@ -4678,34 +5510,94 @@ fn upload_attachments_to_provider(
         println!("Attachments attached successfully ({})", status);
     }
 
-    // Give the UI a moment to render the attachments before typing the prompt
-    thread::sleep(Duration::from_millis(800));
+    Ok(())
+}
 
-    if provider == Provider::Gemini {
-        // Gemini renders image attachments as thumbnails without a stable filename in
-        // the accessible text. Text/document chips do expose their filename, so keep
-        // the stricter post-upload check for `--file` attachments only.
-        for path in file_paths {
-            if let Err(e) = wait_for_attachment_indicator(config_path, provider, path, verbose) {
-                if verbose {
-                    eprintln!(
-                        "Warning: {} DataTransfer upload was not detected, trying file chooser fallback: {}",
-                        provider.display_name(),
-                        e
-                    );
-                }
-                return upload_attachments_via_file_chooser(
+/// Upload every attachment and then require an exact, healthy filename
+/// multiset to remain unchanged across two probes before the prompt may be
+/// typed or submitted.
+fn upload_attachments_to_provider(
+    config_path: &str,
+    provider: Provider,
+    image_paths: &[String],
+    file_paths: &[String],
+    summary: &AttachmentSummary,
+    verbose: bool,
+) -> Result<(), String> {
+    if summary.count() != image_paths.len() + file_paths.len() {
+        return Err("附件摘要數量不一致".to_string());
+    }
+
+    if !image_paths.is_empty() {
+        match provider {
+            Provider::Gemini => {
+                run_native_then_fallback(
+                    || {
+                        upload_attachments_via_file_chooser(
+                            config_path,
+                            provider,
+                            image_paths,
+                            &[],
+                            verbose,
+                        )
+                    },
+                    || {
+                        upload_attachments_via_data_transfer(
+                            config_path,
+                            provider,
+                            image_paths,
+                            &[],
+                            verbose,
+                        )
+                    },
+                )?;
+            }
+            Provider::ChatGpt | Provider::Claude => {
+                upload_attachments_via_data_transfer(
                     config_path,
                     provider,
                     image_paths,
-                    file_paths,
+                    &[],
                     verbose,
-                );
+                )?;
             }
         }
     }
 
-    Ok(())
+    match document_upload_policy(provider) {
+        DocumentUploadPolicy::NativeThenDataTransferFallback => {
+            // Native chooser is preferred for documents. The fallback is
+            // per-document, so a later chooser failure cannot duplicate
+            // documents that were already accepted.
+            for path in file_paths {
+                run_native_then_fallback(
+                    || {
+                        upload_attachments_via_file_chooser(
+                            config_path,
+                            provider,
+                            &[],
+                            std::slice::from_ref(path),
+                            verbose,
+                        )
+                    },
+                    || {
+                        upload_attachments_via_data_transfer(
+                            config_path,
+                            provider,
+                            &[],
+                            std::slice::from_ref(path),
+                            verbose,
+                        )
+                    },
+                )?;
+            }
+        }
+        DocumentUploadPolicy::DataTransferOnly => {
+            upload_attachments_via_data_transfer(config_path, provider, &[], file_paths, verbose)?;
+        }
+    }
+
+    verify_attachment_completion(config_path, provider, &summary.file_names, verbose)
 }
 
 /// Switch the selected provider to the specified model. The page must already be
@@ -5455,6 +6347,43 @@ fn submit_prompt_to_provider(
     submit_regular_prompt(config_path, provider, prompt)
 }
 
+fn execute_verified_prompt_submission<Upload, BeforeSubmit, Submit>(
+    receipt_path: Option<&Path>,
+    upload_and_verify: Upload,
+    before_submit: BeforeSubmit,
+    submit: Submit,
+) -> Result<(usize, String), String>
+where
+    Upload: FnOnce() -> Result<(), String>,
+    BeforeSubmit: FnOnce() -> Result<usize, String>,
+    Submit: FnOnce() -> Result<String, String>,
+{
+    if upload_and_verify().is_err() {
+        if let Some(path) = receipt_path {
+            record_session_receipt_event(path, SessionReceiptEvent::AttachmentsFailed)
+                .map_err(|_| "附件驗證失敗，且無法安全保存 receipt".to_string())?;
+        }
+        return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+    }
+    if let Some(path) = receipt_path {
+        record_session_receipt_event(path, SessionReceiptEvent::AttachmentsVerified)
+            .map_err(|_| "附件已驗證，但無法安全保存 receipt；prompt 未送出".to_string())?;
+    }
+
+    let initial_assistant_count = before_submit()?;
+    if let Some(path) = receipt_path {
+        record_session_receipt_event(path, SessionReceiptEvent::PromptIntentRecorded)
+            .map_err(|_| "無法保存 prompt submit intent；prompt 未送出".to_string())?;
+    }
+    let status = submit()?;
+    if let Some(path) = receipt_path {
+        record_session_receipt_event(path, SessionReceiptEvent::PromptSubmitted).map_err(|_| {
+            "prompt 已可能送出，但無法保存 submitted receipt；遠端狀態未知".to_string()
+        })?;
+    }
+    Ok((initial_assistant_count, status))
+}
+
 fn list_pages(config_path: &str) -> Result<Vec<Page>, String> {
     let list_res = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))?;
     let text = list_res
@@ -5471,9 +6400,10 @@ fn ensure_isolated_provider_tab(
     config_path: &str,
     provider: Provider,
     session_id: &str,
+    attachment_summary: &AttachmentSummary,
     headless: bool,
     verbose: bool,
-) -> Result<usize, String> {
+) -> Result<PathBuf, String> {
     let session_id = validate_session_id(session_id)?;
     clear_owned_page();
     let existing_pages = list_pages(config_path)?;
@@ -5535,10 +6465,12 @@ fn ensure_isolated_provider_tab(
             }),
         )?;
         bind_owned_page(&session_id, page_id)?;
-        if let Err(error) = write_session_receipt(&session_id, provider, page_id) {
-            clear_owned_page();
-            return Err(error);
-        }
+        let receipt_path = write_session_receipt(
+            &session_id,
+            attachment_summary.count(),
+            attachment_summary.total_bytes,
+        )
+        .inspect_err(|_| clear_owned_page())?;
         if verbose {
             println!(
                 "Owned {} page ID {} for session {}.",
@@ -5547,7 +6479,7 @@ fn ensure_isolated_provider_tab(
                 session_id
             );
         }
-        return Ok(page_id);
+        return Ok(receipt_path);
     }
 
     Err(format!(
@@ -6067,6 +6999,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
+    let attachment_summary = match summarize_attachments(&cli.images, &cli.files) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+        }
+    };
 
     if !command_verbose {
         // SAFETY: Called before spawning other threads and before loading MCP config.
@@ -6437,28 +7376,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    let tab_result = if let Some(session_id) = safe_session_id.as_deref() {
-        ensure_isolated_provider_tab(
+    let receipt_path = if let Some(session_id) = safe_session_id.as_deref() {
+        match ensure_isolated_provider_tab(
             &config_path,
             provider,
             session_id,
+            &attachment_summary,
             is_headless,
             command_verbose,
-        )
-        .map(|_| ())
+        ) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);
+                std::process::exit(1);
+            }
+        }
     } else {
-        ensure_provider_tab(
+        if let Err(error) = ensure_provider_tab(
             &config_path,
             provider,
             cli.new,
             is_headless,
             command_verbose,
-        )
+        ) {
+            eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);
+            std::process::exit(1);
+        }
+        None
     };
-    if let Err(e) = tab_result {
-        eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
-        std::process::exit(1);
-    }
 
     // Show attached images in the terminal before sending
     if !cli.images.is_empty() {
@@ -6504,40 +7449,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Upload any attached images/files before counting messages (so the UI is ready)
-    if (!cli.images.is_empty() || !cli.files.is_empty())
-        && let Err(e) = upload_attachments_to_provider(
-            &config_path,
-            provider,
-            &cli.images,
-            &cli.files,
-            command_verbose,
-        )
-    {
-        eprintln!("Error attaching images/files: {}", e);
-        std::process::exit(1);
-    }
-
-    // Get initial number of assistant messages before submitting the prompt
-    let assistant_selector = serde_json::to_string(provider.assistant_selector())
-        .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
-    let count_res = call_mcp_tool(
-        &config_path,
-        "evaluate_script",
-        serde_json::json!({
-            "function": format!("() => document.querySelectorAll({}).length", assistant_selector)
-        }),
-    )?;
-    let initial_assistant_count = parse_script_result(&count_res)
-        .ok()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    if command_verbose {
-        println!("Setting prompt text and submitting...");
-    }
-    let status = submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
-        .map_err(|e| format!("Text entry or submission failed: {}", e))?;
+    let (initial_assistant_count, status) = execute_verified_prompt_submission(
+        receipt_path.as_deref(),
+        || {
+            upload_attachments_to_provider(
+                &config_path,
+                provider,
+                &cli.images,
+                &cli.files,
+                &attachment_summary,
+                command_verbose,
+            )
+        },
+        || {
+            let assistant_selector = serde_json::to_string(provider.assistant_selector())
+                .map_err(|_| "Failed to serialize assistant selector".to_string())?;
+            let count_res = call_mcp_tool(
+                &config_path,
+                "evaluate_script",
+                serde_json::json!({
+                    "function": format!(
+                        "() => document.querySelectorAll({}).length",
+                        assistant_selector
+                    )
+                }),
+            )?;
+            Ok(parse_script_result(&count_res)
+                .ok()
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize)
+        },
+        || {
+            if command_verbose {
+                println!("Setting prompt text and submitting...");
+            }
+            submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
+                .map_err(|error| format!("Text entry or submission failed: {}", error))
+        },
+    )
+    .map_err(|error| format!("Verified prompt submission failed: {}", error))?;
 
     if command_verbose {
         println!("Prompt submitted successfully: {}", status);

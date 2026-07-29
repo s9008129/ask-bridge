@@ -21,3 +21,24 @@
   - 單元測試固定涵蓋 launcher PID 與 listener PID 不同、WMI 空白列、9223／92230 精確解析、stale identity、mixed listeners 與強殺 identity 改變。
   - 單元測試固定涵蓋 ChatGPT auth path precedence、composer-only provider 差異、未穩定訊號不得成為 `LoggedIn`／`LoggedOut`。
   - Windows release 前執行 login → 保持 Chrome 開啟 → query → graceful close → restart query 的真機流程；若無法執行，必須明確記錄限制，不得只以跨平台單元測試宣稱 session 問題已解決。
+
+## 2026-07-29 專案 provider denylist 必須先於 skill 與既有相容性
+
+- Mistake class: misunderstanding requirements、security/privacy oversight。
+- Failure mode: ask-bridge skill 與既有程式碼雖宣稱 Claude 相容，若未先套用本專案明確 denylist，Agent 可能把 Claude 當成可用的 live 驗證 provider。
+- Detection signal: 任務限制已寫明 ask-bridge MUST NOT use Claude，但執行計畫仍包含 Claude CLI、session、login、query、upload、mutation 或 live probe。
+- Prevention rule: 每次執行任何 provider 命令前先建立本輪 allowlist／denylist；專案級 denylist 優先於 skill、help 與既有功能宣告。可保留未被要求刪除的跨 provider相容程式碼，但只能以純函式、mock 或 fixture 離線驗證。
+- Tripwires:
+  - 執行任何 `ask-bridge` provider 命令前搜尋本輪 todo/lessons 的 `MUST NOT use Claude`，命中即停止 Claude 路徑。
+  - 驗證紀錄若出現 Claude，只能是 source-level pure test/mock/fixture，不得包含 CLI、session、login、query、upload、mutation 或 live probe。
+
+## 2026-07-29 外層 deadline 必須涵蓋所有 nested timeout
+
+- Mistake class: incorrect assumption about repo behavior、missing verification。
+- Failure mode: 附件 probe 雖把剩餘 60 秒傳給 tool timeout，但 session slot 為空或 config 改變時，內層 connect 先使用獨立 120 秒 timeout；reset、connect、owned-page select 與 probe tool 因此可能串接超過外層 deadline。
+- Detection signal: 從 `verify_attachment_completion()` 沿呼叫鏈檢查時，發現 `remaining` 只約束最內層 tool，`mcp_session_connect()` 與 reset 仍讀固定常數。
+- Prevention rule: 任何宣告 end-to-end timeout 的安全閘門都必須建立單一 absolute deadline，所有 nested reset/connect/select/tool phase只能取得 `min(phase cap, remaining)`；deadline耗盡即 fail-closed，且不得 replay remote call。
+- Tripwires:
+  - 逐層搜尋 timeout/deadline 呼叫鏈，確認沒有在內層重新建立較長 timer或忽略外層 budget。
+  - 使用 synthetic `Instant` 的 deterministic test，固定驗證 connect 消耗 budget 後 tool只得到剩餘時間，耗盡時立即回錯；不得用真實 60 秒 sleep。
+  - 附件 gate regression固定斷言 uploading、missing、error、timeout 的 submit closure呼叫次數皆為 0。

@@ -215,7 +215,10 @@ ask-bridge --provider chatgpt \
 
 安全模式會以精確 page ID 綁定本次新分頁，並在
 `~/.config/ask-bridge/sessions/<session-id>.json` 寫入權限為 `0600` 的
-session receipt。它不會關閉 ChatGPT、Gemini 或其他既有分頁；同一 provider
+schema-v2 session receipt。附件檔名 multiset、數量與無 uploading/error 狀態
+必須連續兩次穩定，工具才會記錄 submit intent 並輸入 prompt；逾時或錯誤會
+fail-closed。receipt 只保存計數、總 bytes 與狀態，不保存 prompt、檔名或路徑。
+它不會關閉 ChatGPT、Gemini 或其他既有分頁；同一 provider
 的另一個安全模式程序若正在執行，會因跨程序 lease 而 fail-closed。此模式
 要求有效 UUID，且只支援直接送出 prompt，不會套用到 debug subcommand。
 
@@ -225,7 +228,8 @@ session receipt。它不會關閉 ChatGPT、Gemini 或其他既有分頁；同�
 ask-bridge capabilities --json
 ```
 
-只有輸出包含 `isolated_new_tab_v1` 才能啟用上述安全模式。登入後可用唯讀
+只有輸出同時包含 `isolated_new_tab_v1` 與 `verified_file_upload_v1`，整合工具
+才能啟用安全附件工作。登入後可用唯讀
 session probe 驗證目前登入狀態，不會送出 prompt：
 
 ```bash
