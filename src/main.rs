@@ -977,6 +977,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("ask-bridge capabilities");
         println!("  {}", ISOLATED_NEW_TAB_CAPABILITY);
         println!("  {}", VERIFIED_FILE_UPLOAD_CAPABILITY);
+        println!("  {}", VERIFIED_MIXED_ATTACHMENT_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
