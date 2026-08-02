@@ -288,7 +288,14 @@ impl Provider {
 
     fn assistant_selector(self) -> &'static str {
         match self {
-            Provider::ChatGpt => "[data-message-author-role=\"assistant\"], .agent-turn",
+            // ChatGPT currently renders a semantic assistant node inside an
+            // `.agent-turn` wrapper.  Selecting both naively counts the same
+            // turn twice and makes the response identity gate fail closed.
+            // Keep the wrapper as the canonical turn and only use the role
+            // marker when it is not nested in one.
+            Provider::ChatGpt => {
+                ".agent-turn, [data-message-author-role=\"assistant\"]:not(.agent-turn *)"
+            }
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
         }
@@ -654,6 +661,7 @@ enum ResponseFailureCode {
     PageOwnershipChanged,
     PageUrlChanged,
     ResponseIdentityChanged,
+    ProviderRejected,
     ResponseProbeFailed,
     ResponseTimeout,
     ImageDownloadEmpty,
@@ -667,6 +675,7 @@ impl fmt::Display for ResponseFailureCode {
             ResponseFailureCode::PageOwnershipChanged => "page_ownership_changed",
             ResponseFailureCode::PageUrlChanged => "page_url_changed",
             ResponseFailureCode::ResponseIdentityChanged => "response_identity_changed",
+            ResponseFailureCode::ProviderRejected => "provider_rejected",
             ResponseFailureCode::ResponseProbeFailed => "response_probe_failed",
             ResponseFailureCode::ResponseTimeout => "response_timeout",
             ResponseFailureCode::ImageDownloadEmpty => "image_download_empty",
@@ -698,22 +707,28 @@ impl From<String> for ImageDownloadError {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct ResponseDomProbe {
     ownership_token_matches: bool,
     provider_url_owned: bool,
     url: String,
+    conversation_id: String,
+    turn_id: String,
+    artifact_ids: Vec<String>,
     user_count: usize,
     assistant_count: usize,
     generation_control_visible: bool,
     content_present: bool,
+    provider_failure_visible: bool,
     loaded_large_image_count: usize,
     dom_signature: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedResponseIdentity {
-    url: String,
+    conversation_id: String,
+    turn_id: String,
+    artifact_ids: Vec<String>,
     user_count: usize,
     assistant_count: usize,
     dom_signature: String,
@@ -731,10 +746,13 @@ struct ResponseCompletionTracker {
     expected_output_type: ExpectedOutputType,
     initial_user_count: usize,
     initial_assistant_count: usize,
-    response_url: Option<String>,
+    response_conversation_id: Option<String>,
+    response_turn_id: Option<String>,
+    response_artifact_ids: Option<Vec<String>>,
     stable_signature: Option<String>,
     stable_probes: usize,
-    saw_control_absent_for_new_response: bool,
+    provider_failure_signature: Option<String>,
+    provider_failure_probes: usize,
     terminal: Option<ResponseTrackerDecision>,
 }
 
@@ -748,10 +766,13 @@ impl ResponseCompletionTracker {
             expected_output_type,
             initial_user_count,
             initial_assistant_count,
-            response_url: None,
+            response_conversation_id: None,
+            response_turn_id: None,
+            response_artifact_ids: None,
             stable_signature: None,
             stable_probes: 0,
-            saw_control_absent_for_new_response: false,
+            provider_failure_signature: None,
+            provider_failure_probes: 0,
             terminal: None,
         }
     }
@@ -778,36 +799,111 @@ impl ResponseCompletionTracker {
             return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
         }
         if probe.user_count == self.initial_user_count {
-            if self.response_url.is_some() {
+            if self.response_conversation_id.is_some() {
                 return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
             }
             self.reset_stability();
             return ResponseTrackerDecision::Pending;
         }
         if probe.assistant_count == self.initial_assistant_count {
-            if self.response_url.is_some() {
+            if self.response_conversation_id.is_some() {
                 return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
             }
             self.reset_stability();
             return ResponseTrackerDecision::Pending;
         }
 
-        match &self.response_url {
-            Some(response_url) if response_url != &probe.url => {
+        match (
+            &self.response_conversation_id,
+            probe.conversation_id.as_str(),
+        ) {
+            (None, "") => {}
+            (None, conversation_id) => {
+                self.response_conversation_id = Some(conversation_id.to_string());
+            }
+            (Some(current), next) if current == next => {}
+            (Some(current), next)
+                if current.starts_with("home:") && next.starts_with("conversation:") =>
+            {
+                // ChatGPT creates a conversation with history.pushState after
+                // the first assistant shell appears.  The home page is not a
+                // response identity; lock only once the canonical /c/<id>
+                // route exists.  A later conversation-id change remains an
+                // ownership failure.
+                self.response_conversation_id = Some(next.to_string());
+            }
+            (Some(current), next)
+                if current.starts_with("conversation:WEB:")
+                    && next.starts_with("conversation:")
+                    && !next.starts_with("conversation:WEB:") =>
+            {
+                // The isolated ChatGPT tab can expose a temporary WEB
+                // conversation id before the server assigns the canonical
+                // UUID.  Treat that one SPA replacement like the home-page
+                // transition; once a real id is locked, A -> B is unknown.
+                self.response_conversation_id = Some(next.to_string());
+            }
+            (Some(_), _) => {
                 return self.finish_unknown(ResponseFailureCode::PageUrlChanged);
             }
-            None => self.response_url = Some(probe.url.clone()),
-            Some(_) => {}
+        }
+
+        if !probe.turn_id.is_empty() {
+            match &self.response_turn_id {
+                Some(current) if current != &probe.turn_id => {
+                    return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+                }
+                None => self.response_turn_id = Some(probe.turn_id.clone()),
+                Some(_) => {}
+            }
+        }
+        if !probe.artifact_ids.is_empty() {
+            match &self.response_artifact_ids {
+                Some(current) if current != &probe.artifact_ids => {
+                    return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+                }
+                None => self.response_artifact_ids = Some(probe.artifact_ids.clone()),
+                Some(_) => {}
+            }
         }
 
         if probe.generation_control_visible {
-            if self.saw_control_absent_for_new_response {
-                return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
-            }
+            // Provider UIs can briefly hide and remount Stop while the same
+            // image response is transitioning from an assistant shell to its
+            // loaded artifact.  It is a readiness signal, not an identity
+            // signal; counts, route, ownership token and semantic anchors
+            // above remain the fail-closed identity gates.
             self.reset_stability();
             return ResponseTrackerDecision::Pending;
         }
-        self.saw_control_absent_for_new_response = true;
+
+        if self.expected_output_type == ExpectedOutputType::Image
+            && probe.provider_failure_visible
+            && probe.content_present
+            && probe.loaded_large_image_count == 0
+            && !probe.dom_signature.is_empty()
+            && probe.conversation_id.starts_with("conversation:")
+            && !probe.turn_id.is_empty()
+            && probe.artifact_ids.is_empty()
+        {
+            // A provider refusal is a terminal response, but it does not
+            // satisfy the image artifact contract.  Require the same
+            // provider marker and DOM signature to persist for the normal
+            // stability window so a transient error label cannot terminate a
+            // still-streaming response.  Once stable, fail closed instead of
+            // waiting for the full provider timeout; the submitted receipt
+            // remains ambiguous for the caller.
+            if self.provider_failure_signature.as_deref() == Some(probe.dom_signature.as_str()) {
+                self.provider_failure_probes = self.provider_failure_probes.saturating_add(1);
+            } else {
+                self.provider_failure_signature = Some(probe.dom_signature.clone());
+                self.provider_failure_probes = 1;
+            }
+            if self.provider_failure_probes >= RESPONSE_REQUIRED_STABLE_PROBES {
+                return self.finish_unknown(ResponseFailureCode::ProviderRejected);
+            }
+            return ResponseTrackerDecision::Pending;
+        }
 
         let artifact_ready = match self.expected_output_type {
             ExpectedOutputType::Text => probe.content_present,
@@ -830,7 +926,9 @@ impl ResponseCompletionTracker {
         }
 
         let decision = ResponseTrackerDecision::Completed(VerifiedResponseIdentity {
-            url: probe.url,
+            conversation_id: self.response_conversation_id.clone().unwrap_or_default(),
+            turn_id: self.response_turn_id.clone().unwrap_or_default(),
+            artifact_ids: self.response_artifact_ids.clone().unwrap_or_default(),
             user_count: probe.user_count,
             assistant_count: probe.assistant_count,
             dom_signature: probe.dom_signature,
@@ -855,6 +953,8 @@ impl ResponseCompletionTracker {
     fn reset_stability(&mut self) {
         self.stable_signature = None;
         self.stable_probes = 0;
+        self.provider_failure_signature = None;
+        self.provider_failure_probes = 0;
     }
 }
 
@@ -3129,10 +3229,14 @@ mod tests {
             ownership_token_matches: true,
             provider_url_owned: true,
             url: "https://chatgpt.com/c/response-contract".to_string(),
+            conversation_id: "conversation:response-contract".to_string(),
+            turn_id: String::new(),
+            artifact_ids: Vec::new(),
             user_count: 1,
             assistant_count,
             generation_control_visible: generating,
             content_present: assistant_count > 0,
+            provider_failure_visible: false,
             loaded_large_image_count,
             dom_signature: signature.to_string(),
         }
@@ -3207,6 +3311,47 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_assistant_selector_deduplicates_nested_role_nodes() {
+        assert_eq!(
+            Provider::ChatGpt.assistant_selector(),
+            ".agent-turn, [data-message-author-role=\"assistant\"]:not(.agent-turn *)"
+        );
+    }
+
+    #[test]
+    fn text_completion_fails_closed_on_assistant_count_change() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+
+        // The DOM probe must canonicalize one visual turn before it reaches
+        // this state machine.  A real count delta remains an identity change
+        // for text as well as image tasks, so it must fail closed.
+        assert_eq!(
+            tracker.observe(response_probe(8, false, 0, "text-final-v1")),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::AssistantCountChanged)
+        );
+    }
+
+    #[test]
+    fn image_provider_rejection_fails_closed_without_waiting_for_timeout() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 0);
+        let mut rejected = response_probe(1, false, 0, "provider-rejection");
+        rejected.provider_failure_visible = true;
+        rejected.turn_id = "request-WEB:refusal-0".to_string();
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+    }
+
+    #[test]
     fn response_completion_fails_closed_on_ownership_url_or_assistant_interference() {
         let mut ownership = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
         let mut lost = response_probe(3, false, 1, "ready");
@@ -3237,9 +3382,40 @@ mod tests {
         );
         let mut navigated = response_probe(3, false, 1, "ready");
         navigated.url = "https://chatgpt.com/c/different-conversation".to_string();
+        navigated.conversation_id = "conversation:different-conversation".to_string();
         assert_eq!(
             url.observe(navigated),
             ResponseTrackerDecision::Unknown(ResponseFailureCode::PageUrlChanged)
+        );
+
+        let mut new_chat = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut home_shell = response_probe(3, false, 0, "assistant-shell");
+        home_shell.url = "https://chatgpt.com/".to_string();
+        home_shell.conversation_id = "home:https://chatgpt.com".to_string();
+        assert_eq!(
+            new_chat.observe(home_shell),
+            ResponseTrackerDecision::Pending
+        );
+        let mut conversation_shell = response_probe(3, false, 0, "assistant-shell");
+        conversation_shell.url = "https://chatgpt.com/c/new-conversation".to_string();
+        conversation_shell.conversation_id = "conversation:new-conversation".to_string();
+        assert_eq!(
+            new_chat.observe(conversation_shell),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut web_chat = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut web_shell = response_probe(3, false, 0, "assistant-shell");
+        web_shell.conversation_id = "conversation:WEB:temporary".to_string();
+        assert_eq!(
+            web_chat.observe(web_shell),
+            ResponseTrackerDecision::Pending
+        );
+        let mut uuid_shell = response_probe(3, false, 0, "assistant-shell");
+        uuid_shell.conversation_id = "conversation:canonical-uuid".to_string();
+        assert_eq!(
+            web_chat.observe(uuid_shell),
+            ResponseTrackerDecision::Pending
         );
 
         let mut regenerated = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
@@ -3249,13 +3425,74 @@ mod tests {
         );
         assert_eq!(
             regenerated.observe(response_probe(3, true, 0, "manual-regeneration")),
-            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut remounted_stop = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            remounted_stop.observe(response_probe(3, false, 0, "assistant-shell")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            remounted_stop.observe(response_probe(3, true, 0, "assistant-shell")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            remounted_stop.observe(response_probe(3, false, 1, "image-v1")),
+            ResponseTrackerDecision::Pending
         );
 
         let mut timeout = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
         assert_eq!(
             timeout.timeout(),
             ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseTimeout)
+        );
+    }
+
+    #[test]
+    fn response_completion_uses_semantic_turn_and_artifact_identity() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut shell = response_probe(3, false, 0, "shell");
+        shell.turn_id = "turn-1".to_string();
+        assert_eq!(tracker.observe(shell), ResponseTrackerDecision::Pending);
+
+        let mut remounted_stop = response_probe(3, true, 0, "shell-mutated");
+        remounted_stop.turn_id = "turn-1".to_string();
+        assert_eq!(
+            tracker.observe(remounted_stop),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut image = response_probe(3, false, 1, "image-v1");
+        image.turn_id = "turn-1".to_string();
+        image.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            tracker.observe(image.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(image.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(image),
+            ResponseTrackerDecision::Completed(_)
+        ));
+
+        let mut changed_turn = response_probe(3, false, 1, "image-v2");
+        changed_turn.turn_id = "turn-2".to_string();
+        changed_turn.artifact_ids = vec!["image-artifact-2".to_string()];
+        let mut identity_tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut first = response_probe(3, false, 1, "image-v1");
+        first.turn_id = "turn-1".to_string();
+        first.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            identity_tracker.observe(first),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            identity_tracker.observe(changed_turn),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
         );
     }
 
@@ -3385,6 +3622,10 @@ mod tests {
         assert!(script.contains("naturalWidth < minimumImageDimension"));
         assert!(script.contains("naturalHeight < minimumImageDimension"));
         assert!(script.contains("dom_signature"));
+        assert!(script.contains("provider_failure_visible"));
+        assert!(script.contains("conversation_id"));
+        assert!(script.contains("turn_id"));
+        assert!(script.contains("artifact_ids"));
         assert!(script.contains("window.location.origin"));
         assert!(!script.contains("__TOKEN__"));
         assert!(!script.contains("__ASSISTANT_SELECTOR__"));
@@ -5559,10 +5800,11 @@ fn download_images_from_latest_message(
     let expected_identity = match verified_response {
         Some((baseline, identity)) => serde_json::json!({
             "ownership_token": baseline.ownership_token,
-            "url": identity.url,
+            "conversation_id": identity.conversation_id,
+            "turn_id": identity.turn_id,
+            "artifact_ids": identity.artifact_ids,
             "user_count": identity.user_count,
             "assistant_count": identity.assistant_count,
-            "dom_signature": identity.dom_signature,
         }),
         None => Value::Null,
     };
@@ -5586,15 +5828,24 @@ fn download_images_from_latest_message(
                             const rect = element.getBoundingClientRect();
                             return rect.width > 0 && rect.height > 0;
                         };
-                        const domSignature = (element) => {
-                            if (!element) return '';
-                            const source = element.innerHTML || '';
-                            let hash = 2166136261;
-                            for (let index = 0; index < source.length; index += 1) {
-                                hash ^= source.charCodeAt(index);
-                                hash = Math.imul(hash, 16777619);
-                            }
-                            return `${source.length}:${(hash >>> 0).toString(16)}`;
+                        const conversationId = (() => {
+                            const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
+                            return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
+                        })();
+                        const semanticIdentity = (element) => {
+                            const turn = element
+                                ? (element.closest('section[data-turn="assistant"][data-turn-id]') ||
+                                    element.closest('[data-turn="assistant"][data-turn-id]') || element)
+                                : null;
+                            const turnId = turn?.getAttribute('data-turn-id') || '';
+                            const artifactIds = turn
+                                ? Array.from(turn.querySelectorAll('[id^="image-"]'))
+                                    .map((candidate) => candidate.id)
+                                    .filter(Boolean)
+                                    .filter((id, index, all) => all.indexOf(id) === index)
+                                    .sort()
+                                : [];
+                            return { turnId, artifactIds };
                         };
                         const responseState = () => {
                             const assistantMessages = Array.from(document.querySelectorAll(assistantSelector));
@@ -5604,15 +5855,18 @@ fn download_images_from_latest_message(
                                 : Array.from(document.querySelectorAll(latestSelector));
                             const latestMessage = latestMessages[latestMessages.length - 1] || null;
                             if (!expectedIdentity) return { ok: true, latestMessage };
+                            const identity = semanticIdentity(latestMessage);
                             const generationControl = stopSelectors
                                 .map((selector) => document.querySelector(selector))
                                 .find(isVisibleControl);
                             const ok =
                                 window.__ask_bridge_response_owner_v1 === expectedIdentity.ownership_token &&
-                                window.location.href === expectedIdentity.url &&
+                                conversationId === expectedIdentity.conversation_id &&
+                                (!expectedIdentity.turn_id || identity.turnId === expectedIdentity.turn_id) &&
+                                (expectedIdentity.artifact_ids.length === 0 ||
+                                    JSON.stringify(identity.artifactIds) === JSON.stringify(expectedIdentity.artifact_ids)) &&
                                 userMessages.length === expectedIdentity.user_count &&
                                 assistantMessages.length === expectedIdentity.assistant_count &&
-                                domSignature(latestMessage) === expectedIdentity.dom_signature &&
                                 !generationControl;
                             return { ok, latestMessage };
                         };
@@ -7783,15 +8037,33 @@ fn build_response_probe_script(
                 }
                 return `${source.length}:${(hash >>> 0).toString(16)}`;
             };
+            const conversationId = (() => {
+                const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
+                return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
+            })();
             const messages = Array.from(document.querySelectorAll(assistantSelector));
             const userMessages = Array.from(document.querySelectorAll(userSelector));
             const latest = messages[messages.length - 1] || null;
+            const turn = latest
+                ? (latest.closest('section[data-turn="assistant"][data-turn-id]') ||
+                    latest.closest('[data-turn="assistant"][data-turn-id]') || latest)
+                : null;
+            const turnId = turn?.getAttribute('data-turn-id') || '';
+            const artifactIds = turn
+                ? Array.from(turn.querySelectorAll('[id^="image-"]'))
+                    .map((element) => element.id)
+                    .filter(Boolean)
+                    .filter((id, index, all) => all.indexOf(id) === index)
+                    .sort()
+                : [];
             const loadedImages = latest
                 ? Array.from(latest.querySelectorAll('img')).filter(isLargeLoadedImage)
                 : [];
             const generationControl = stopSelectors
                 .map((selector) => document.querySelector(selector))
                 .find(isVisibleControl);
+            const latestText = latest ? (latest.textContent || '') : '';
+            const providerFailureVisible = Boolean(latest && /(?:content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i.test(latestText));
             let providerUrlOwned = false;
             try {
                 providerUrlOwned = window.location.origin === new URL(__PROVIDER_HOME_URL__).origin;
@@ -7802,10 +8074,14 @@ fn build_response_probe_script(
                 ownership_token_matches: window.__ask_bridge_response_owner_v1 === __TOKEN__,
                 provider_url_owned: providerUrlOwned,
                 url: window.location.href,
+                conversation_id: conversationId,
+                turn_id: turnId,
+                artifact_ids: artifactIds,
                 user_count: userMessages.length,
                 assistant_count: messages.length,
                 generation_control_visible: Boolean(generationControl),
                 content_present: Boolean(latest && (((latest.textContent || '').trim().length > 0) || loadedImages.length > 0)),
+                provider_failure_visible: providerFailureVisible,
                 loaded_large_image_count: loadedImages.length,
                 dom_signature: domSignature(latest)
             };

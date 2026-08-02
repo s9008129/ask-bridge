@@ -52,4 +52,15 @@
 - Tripwires:
   - pure state-machine regression 固定重播「assistant 先出現、Stop 消失超過舊穩定窗、圖片稍後出現」，圖片出現前不得 completed。
   - `--image-output` 的 zero/download error/timeout/ownership or URL interference 固定映射 non-zero 與低敏感度 receipt failure code。
-  - capability gate 固定要求 `verified_image_response_completion_v1`；receipt privacy canary不得出現在 prompt、回覆、URL、DOM、檔名或路徑欄位。
+- capability gate 固定要求 `verified_image_response_completion_v1`；receipt privacy canary不得出現在 prompt、回覆、URL、DOM、檔名或路徑欄位。
+
+## 2026-08-02 SPA 語意 identity 與 provider 拒絕終態
+
+- Mistake class: incorrect assumption about provider DOM／timing、missing verification。
+- Failure mode: ChatGPT 以外層 `.agent-turn` 加內層 assistant role 造成同一 turn 雙計；新對話又會先經 home／`conversation:WEB:*` 再切正式 UUID；Stop 可在同一圖片回應中 remount。另一種終態是 assistant 已明確回報政策／暫時限制拒絕但沒有圖片，若只等待 artifact 會拖到完整 timeout。
+- Detection signal: readonly CDP 顯示 canonical assistant=1、舊 selector=2；同一頁的 semantic conversation／turn／artifact anchor 未變但 Stop 先消失後出現；provider refusal turn 為 Stop=0、large image=0、穩定 DOM，receipt 卻長時間 pending。
+- Prevention rule: selector 必須以 containment 去重；response identity 只鎖 canonical conversation、latest turn、artifact ID set 與 ownership token，允許一次 home→conversation／WEB→UUID transition，禁止之後 A→B。Stop 是 readiness，不是 identity。圖片 provider refusal 只能在本次 owned latest turn、無 Stop／大圖、明確 marker 且同一 DOM signature 連續三次穩定後以 `provider_rejected` fail closed；不保存錯誤文字，也不自動重送已 submitted Prompt。
+- Tripwires:
+  - Chrome fixture 固定驗證 nested／agent-only／role-only／sibling selector counts；state machine 固定覆蓋 home→conversation、WEB→UUID、Stop remount 與真正 turn／artifact change。
+  - refusal fixture 固定要求單次／兩次 marker probe 維持 Pending，第三次穩定才 Unknown；普通串流文字、marker 消失或大圖出現不得誤判拒絕。
+  - 每次真實 provider E2E 先保存 low-sensitivity manifest／receipt／hash；看到 `prompt_submission=submitted` 後不重送，並把 provider failure 與 bridge timeout 分開記錄。
