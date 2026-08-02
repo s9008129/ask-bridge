@@ -42,3 +42,14 @@
   - 逐層搜尋 timeout/deadline 呼叫鏈，確認沒有在內層重新建立較長 timer或忽略外層 budget。
   - 使用 synthetic `Instant` 的 deterministic test，固定驗證 connect 消耗 budget 後 tool只得到剩餘時間，耗盡時立即回錯；不得用真實 60 秒 sleep。
   - 附件 gate regression固定斷言 uploading、missing、error、timeout 的 submit closure呼叫次數皆為 0。
+
+## 2026-08-02 Provider 完成必須由預期產物證明
+
+- Mistake class: incorrect assumption about repo behavior、missing verification。
+- Failure mode: 把「新增 assistant 節點且 Stop control 短暫消失」當成圖片生成完成；provider 圖片實際稍後才載入，bridge 先退出後又把零圖片下載視為成功，形成遠端已有產物、本機卻是空輸出。
+- Detection signal: receipt 顯示 prompt 已 submitted，但本機沒有圖片；既有輪詢只觀察 assistant count／Stop，不觀察最新回應中的 loaded large image，也沒有把 download count 納入 exit contract。
+- Prevention rule: 完成條件必須由呼叫者宣告的預期輸出種類決定。圖片工作只有在唯一新增 assistant、無生成控制項、至少一張已載入大尺寸圖片、DOM 簽章連續穩定且 response identity 未改變後才可下載；零產物與下載錯誤必須 fail loudly。
+- Tripwires:
+  - pure state-machine regression 固定重播「assistant 先出現、Stop 消失超過舊穩定窗、圖片稍後出現」，圖片出現前不得 completed。
+  - `--image-output` 的 zero/download error/timeout/ownership or URL interference 固定映射 non-zero 與低敏感度 receipt failure code。
+  - capability gate 固定要求 `verified_image_response_completion_v1`；receipt privacy canary不得出現在 prompt、回覆、URL、DOM、檔名或路徑欄位。

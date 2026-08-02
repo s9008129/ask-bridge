@@ -217,7 +217,10 @@ ask-bridge --provider chatgpt \
 `~/.config/ask-bridge/sessions/<session-id>.json` 寫入權限為 `0600` 的
 schema-v2 session receipt。附件檔名 multiset、數量與無 uploading/error 狀態
 必須連續兩次穩定，工具才會記錄 submit intent 並輸入 prompt；逾時或錯誤會
-fail-closed。receipt 只保存計數、總 bytes 與狀態，不保存 prompt、檔名或路徑。
+fail-closed。圖片工作則必須等到本次唯一新增的 assistant 回應已停止生成、至少
+一張大尺寸圖片載入完成，且 DOM 簽章連續穩定後才算完成。receipt 只保存計數、
+預期輸出種類、completion enum 與固定 failure code，不保存 prompt、回覆、URL、
+DOM、檔名或路徑。
 它不會關閉 ChatGPT、Gemini 或其他既有分頁；同一 provider
 的另一個安全模式程序若正在執行，會因跨程序 lease 而 fail-closed。此模式
 要求有效 UUID，且只支援直接送出 prompt，不會套用到 debug subcommand。
@@ -228,8 +231,9 @@ fail-closed。receipt 只保存計數、總 bytes 與狀態，不保存 prompt�
 ask-bridge capabilities --json
 ```
 
-只有輸出同時包含 `isolated_new_tab_v1` 與 `verified_file_upload_v1`，整合工具
-才能啟用安全附件工作。登入後可用唯讀
+安全附件工作至少需要 `isolated_new_tab_v1` 與 `verified_file_upload_v1`；要求
+生成圖片並下載的整合工具還必須檢查
+`verified_image_response_completion_v1`。登入後可用唯讀
 session probe 驗證目前登入狀態，不會送出 prompt：
 
 ```bash
@@ -344,7 +348,7 @@ ask-bridge "請對照這張設計圖與規格文件，指出不一致的地方�
 
 #### 顯示上傳結果
 
-provider 回覆後，可使用 `-i` / `--image-output` 指定生成圖片的下載路徑（資料夾或檔案路徑）。
+provider 回覆後，可使用 `-i` / `--image-output` 指定生成圖片的下載路徑（資料夾或檔案路徑）。指定此旗標即啟用嚴格圖片產物契約：零張圖片、下載錯誤、回應 ownership 改變或逾時都會以非零狀態結束，不會把空輸出視為成功。
 
 ### 9. 切換模型
 

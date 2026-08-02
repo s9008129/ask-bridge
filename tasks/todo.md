@@ -428,3 +428,57 @@ pm test。
 - 新增 pure/offline tests：synthetic `Instant`證明 connect消耗後 tool只取得剩餘 budget；ChatGPT document policy固定為 native-first＋DataTransfer fallback；uploading/missing/error/timeout均保持 submit closure呼叫 0 次。
 - Review-fix增量為 production `+85/-8`、tests `+124/-0`、lessons `+11`、todo `+11`，合計 `+231/-8`；完整 diff為 `+1336/-289`。
 - Review-fix 後完整驗證全綠：Rust 79 passed、Node 4 passed，fmt、clippy `-D warnings`、check、release build與diff-check皆成功；`make install`後 installed capability仍為 schema 2與兩項安全能力。
+
+---
+
+# 2026-08-02 以圖片產物契約判定 provider 回應完成
+
+## 目標與驗收條件
+
+- [x] 圖片工作在本次唯一新增 assistant、無生成控制項、最新回應至少一張已載入大尺寸圖片且 DOM 簽章連續穩定前，絕不判定完成。
+- [x] assistant 數量異常、owned page／provider URL／頁內 ownership token 改變時 fail closed 為 `unknown`，不得下載其他回應圖片。
+- [x] `--image-output` 的 timeout、零圖片與任何下載錯誤皆回傳非零；prompt 已送出後 receipt 保持可判定為 ambiguous。
+- [x] schema-v2 receipt additive 保存預期輸出種類、response completion enum、下載圖片數與固定 failure code；不保存 prompt、回覆、URL、檔名或 DOM。
+- [x] `capabilities --json` 宣告 `verified_image_response_completion_v1`，並提供 machine-readable 契約欄位。
+- [x] failing-first 與完整離線測試、fmt、clippy、check、release build 全部通過；不執行任何真實 provider mutation，且依 denylist 不使用 Claude live path。
+
+## Risk & Rollback
+
+- Risk level: medium-high
+- Affected components: provider response polling、generated-image extraction、same-run receipt audit、App/bridge capability compatibility。
+- Rollback strategy: revert `src/main.rs`、README 與 task/lesson 增量，並從既有已驗證 commit 重建 binary；App 端缺少新 capability 時必須 fail closed。
+- Monitoring signals: 圖片未落地時 completion 不得變成 completed；任一圖片輸出失敗 CLI 必須 non-zero；receipt 不得出現 privacy canary。
+
+## Dependencies & Environment
+
+- Rust/Cargo 與既有 `chrome-devtools-mcp`；不新增 dependency。
+- 所有 provider DOM 行為只以 pure state-machine／fixture 測試，不呼叫 ChatGPT/Gemini/Claude live query 或 upload。
+- Provider denylist: MUST NOT use Claude CLI/session/login/query/upload/mutation/live probe。
+
+## Working Notes
+
+- 現行 completion 只以「assistant count 增加、Stop control 連續約 1.5 秒不可見」判定；圖片可能稍後才載入。
+- 現行 image scan 將零圖片視為成功，main 也吞掉 download error，會形成遠端已生成但本機空輸出。
+- exact owned page 已由 process-local binding 在每次 page-bound MCP call 前重選；本次再加入頁內隨機 token、provider URL 與 response identity 驗證。
+
+## Checklist
+
+- [x] Review `AGENTS.md`、`tasks/lessons.md` 與既有 checkpoint notes。
+- [x] Locate response polling、download、receipt、capability authoritative paths。
+- [x] 新增 failing-first state-machine／download contract／receipt privacy tests並保存失敗證據。
+- [x] 實作最小 response completion state machine 與 browser probe。
+- [x] 將 strict image download與 receipt terminal audit 接入 runtime。
+- [x] 執行 targeted、full verification 與 release build。
+- [x] correctness/security/privacy review並補 Results／lesson tripwire。
+
+## Results
+
+- Failing-first：`cargo test image_completion_waits_for_loaded_artifact_after_assistant_and_stop_disappear -- --exact` 在 production symbols 加入前 exit 101，53 個 compile errors明確指出缺少 output type、completion tracker、download contract與 receipt fields。
+- `src/main.rs`：新增 pure `ResponseCompletionTracker`，文字與圖片使用不同 artifact gate；圖片需唯一 assistant delta、無可見生成控制項、至少一張 `256×256` 已載入候選圖與 500ms 間隔連續 3 次相同 DOM hash。
+- `src/main.rs`：送出前建立隨機 page-local ownership token並確認當下沒有生成控制項；輪詢與下載前後驗證 exact user/assistant delta、provider origin、conversation URL、token 與 DOM signature，任何人工導航／額外訊息／response identity 改變都停止為 `unknown`。
+- `src/main.rs`：`--image-output` 對 zero image、browser extraction／base64／filesystem error、timeout 一律 non-zero；下載函式回傳實際成功張數，不再由 main 吞掉 error。
+- `src/main.rs`：receipt schema 維持 v2並 additive 加入 `expected_output_type`、`response_completion`、`downloaded_image_count`、`response_failure_code`；legacy v2缺欄位可讀，既有 `attachment_probe` 在後續狀態轉移中保持不丟失。
+- `src/main.rs`／`README.md`：capability list與 human output加入 `verified_image_response_completion_v1`，文件說明 strict image artifact契約；`tasks/lessons.md`加入產物完成判斷 tripwire。
+- 驗證全綠：`cargo fmt --all -- --check`；`cargo clippy --all-targets -- -D warnings`；`cargo test`（92 passed）；`cargo check`；`npm test`（4 passed）；`cargo build --release`；`git diff --check`。
+- installed `/Users/hsiaojohnny/.local/bin/ask-bridge`與`ask`仍指向本 repo release binary；installed `capabilities --json`已回報四項能力與 strict image contract。
+- 未執行任何真實 provider query/upload/mutation/live probe；依 denylist 未使用 Claude CLI/session/login/query/upload/mutation/live probe。DOM selector與時序仍只由 pure/offline regression證實，受控真機 E2E留給使用者明確操作。

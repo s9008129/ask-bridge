@@ -20,11 +20,15 @@ const ASK_BRIDGE_CHROME_MARKER: &str = "--ask-bridge-instance";
 const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
 const VERIFIED_FILE_UPLOAD_CAPABILITY: &str = "verified_file_upload_v1";
 const VERIFIED_MIXED_ATTACHMENT_CAPABILITY: &str = "verified_mixed_attachment_upload_v1";
+const VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY: &str = "verified_image_response_completion_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 const ATTACHMENT_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ATTACHMENT_REQUIRED_STABLE_PROBES: usize = 2;
+const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RESPONSE_REQUIRED_STABLE_PROBES: usize = 3;
+const GENERATED_IMAGE_MIN_DIMENSION: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginState {
@@ -287,6 +291,14 @@ impl Provider {
             Provider::ChatGpt => "[data-message-author-role=\"assistant\"], .agent-turn",
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
+        }
+    }
+
+    fn user_selector(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "[data-message-author-role=\"user\"]",
+            Provider::Gemini => "user-query",
+            Provider::Claude => "[data-testid=\"user-message\"], .font-user-message",
         }
     }
 
@@ -618,6 +630,250 @@ enum PromptSubmission {
     Submitted,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedOutputType {
+    #[default]
+    Text,
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseCompletion {
+    #[default]
+    Pending,
+    Completed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseFailureCode {
+    AssistantCountChanged,
+    PageOwnershipChanged,
+    PageUrlChanged,
+    ResponseIdentityChanged,
+    ResponseProbeFailed,
+    ResponseTimeout,
+    ImageDownloadEmpty,
+    ImageDownloadFailed,
+}
+
+impl fmt::Display for ResponseFailureCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            ResponseFailureCode::AssistantCountChanged => "assistant_count_changed",
+            ResponseFailureCode::PageOwnershipChanged => "page_ownership_changed",
+            ResponseFailureCode::PageUrlChanged => "page_url_changed",
+            ResponseFailureCode::ResponseIdentityChanged => "response_identity_changed",
+            ResponseFailureCode::ResponseProbeFailed => "response_probe_failed",
+            ResponseFailureCode::ResponseTimeout => "response_timeout",
+            ResponseFailureCode::ImageDownloadEmpty => "image_download_empty",
+            ResponseFailureCode::ImageDownloadFailed => "image_download_failed",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ImageDownloadError {
+    ResponseIdentityChanged,
+    DownloadFailed(String),
+}
+
+impl fmt::Display for ImageDownloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImageDownloadError::ResponseIdentityChanged => {
+                formatter.write_str("verified response identity changed before image download")
+            }
+            ImageDownloadError::DownloadFailed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for ImageDownloadError {
+    fn from(message: String) -> Self {
+        Self::DownloadFailed(message)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ResponseDomProbe {
+    ownership_token_matches: bool,
+    provider_url_owned: bool,
+    url: String,
+    user_count: usize,
+    assistant_count: usize,
+    generation_control_visible: bool,
+    content_present: bool,
+    loaded_large_image_count: usize,
+    dom_signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedResponseIdentity {
+    url: String,
+    user_count: usize,
+    assistant_count: usize,
+    dom_signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResponseTrackerDecision {
+    Pending,
+    Completed(VerifiedResponseIdentity),
+    Unknown(ResponseFailureCode),
+}
+
+#[derive(Debug)]
+struct ResponseCompletionTracker {
+    expected_output_type: ExpectedOutputType,
+    initial_user_count: usize,
+    initial_assistant_count: usize,
+    response_url: Option<String>,
+    stable_signature: Option<String>,
+    stable_probes: usize,
+    saw_control_absent_for_new_response: bool,
+    terminal: Option<ResponseTrackerDecision>,
+}
+
+impl ResponseCompletionTracker {
+    fn new(
+        expected_output_type: ExpectedOutputType,
+        initial_user_count: usize,
+        initial_assistant_count: usize,
+    ) -> Self {
+        Self {
+            expected_output_type,
+            initial_user_count,
+            initial_assistant_count,
+            response_url: None,
+            stable_signature: None,
+            stable_probes: 0,
+            saw_control_absent_for_new_response: false,
+            terminal: None,
+        }
+    }
+
+    fn observe(&mut self, probe: ResponseDomProbe) -> ResponseTrackerDecision {
+        if let Some(decision) = &self.terminal {
+            return decision.clone();
+        }
+
+        if !probe.ownership_token_matches {
+            return self.finish_unknown(ResponseFailureCode::PageOwnershipChanged);
+        }
+        if !probe.provider_url_owned {
+            return self.finish_unknown(ResponseFailureCode::PageUrlChanged);
+        }
+        if probe.user_count < self.initial_user_count
+            || probe.user_count > self.initial_user_count.saturating_add(1)
+        {
+            return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+        }
+        if probe.assistant_count < self.initial_assistant_count
+            || probe.assistant_count > self.initial_assistant_count.saturating_add(1)
+        {
+            return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
+        }
+        if probe.user_count == self.initial_user_count {
+            if self.response_url.is_some() {
+                return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+            }
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+        if probe.assistant_count == self.initial_assistant_count {
+            if self.response_url.is_some() {
+                return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
+            }
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+
+        match &self.response_url {
+            Some(response_url) if response_url != &probe.url => {
+                return self.finish_unknown(ResponseFailureCode::PageUrlChanged);
+            }
+            None => self.response_url = Some(probe.url.clone()),
+            Some(_) => {}
+        }
+
+        if probe.generation_control_visible {
+            if self.saw_control_absent_for_new_response {
+                return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+            }
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+        self.saw_control_absent_for_new_response = true;
+
+        let artifact_ready = match self.expected_output_type {
+            ExpectedOutputType::Text => probe.content_present,
+            ExpectedOutputType::Image => probe.loaded_large_image_count > 0,
+        };
+        if !artifact_ready || probe.dom_signature.is_empty() {
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+
+        if self.stable_signature.as_deref() == Some(probe.dom_signature.as_str()) {
+            self.stable_probes = self.stable_probes.saturating_add(1);
+        } else {
+            self.stable_signature = Some(probe.dom_signature.clone());
+            self.stable_probes = 1;
+        }
+
+        if self.stable_probes < RESPONSE_REQUIRED_STABLE_PROBES {
+            return ResponseTrackerDecision::Pending;
+        }
+
+        let decision = ResponseTrackerDecision::Completed(VerifiedResponseIdentity {
+            url: probe.url,
+            user_count: probe.user_count,
+            assistant_count: probe.assistant_count,
+            dom_signature: probe.dom_signature,
+        });
+        self.terminal = Some(decision.clone());
+        decision
+    }
+
+    fn timeout(&mut self) -> ResponseTrackerDecision {
+        if let Some(decision) = &self.terminal {
+            return decision.clone();
+        }
+        self.finish_unknown(ResponseFailureCode::ResponseTimeout)
+    }
+
+    fn finish_unknown(&mut self, code: ResponseFailureCode) -> ResponseTrackerDecision {
+        let decision = ResponseTrackerDecision::Unknown(code);
+        self.terminal = Some(decision.clone());
+        decision
+    }
+
+    fn reset_stability(&mut self) {
+        self.stable_signature = None;
+        self.stable_probes = 0;
+    }
+}
+
+fn enforce_download_contract(
+    expected_output_type: ExpectedOutputType,
+    download_result: Result<usize, ImageDownloadError>,
+) -> Result<usize, ResponseFailureCode> {
+    match download_result {
+        Err(ImageDownloadError::ResponseIdentityChanged) => {
+            Err(ResponseFailureCode::ResponseIdentityChanged)
+        }
+        Err(ImageDownloadError::DownloadFailed(_)) => Err(ResponseFailureCode::ImageDownloadFailed),
+        Ok(0) if expected_output_type == ExpectedOutputType::Image => {
+            Err(ResponseFailureCode::ImageDownloadEmpty)
+        }
+        Ok(downloaded) => Ok(downloaded),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct SessionReceipt {
     schema_version: u8,
@@ -628,22 +884,49 @@ struct SessionReceipt {
     attachment_total_bytes: u64,
     prompt_submission: PromptSubmission,
     failure_code: Option<String>,
+    #[serde(default)]
+    expected_output_type: ExpectedOutputType,
+    #[serde(default)]
+    response_completion: ResponseCompletion,
+    #[serde(default)]
+    downloaded_image_count: usize,
+    #[serde(default)]
+    response_failure_code: Option<ResponseFailureCode>,
 }
 
 impl SessionReceipt {
+    #[cfg(test)]
     fn new(attachment_count: usize, attachment_total_bytes: u64) -> Self {
+        Self::new_for_output(
+            attachment_count,
+            attachment_total_bytes,
+            ExpectedOutputType::Text,
+        )
+    }
+
+    fn new_for_output(
+        attachment_count: usize,
+        attachment_total_bytes: u64,
+        expected_output_type: ExpectedOutputType,
+    ) -> Self {
         Self {
             schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
             capabilities: vec![
                 ISOLATED_NEW_TAB_CAPABILITY.to_string(),
                 VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
+                VERIFIED_MIXED_ATTACHMENT_CAPABILITY.to_string(),
+                VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
             attachment_total_bytes,
             prompt_submission: PromptSubmission::NotStarted,
             failure_code: None,
+            expected_output_type,
+            response_completion: ResponseCompletion::Pending,
+            downloaded_image_count: 0,
+            response_failure_code: None,
         }
     }
 }
@@ -859,6 +1142,28 @@ fn write_attachment_probe_receipt(
     Ok(())
 }
 
+fn write_session_receipt_preserving_attachment_probe(
+    path: &Path,
+    receipt: &SessionReceipt,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("無法讀取 session receipt metadata：{}", error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("session receipt 不是可信任的 regular file".to_string());
+    }
+    let existing = serde_json::from_slice::<Value>(
+        &std::fs::read(path).map_err(|error| format!("無法讀取 session receipt：{}", error))?,
+    )
+    .map_err(|error| format!("session receipt 格式無效：{}", error))?;
+    let attachment_probe = existing.get("attachment_probe").cloned();
+    let mut updated = serde_json::to_value(receipt)
+        .map_err(|error| format!("無法序列化 session receipt：{}", error))?;
+    if let (Some(probe), Some(object)) = (attachment_probe, updated.as_object_mut()) {
+        object.insert("attachment_probe".to_string(), probe);
+    }
+    write_private_json(path, &updated)
+}
+
 fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     match event {
@@ -895,10 +1200,51 @@ fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Resu
             receipt.prompt_submission = PromptSubmission::Submitted;
         }
     }
-    write_private_json(path, &receipt)?;
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
     let persisted = read_session_receipt(path)?;
     if persisted != receipt {
         return Err("session receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn record_session_response_outcome(
+    path: &Path,
+    completion: ResponseCompletion,
+    downloaded_image_count: usize,
+    failure_code: Option<ResponseFailureCode>,
+) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission == PromptSubmission::NotStarted {
+        return Err("prompt 尚未開始，不得記錄 response terminal outcome".to_string());
+    }
+    if completion == ResponseCompletion::Pending {
+        return Err("response outcome 不得回寫 pending".to_string());
+    }
+    if receipt.response_completion == ResponseCompletion::Unknown
+        && completion != ResponseCompletion::Unknown
+    {
+        return Err("unknown response outcome 不得改寫為其他終態".to_string());
+    }
+    if receipt.response_completion == ResponseCompletion::Completed
+        && completion != ResponseCompletion::Completed
+    {
+        return Err("completed response outcome 不得倒退".to_string());
+    }
+    if downloaded_image_count < receipt.downloaded_image_count {
+        return Err("下載圖片計數不得倒退".to_string());
+    }
+    if completion == ResponseCompletion::Unknown && failure_code.is_none() {
+        return Err("unknown response outcome 必須包含固定 failure code".to_string());
+    }
+
+    receipt.response_completion = completion;
+    receipt.downloaded_image_count = downloaded_image_count;
+    receipt.response_failure_code = failure_code;
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("response outcome 原子更新後驗證失敗".to_string());
     }
     Ok(())
 }
@@ -907,6 +1253,7 @@ fn write_session_receipt(
     session_id: &str,
     attachment_count: usize,
     attachment_total_bytes: u64,
+    expected_output_type: ExpectedOutputType,
 ) -> Result<PathBuf, String> {
     let session_id = validate_session_id(session_id)?;
     let path = session_receipt_path(&session_id)?;
@@ -919,7 +1266,11 @@ fn write_session_receipt(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("無法檢查 session receipt：{}", error)),
     }
-    let receipt = SessionReceipt::new(attachment_count, attachment_total_bytes);
+    let receipt = SessionReceipt::new_for_output(
+        attachment_count,
+        attachment_total_bytes,
+        expected_output_type,
+    );
     write_private_json(&path, &receipt)?;
     let persisted = read_session_receipt(&path)?;
     if persisted != receipt {
@@ -935,7 +1286,8 @@ fn capabilities_value() -> Value {
         "capabilities": [
             ISOLATED_NEW_TAB_CAPABILITY,
             VERIFIED_FILE_UPLOAD_CAPABILITY,
-            VERIFIED_MIXED_ATTACHMENT_CAPABILITY
+            VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
+            VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -961,6 +1313,24 @@ fn capabilities_value() -> Value {
             "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
             "submit_before_verified": false,
             "receipt_fields": ["attachment_probe"]
+        },
+        "verified_image_response_completion_v1": {
+            "expected_output_flag": "--image-output",
+            "verification": "new-assistant-no-generation-control-loaded-large-image-stable-dom",
+            "user_delta": 1,
+            "assistant_delta": 1,
+            "minimum_image_dimension": GENERATED_IMAGE_MIN_DIMENSION,
+            "stable_probes": RESPONSE_REQUIRED_STABLE_PROBES,
+            "probe_interval_ms": RESPONSE_POLL_INTERVAL.as_millis(),
+            "zero_images_exit_success": false,
+            "download_error_exit_success": false,
+            "interference_result": "unknown",
+            "receipt_fields": [
+                "expected_output_type",
+                "response_completion",
+                "downloaded_image_count",
+                "response_failure_code"
+            ]
         }
     })
 }
@@ -978,6 +1348,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", ISOLATED_NEW_TAB_CAPABILITY);
         println!("  {}", VERIFIED_FILE_UPLOAD_CAPABILITY);
         println!("  {}", VERIFIED_MIXED_ATTACHMENT_CAPABILITY);
+        println!("  {}", VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -2675,6 +3046,7 @@ mod tests {
         assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
         assert_eq!(
             capabilities["isolated_new_tab_v1"]["flag"].as_str(),
             Some("--new-tab-preserve-existing")
@@ -2686,6 +3058,19 @@ mod tests {
         assert_eq!(
             capabilities["verified_mixed_attachment_upload_v1"]["verification"].as_str(),
             Some("typed-document-image-stable-dom-probe")
+        );
+        assert_eq!(
+            capabilities["verified_image_response_completion_v1"]["verification"].as_str(),
+            Some("new-assistant-no-generation-control-loaded-large-image-stable-dom")
+        );
+        assert_eq!(
+            capabilities["verified_image_response_completion_v1"]["zero_images_exit_success"]
+                .as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            capabilities["verified_image_response_completion_v1"]["user_delta"].as_u64(),
+            Some(1)
         );
         assert!(
             capabilities["version"]
@@ -2732,6 +3117,301 @@ mod tests {
             probe.command,
             Some(Commands::SessionProbe { json: true })
         ));
+    }
+
+    fn response_probe(
+        assistant_count: usize,
+        generating: bool,
+        loaded_large_image_count: usize,
+        signature: &str,
+    ) -> ResponseDomProbe {
+        ResponseDomProbe {
+            ownership_token_matches: true,
+            provider_url_owned: true,
+            url: "https://chatgpt.com/c/response-contract".to_string(),
+            user_count: 1,
+            assistant_count,
+            generation_control_visible: generating,
+            content_present: assistant_count > 0,
+            loaded_large_image_count,
+            dom_signature: signature.to_string(),
+        }
+    }
+
+    #[test]
+    fn image_completion_waits_for_loaded_artifact_after_assistant_and_stop_disappear() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 4);
+
+        // Two seconds of a new assistant node with no Stop control is not a
+        // completed image response while the expected artifact is absent.
+        for _ in 0..4 {
+            assert_eq!(
+                tracker.observe(response_probe(5, false, 0, "assistant-only")),
+                ResponseTrackerDecision::Pending
+            );
+        }
+
+        assert_eq!(
+            tracker.observe(response_probe(5, false, 1, "image-v1")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(response_probe(5, false, 1, "image-v1")),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(response_probe(5, false, 1, "image-v1")),
+            ResponseTrackerDecision::Completed(_)
+        ));
+        assert_eq!(RESPONSE_REQUIRED_STABLE_PROBES, 3);
+        assert_eq!(RESPONSE_POLL_INTERVAL, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn image_completion_resets_stability_when_dom_signature_changes() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 1);
+        assert_eq!(
+            tracker.observe(response_probe(2, false, 1, "image-loading")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(response_probe(2, false, 1, "image-final")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(response_probe(2, false, 1, "image-final")),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(response_probe(2, false, 1, "image-final")),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn text_completion_uses_content_contract_without_requiring_an_image() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+        for expected in [
+            ResponseTrackerDecision::Pending,
+            ResponseTrackerDecision::Pending,
+        ] {
+            assert_eq!(
+                tracker.observe(response_probe(7, false, 0, "stable-text")),
+                expected
+            );
+        }
+        assert!(matches!(
+            tracker.observe(response_probe(7, false, 0, "stable-text")),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn response_completion_fails_closed_on_ownership_url_or_assistant_interference() {
+        let mut ownership = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut lost = response_probe(3, false, 1, "ready");
+        lost.ownership_token_matches = false;
+        assert_eq!(
+            ownership.observe(lost),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::PageOwnershipChanged)
+        );
+
+        let mut count = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            count.observe(response_probe(4, false, 1, "other-response")),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::AssistantCountChanged)
+        );
+
+        let mut extra_user = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut manually_submitted = response_probe(3, false, 1, "other-prompt-response");
+        manually_submitted.user_count = 2;
+        assert_eq!(
+            extra_user.observe(manually_submitted),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+
+        let mut url = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            url.observe(response_probe(3, false, 1, "ready")),
+            ResponseTrackerDecision::Pending
+        );
+        let mut navigated = response_probe(3, false, 1, "ready");
+        navigated.url = "https://chatgpt.com/c/different-conversation".to_string();
+        assert_eq!(
+            url.observe(navigated),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::PageUrlChanged)
+        );
+
+        let mut regenerated = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            regenerated.observe(response_probe(3, false, 0, "assistant-shell")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            regenerated.observe(response_probe(3, true, 0, "manual-regeneration")),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+
+        let mut timeout = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            timeout.timeout(),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseTimeout)
+        );
+    }
+
+    #[test]
+    fn strict_image_download_rejects_zero_and_download_errors() {
+        assert_eq!(
+            enforce_download_contract(ExpectedOutputType::Image, Ok(2)).unwrap(),
+            2
+        );
+        assert_eq!(
+            enforce_download_contract(ExpectedOutputType::Image, Ok(0)).unwrap_err(),
+            ResponseFailureCode::ImageDownloadEmpty
+        );
+        assert_eq!(
+            enforce_download_contract(
+                ExpectedOutputType::Image,
+                Err(ImageDownloadError::DownloadFailed(
+                    "PRIVATE DOWNLOAD DETAILS".to_string()
+                ))
+            )
+            .unwrap_err(),
+            ResponseFailureCode::ImageDownloadFailed
+        );
+    }
+
+    #[test]
+    fn response_receipt_fields_are_additive_and_low_sensitivity() {
+        let root = make_test_dir("response_receipt_privacy");
+        let path = root.join("receipt.json");
+        let canary = "PRIVATE-PROMPT-URL-FILENAME-DOM";
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_output(0, 0, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+        record_session_response_outcome(
+            &path,
+            ResponseCompletion::Unknown,
+            0,
+            Some(ResponseFailureCode::ResponseTimeout),
+        )
+        .unwrap();
+
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.expected_output_type, ExpectedOutputType::Image);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Unknown);
+        assert_eq!(receipt.downloaded_image_count, 0);
+        assert_eq!(
+            receipt.response_failure_code,
+            Some(ResponseFailureCode::ResponseTimeout)
+        );
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains(canary));
+        for forbidden in ["prompt", "response_content", "url", "file_name", "dom"] {
+            assert!(!json.contains(&format!("\"{forbidden}\"")));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_submit_interference_stays_safe_but_post_submit_interference_is_unknown() {
+        let safe_root = make_test_dir("pre_submit_interference");
+        let safe_path = safe_root.join("receipt.json");
+        write_private_json(&safe_path, &SessionReceipt::new(0, 0)).unwrap();
+        let submit_count = std::cell::Cell::new(0);
+        let result = execute_verified_prompt_submission(
+            Some(&safe_path),
+            || Ok(()),
+            || Err::<usize, _>("owned page changed before submit".to_string()),
+            || {
+                submit_count.set(submit_count.get() + 1);
+                Ok("submitted".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(submit_count.get(), 0);
+        let safe = read_session_receipt(&safe_path).unwrap();
+        assert_eq!(safe.prompt_submission, PromptSubmission::NotStarted);
+        assert_eq!(safe.response_completion, ResponseCompletion::Pending);
+
+        let unknown_root = make_test_dir("post_submit_interference");
+        let unknown_path = unknown_root.join("receipt.json");
+        write_private_json(
+            &unknown_path,
+            &SessionReceipt::new_for_output(0, 0, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        let submitted = execute_verified_prompt_submission(
+            Some(&unknown_path),
+            || Ok(()),
+            || Ok(2usize),
+            || Ok("submitted".to_string()),
+        )
+        .unwrap();
+        assert_eq!(submitted.0, 2);
+        record_session_response_outcome(
+            &unknown_path,
+            ResponseCompletion::Unknown,
+            0,
+            Some(ResponseFailureCode::PageOwnershipChanged),
+        )
+        .unwrap();
+        let unknown = read_session_receipt(&unknown_path).unwrap();
+        assert_eq!(unknown.prompt_submission, PromptSubmission::Submitted);
+        assert_eq!(unknown.response_completion, ResponseCompletion::Unknown);
+
+        std::fs::remove_dir_all(safe_root).unwrap();
+        std::fs::remove_dir_all(unknown_root).unwrap();
+    }
+
+    #[test]
+    fn response_probe_contract_checks_token_controls_large_images_and_dom_signature() {
+        let baseline = ResponseBaseline {
+            initial_user_count: 2,
+            initial_assistant_count: 3,
+            ownership_token: "00000000-0000-4000-8000-000000000003".to_string(),
+        };
+        let script = build_response_probe_script(Provider::ChatGpt, &baseline).unwrap();
+        assert!(script.contains("__ask_bridge_response_owner_v1"));
+        assert!(script.contains("generation_control_visible"));
+        assert!(script.contains("user_count"));
+        assert!(script.contains("img.complete"));
+        assert!(script.contains("const minimumImageDimension = 256"));
+        assert!(script.contains("naturalWidth < minimumImageDimension"));
+        assert!(script.contains("naturalHeight < minimumImageDimension"));
+        assert!(script.contains("dom_signature"));
+        assert!(script.contains("window.location.origin"));
+        assert!(!script.contains("__TOKEN__"));
+        assert!(!script.contains("__ASSISTANT_SELECTOR__"));
+        assert!(!script.contains("__USER_SELECTOR__"));
+    }
+
+    #[test]
+    fn legacy_schema_v2_receipt_defaults_new_response_fields() {
+        let root = make_test_dir("legacy_response_receipt");
+        let path = root.join("receipt.json");
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "capability": ISOLATED_NEW_TAB_CAPABILITY,
+            "capabilities": [ISOLATED_NEW_TAB_CAPABILITY, VERIFIED_FILE_UPLOAD_CAPABILITY],
+            "attachment_verification": "verified",
+            "attachment_count": 1,
+            "attachment_total_bytes": 123,
+            "prompt_submission": "submitted",
+            "failure_code": null
+        });
+        write_private_json(&path, &legacy).unwrap();
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.expected_output_type, ExpectedOutputType::Text);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Pending);
+        assert_eq!(receipt.downloaded_image_count, 0);
+        assert_eq!(receipt.response_failure_code, None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3218,6 +3898,41 @@ mod tests {
         assert!(!json.contains("report.md"));
         assert!(!json.contains("style.png"));
         assert!(!json.contains("/"));
+    }
+
+    #[test]
+    fn receipt_state_transitions_preserve_additive_attachment_probe() {
+        let root = make_test_dir("preserve_attachment_probe");
+        let path = root.join("receipt.json");
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_output(2, 42, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        let expectations =
+            AttachmentExpectations::new(&["source.md".to_string()], &["anchor.png".to_string()])
+                .unwrap();
+        let probe = TypedAttachmentProbe {
+            document_count: 1,
+            image_count: 1,
+            image_loaded: true,
+            uploading: false,
+            provider_error: false,
+        };
+        write_attachment_probe_receipt(&path, &AttachmentProbeSummary::new(&expectations, &probe))
+            .unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+        record_session_response_outcome(&path, ResponseCompletion::Completed, 1, None).unwrap();
+
+        let json: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            json["attachment_probe"]["expected_documents"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(json["downloaded_image_count"].as_u64(), Some(1));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4829,20 +5544,84 @@ fn download_images_from_latest_message(
     config_path: &str,
     provider: Provider,
     image_output: Option<&str>,
+    verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
     verbose: bool,
-) -> Result<(), String> {
+) -> Result<usize, ImageDownloadError> {
     if verbose {
         println!("Checking for generated images in the latest assistant response...");
     }
     let latest_selector = serde_json::to_string(provider.latest_response_selector())
         .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
+    let user_selector = serde_json::to_string(provider.user_selector())
+        .map_err(|e| format!("Failed to serialize user selector: {}", e))?;
+    let expected_identity = match verified_response {
+        Some((baseline, identity)) => serde_json::json!({
+            "ownership_token": baseline.ownership_token,
+            "url": identity.url,
+            "user_count": identity.user_count,
+            "assistant_count": identity.assistant_count,
+            "dom_signature": identity.dom_signature,
+        }),
+        None => Value::Null,
+    };
+    let expected_identity_json = serde_json::to_string(&expected_identity)
+        .map_err(|_| "Failed to serialize verified response identity".to_string())?;
     let image_scan_js = r#"() => {
                 window.__downloaded_images_status = "pending";
                 window.__downloaded_images = null;
                 (async () => {
                     try {
-                        const messages = document.querySelectorAll(__LATEST_SELECTOR__);
-                        const latestMessage = messages[messages.length - 1];
+                        const latestSelector = __LATEST_SELECTOR__;
+                        const assistantSelector = __ASSISTANT_SELECTOR__;
+                        const userSelector = __USER_SELECTOR__;
+                        const expectedIdentity = __EXPECTED_IDENTITY__;
+                        const minimumImageDimension = __MINIMUM_IMAGE_DIMENSION__;
+                        const stopSelectors = __STOP_SELECTORS__;
+                        const isVisibleControl = (element) => {
+                            if (!element) return false;
+                            const style = window.getComputedStyle(element);
+                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                            const rect = element.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0;
+                        };
+                        const domSignature = (element) => {
+                            if (!element) return '';
+                            const source = element.innerHTML || '';
+                            let hash = 2166136261;
+                            for (let index = 0; index < source.length; index += 1) {
+                                hash ^= source.charCodeAt(index);
+                                hash = Math.imul(hash, 16777619);
+                            }
+                            return `${source.length}:${(hash >>> 0).toString(16)}`;
+                        };
+                        const responseState = () => {
+                            const assistantMessages = Array.from(document.querySelectorAll(assistantSelector));
+                            const userMessages = Array.from(document.querySelectorAll(userSelector));
+                            const latestMessages = expectedIdentity
+                                ? assistantMessages
+                                : Array.from(document.querySelectorAll(latestSelector));
+                            const latestMessage = latestMessages[latestMessages.length - 1] || null;
+                            if (!expectedIdentity) return { ok: true, latestMessage };
+                            const generationControl = stopSelectors
+                                .map((selector) => document.querySelector(selector))
+                                .find(isVisibleControl);
+                            const ok =
+                                window.__ask_bridge_response_owner_v1 === expectedIdentity.ownership_token &&
+                                window.location.href === expectedIdentity.url &&
+                                userMessages.length === expectedIdentity.user_count &&
+                                assistantMessages.length === expectedIdentity.assistant_count &&
+                                domSignature(latestMessage) === expectedIdentity.dom_signature &&
+                                !generationControl;
+                            return { ok, latestMessage };
+                        };
+                        const before = responseState();
+                        if (!before.ok) {
+                            window.__downloaded_images_status = "error: response_identity_changed";
+                            return;
+                        }
+                        const latestMessage = before.latestMessage;
                         if (!latestMessage) {
                             window.__downloaded_images = [];
                             window.__downloaded_images_status = "success";
@@ -4854,10 +5633,7 @@ fn download_images_from_latest_message(
                         const candidateImgs = imgs.filter(img => {
                             const src = img.src || '';
                             if (src.includes('avatar') || src.includes('profile')) return false;
-                            const width = img.naturalWidth || img.width || 0;
-                            const height = img.naturalHeight || img.height || 0;
-                            if (width > 0 && width < 100) return false;
-                            if (height > 0 && height < 100) return false;
+                            if (!img.complete || img.naturalWidth < minimumImageDimension || img.naturalHeight < minimumImageDimension) return false;
                             if (!src.startsWith('http') && !src.startsWith('blob:') && !src.startsWith('data:image/')) return false;
                             if (seenSrcs.has(src)) return false;
                             seenSrcs.add(src);
@@ -4865,24 +5641,19 @@ fn download_images_from_latest_message(
                         });
 
                         const imagesData = [];
+                        let failedCount = 0;
                         for (let i = 0; i < candidateImgs.length; i++) {
                             const img = candidateImgs[i];
                             try {
-                                if (!img.complete) {
-                                    await new Promise((resolve) => {
-                                        img.addEventListener('load', resolve);
-                                        img.addEventListener('error', resolve);
-                                        setTimeout(resolve, 10000);
-                                    });
-                                }
-
                                 let dataUrl = "";
                                 if ((img.src || '').startsWith('data:image/')) {
                                     dataUrl = img.src;
                                 } else {
                                     try {
                                         const response = await fetch(img.src);
+                                        if (!response.ok) throw new Error('image_fetch_failed');
                                         const blob = await response.blob();
+                                        if (!blob.type.startsWith('image/')) throw new Error('image_type_invalid');
                                         dataUrl = await new Promise((resolve, reject) => {
                                             const reader = new FileReader();
                                             reader.onloadend = () => resolve(reader.result);
@@ -4902,24 +5673,41 @@ fn download_images_from_latest_message(
                                 if (dataUrl && dataUrl.startsWith('data:image/')) {
                                     imagesData.push({
                                         index: i,
-                                        src: img.src,
-                                        alt: img.alt || "",
                                         dataUrl: dataUrl
                                     });
+                                } else {
+                                    failedCount += 1;
                                 }
-                            } catch (err) {
-                                // ignore
+                            } catch (_) {
+                                failedCount += 1;
                             }
+                        }
+                        const after = responseState();
+                        if (!after.ok) {
+                            window.__downloaded_images_status = "error: response_identity_changed";
+                            return;
+                        }
+                        if (failedCount > 0) {
+                            window.__downloaded_images_status = "error: image_download_failed";
+                            return;
                         }
                         window.__downloaded_images = imagesData;
                         window.__downloaded_images_status = "success";
-                    } catch (e) {
-                        window.__downloaded_images_status = "error: " + e.message;
+                    } catch (_) {
+                        window.__downloaded_images_status = "error: image_download_failed";
                     }
                 })();
                 return { ok: true };
             }"#
-    .replace("__LATEST_SELECTOR__", &latest_selector);
+    .replace("__LATEST_SELECTOR__", &latest_selector)
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__EXPECTED_IDENTITY__", &expected_identity_json)
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
+    .replace(
+        "__MINIMUM_IMAGE_DIMENSION__",
+        &GENERATED_IMAGE_MIN_DIMENSION.to_string(),
+    );
 
     let start_res = call_mcp_tool(
         config_path,
@@ -4931,7 +5719,9 @@ fn download_images_from_latest_message(
 
     let start_parsed = parse_script_result(&start_res)?;
     if !start_parsed["ok"].as_bool().unwrap_or(false) {
-        return Err("Failed to initiate image scanning script".to_string());
+        return Err(ImageDownloadError::DownloadFailed(
+            "Failed to initiate image scanning script".to_string(),
+        ));
     }
 
     let mut wait_cycles = 0;
@@ -4955,11 +5745,19 @@ fn download_images_from_latest_message(
     }
 
     if status.starts_with("error:") {
-        return Err(format!("Image scanning failed: {}", status));
+        return if status == "error: response_identity_changed" {
+            Err(ImageDownloadError::ResponseIdentityChanged)
+        } else {
+            Err(ImageDownloadError::DownloadFailed(
+                "Image scanning failed for the verified response".to_string(),
+            ))
+        };
     }
 
     if status == "pending" {
-        return Err("Timed out waiting for images to download in browser".to_string());
+        return Err(ImageDownloadError::DownloadFailed(
+            "Timed out waiting for images to download in browser".to_string(),
+        ));
     }
 
     let get_res = call_mcp_tool(
@@ -4978,14 +5776,18 @@ fn download_images_from_latest_message(
     let parsed = parse_script_result(&get_res)?;
     let images = match parsed.as_array() {
         Some(arr) => arr,
-        None => return Ok(()),
+        None => {
+            return Err(ImageDownloadError::DownloadFailed(
+                "Image scanner returned an invalid result".to_string(),
+            ));
+        }
     };
 
     if images.is_empty() {
         if verbose {
             println!("No generated images found in the latest response.");
         }
-        return Ok(());
+        return Ok(0);
     }
 
     let epoch = std::time::SystemTime::now()
@@ -4994,19 +5796,19 @@ fn download_images_from_latest_message(
         .as_secs();
 
     let total = images.len();
+    let mut saved_count = 0usize;
     for (idx, img) in images.iter().enumerate() {
-        let data_url = match img["dataUrl"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let parts: Vec<&str> = data_url.splitn(2, ',').collect();
-        if parts.len() != 2 {
-            continue;
+        let data_url = img["dataUrl"]
+            .as_str()
+            .ok_or_else(|| "Downloaded image result was incomplete".to_string())?;
+        let (header, base64_data) = data_url
+            .split_once(',')
+            .ok_or_else(|| "Downloaded image data was malformed".to_string())?;
+        if !header.starts_with("data:image/") {
+            return Err(ImageDownloadError::DownloadFailed(
+                "Downloaded image data had an invalid media type".to_string(),
+            ));
         }
-
-        let header = parts[0];
-        let base64_data = parts[1];
 
         let ext = if header.contains("image/png") {
             "png"
@@ -5063,6 +5865,7 @@ fn download_images_from_latest_message(
 
         std::fs::write(&file_path, decoded)
             .map_err(|e| format!("Failed to write image file {:?}: {}", file_path, e))?;
+        saved_count = saved_count.saturating_add(1);
 
         println!(
             "Downloaded and saved generated image to: {}",
@@ -5070,7 +5873,7 @@ fn download_images_from_latest_message(
         );
     }
 
-    Ok(())
+    Ok(saved_count)
 }
 
 /// Display an image in the terminal using kitty's icat protocol.
@@ -6862,15 +7665,171 @@ fn submit_prompt_to_provider(
     submit_regular_prompt(config_path, provider, prompt)
 }
 
-fn execute_verified_prompt_submission<Upload, BeforeSubmit, Submit>(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResponseBaseline {
+    initial_user_count: usize,
+    initial_assistant_count: usize,
+    ownership_token: String,
+}
+
+fn establish_response_baseline(
+    config_path: &str,
+    provider: Provider,
+) -> Result<ResponseBaseline, String> {
+    let ownership_token = Uuid::new_v4().to_string();
+    let token_json = serde_json::to_string(&ownership_token)
+        .map_err(|_| "Failed to serialize response ownership token".to_string())?;
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|_| "Failed to serialize assistant selector".to_string())?;
+    let user_selector = serde_json::to_string(provider.user_selector())
+        .map_err(|_| "Failed to serialize user selector".to_string())?;
+    let home_url_json = serde_json::to_string(provider.home_url())
+        .map_err(|_| "Failed to serialize provider URL".to_string())?;
+    let script = r#"() => {
+            const stopSelectors = __STOP_SELECTORS__;
+            const isVisibleControl = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            window.__ask_bridge_response_owner_v1 = __TOKEN__;
+            return {
+                ownership_token_set: window.__ask_bridge_response_owner_v1 === __TOKEN__,
+                provider_url_owned: window.location.origin === new URL(__PROVIDER_HOME_URL__).origin,
+                generation_control_visible: Boolean(stopSelectors
+                    .map((selector) => document.querySelector(selector))
+                    .find(isVisibleControl)),
+                user_count: document.querySelectorAll(__USER_SELECTOR__).length,
+                assistant_count: document.querySelectorAll(__ASSISTANT_SELECTOR__).length
+            };
+        }"#
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
+    .replace("__TOKEN__", &token_json)
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__PROVIDER_HOME_URL__", &home_url_json);
+    let result = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({"function": script}),
+    )?;
+    let value = parse_script_result(&result)?;
+    if !value["ownership_token_set"].as_bool().unwrap_or(false) {
+        return Err("Failed to establish response page ownership".to_string());
+    }
+    if !value["provider_url_owned"].as_bool().unwrap_or(false) {
+        return Err("Provider page changed before prompt submission".to_string());
+    }
+    if value["generation_control_visible"]
+        .as_bool()
+        .unwrap_or(true)
+    {
+        return Err("Provider was already generating before prompt submission".to_string());
+    }
+    let initial_user_count = value["user_count"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "Response baseline returned an invalid user count".to_string())?;
+    let initial_assistant_count = value["assistant_count"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "Response baseline returned an invalid assistant count".to_string())?;
+    Ok(ResponseBaseline {
+        initial_user_count,
+        initial_assistant_count,
+        ownership_token,
+    })
+}
+
+fn build_response_probe_script(
+    provider: Provider,
+    baseline: &ResponseBaseline,
+) -> Result<String, String> {
+    let token_json = serde_json::to_string(&baseline.ownership_token)
+        .map_err(|_| "Failed to serialize response ownership token".to_string())?;
+    let home_url_json = serde_json::to_string(provider.home_url())
+        .map_err(|_| "Failed to serialize provider URL".to_string())?;
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|_| "Failed to serialize assistant selector".to_string())?;
+    let user_selector = serde_json::to_string(provider.user_selector())
+        .map_err(|_| "Failed to serialize user selector".to_string())?;
+    Ok(r#"() => {
+            const stopSelectors = __STOP_SELECTORS__;
+            const assistantSelector = __ASSISTANT_SELECTOR__;
+            const userSelector = __USER_SELECTOR__;
+            const minimumImageDimension = __MINIMUM_IMAGE_DIMENSION__;
+            const isVisibleControl = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const isLargeLoadedImage = (img) => {
+                const src = img.currentSrc || img.src || '';
+                if (!img.complete || img.naturalWidth < minimumImageDimension || img.naturalHeight < minimumImageDimension) return false;
+                if (src.includes('avatar') || src.includes('profile')) return false;
+                return src.startsWith('http') || src.startsWith('blob:') || src.startsWith('data:image/');
+            };
+            const domSignature = (element) => {
+                if (!element) return '';
+                const source = element.innerHTML || '';
+                let hash = 2166136261;
+                for (let index = 0; index < source.length; index += 1) {
+                    hash ^= source.charCodeAt(index);
+                    hash = Math.imul(hash, 16777619);
+                }
+                return `${source.length}:${(hash >>> 0).toString(16)}`;
+            };
+            const messages = Array.from(document.querySelectorAll(assistantSelector));
+            const userMessages = Array.from(document.querySelectorAll(userSelector));
+            const latest = messages[messages.length - 1] || null;
+            const loadedImages = latest
+                ? Array.from(latest.querySelectorAll('img')).filter(isLargeLoadedImage)
+                : [];
+            const generationControl = stopSelectors
+                .map((selector) => document.querySelector(selector))
+                .find(isVisibleControl);
+            let providerUrlOwned = false;
+            try {
+                providerUrlOwned = window.location.origin === new URL(__PROVIDER_HOME_URL__).origin;
+            } catch (_) {
+                providerUrlOwned = false;
+            }
+            return {
+                ownership_token_matches: window.__ask_bridge_response_owner_v1 === __TOKEN__,
+                provider_url_owned: providerUrlOwned,
+                url: window.location.href,
+                user_count: userMessages.length,
+                assistant_count: messages.length,
+                generation_control_visible: Boolean(generationControl),
+                content_present: Boolean(latest && (((latest.textContent || '').trim().length > 0) || loadedImages.length > 0)),
+                loaded_large_image_count: loadedImages.length,
+                dom_signature: domSignature(latest)
+            };
+        }"#
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace(
+        "__MINIMUM_IMAGE_DIMENSION__",
+        &GENERATED_IMAGE_MIN_DIMENSION.to_string(),
+    )
+    .replace("__PROVIDER_HOME_URL__", &home_url_json)
+    .replace("__TOKEN__", &token_json))
+}
+
+fn execute_verified_prompt_submission<Baseline, Upload, BeforeSubmit, Submit>(
     receipt_path: Option<&Path>,
     upload_and_verify: Upload,
     before_submit: BeforeSubmit,
     submit: Submit,
-) -> Result<(usize, String), String>
+) -> Result<(Baseline, String), String>
 where
     Upload: FnOnce() -> Result<(), String>,
-    BeforeSubmit: FnOnce() -> Result<usize, String>,
+    BeforeSubmit: FnOnce() -> Result<Baseline, String>,
     Submit: FnOnce() -> Result<String, String>,
 {
     if upload_and_verify().is_err() {
@@ -6885,7 +7844,7 @@ where
             .map_err(|_| "附件已驗證，但無法安全保存 receipt；prompt 未送出".to_string())?;
     }
 
-    let initial_assistant_count = before_submit()?;
+    let baseline = before_submit()?;
     if let Some(path) = receipt_path {
         record_session_receipt_event(path, SessionReceiptEvent::PromptIntentRecorded)
             .map_err(|_| "無法保存 prompt submit intent；prompt 未送出".to_string())?;
@@ -6896,7 +7855,7 @@ where
             "prompt 已可能送出，但無法保存 submitted receipt；遠端狀態未知".to_string()
         })?;
     }
-    Ok((initial_assistant_count, status))
+    Ok((baseline, status))
 }
 
 fn list_pages(config_path: &str) -> Result<Vec<Page>, String> {
@@ -6916,6 +7875,7 @@ fn ensure_isolated_provider_tab(
     provider: Provider,
     session_id: &str,
     attachment_summary: &AttachmentSummary,
+    expected_output_type: ExpectedOutputType,
     headless: bool,
     verbose: bool,
 ) -> Result<PathBuf, String> {
@@ -6984,6 +7944,7 @@ fn ensure_isolated_provider_tab(
             &session_id,
             attachment_summary.count(),
             attachment_summary.total_bytes,
+            expected_output_type,
         )
         .inspect_err(|_| clear_owned_page())?;
         if verbose {
@@ -7611,13 +8572,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Error rendering Markdown: {}", e);
                                 std::process::exit(1);
                             }
-                            if let Err(e) = download_images_from_latest_message(
+                            let image_result = download_images_from_latest_message(
                                 &config_path,
                                 page_provider,
                                 cli.image_output.as_deref(),
+                                None,
                                 command_verbose,
-                            ) {
-                                eprintln!("Error downloading images: {}", e);
+                            );
+                            match image_result {
+                                Ok(0) if cli.image_output.is_some() => {
+                                    eprintln!("Error downloading images: no generated image found");
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error downloading images: {}", e);
+                                    if cli.image_output.is_some() {
+                                        std::process::exit(1);
+                                    }
+                                }
+                                Ok(_) => {}
                             }
                         }
                         Err(e) => {
@@ -7679,13 +8652,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("Error rendering Markdown: {}", e);
                             std::process::exit(1);
                         }
-                        if let Err(e) = download_images_from_latest_message(
+                        let image_result = download_images_from_latest_message(
                             &config_path,
                             page_provider,
                             cli.image_output.as_deref(),
+                            None,
                             command_verbose,
-                        ) {
-                            eprintln!("Error downloading images: {}", e);
+                        );
+                        match image_result {
+                            Ok(0) if cli.image_output.is_some() => {
+                                eprintln!("Error downloading images: no generated image found");
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("Error downloading images: {}", e);
+                                if cli.image_output.is_some() {
+                                    std::process::exit(1);
+                                }
+                            }
+                            Ok(_) => {}
                         }
                     }
                     Err(e) => {
@@ -7891,12 +8876,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
+    let expected_output_type = if cli.image_output.is_some() {
+        ExpectedOutputType::Image
+    } else {
+        ExpectedOutputType::Text
+    };
+
     let receipt_path = if let Some(session_id) = safe_session_id.as_deref() {
         match ensure_isolated_provider_tab(
             &config_path,
             provider,
             session_id,
             &attachment_summary,
+            expected_output_type,
             is_headless,
             command_verbose,
         ) {
@@ -8011,7 +9003,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let (initial_assistant_count, status) = execute_verified_prompt_submission(
+    let submission_result = execute_verified_prompt_submission(
         receipt_path.as_deref(),
         || {
             let probe_summary = upload_attachments_to_provider(
@@ -8033,24 +9025,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         },
-        || {
-            let assistant_selector = serde_json::to_string(provider.assistant_selector())
-                .map_err(|_| "Failed to serialize assistant selector".to_string())?;
-            let count_res = call_mcp_tool(
-                &config_path,
-                "evaluate_script",
-                serde_json::json!({
-                    "function": format!(
-                        "() => document.querySelectorAll({}).length",
-                        assistant_selector
-                    )
-                }),
-            )?;
-            Ok(parse_script_result(&count_res)
-                .ok()
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0) as usize)
-        },
+        || establish_response_baseline(&config_path, provider),
         || {
             if command_verbose {
                 println!("Setting prompt text and submitting...");
@@ -8058,8 +9033,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
                 .map_err(|error| format!("Text entry or submission failed: {}", error))
         },
-    )
-    .map_err(|error| format!("Verified prompt submission failed: {}", error))?;
+    );
+    let (response_baseline, status) = match submission_result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(path) = receipt_path.as_deref()
+                && read_session_receipt(path)
+                    .is_ok_and(|receipt| receipt.prompt_submission != PromptSubmission::NotStarted)
+            {
+                let _ = record_session_response_outcome(
+                    path,
+                    ResponseCompletion::Unknown,
+                    0,
+                    Some(ResponseFailureCode::ResponseProbeFailed),
+                );
+            }
+            return Err(format!("Verified prompt submission failed: {}", error).into());
+        }
+    };
 
     if command_verbose {
         println!("Prompt submitted successfully: {}", status);
@@ -8070,16 +9061,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut last_markdown = String::new();
-    let mut finished = false;
-    let mut wait_cycles = 0;
-    let mut stable_done_checks = 0;
     let spinner_frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut spinner_idx = 0;
-
-    let max_wait_cycles: usize =
-        usize::try_from(cli.timeout.saturating_mul(10)).unwrap_or(usize::MAX);
-    while !finished && wait_cycles < max_wait_cycles {
-        // Max wait time: timeout seconds (timeout * 10 * 100ms)
+    let response_deadline = McpOperationDeadline::from_timeout(Duration::from_secs(cli.timeout))?;
+    let response_probe_script = build_response_probe_script(provider, &response_baseline)?;
+    let mut response_tracker = ResponseCompletionTracker::new(
+        expected_output_type,
+        response_baseline.initial_user_count,
+        response_baseline.initial_assistant_count,
+    );
+    let response_decision = loop {
         if is_terminal {
             let frame = spinner_frames[spinner_idx % spinner_frames.len()];
             print!(
@@ -8091,124 +9082,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             spinner_idx += 1;
         }
 
-        if wait_cycles % 5 == 0 {
-            let stop_selectors = provider.stop_button_selectors_json();
-            let assistant_selector = serde_json::to_string(provider.assistant_selector())
-                .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
-            let response_check_js = r#"() => {
-                    const stopSelectors = __STOP_SELECTORS__;
-                    const isVisible = (el) => {
-                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
-                    const stopButton = stopSelectors.map((selector) => document.querySelector(selector)).find(isVisible);
-                    const messages = document.querySelectorAll(__ASSISTANT_SELECTOR__);
-                    const isNew = messages.length > __INITIAL_COUNT__;
-                    
-                    if (isVisible(stopButton)) {
-                        return { status: "generating", isNew: isNew };
-                    }
-                    
-                    if (isNew) {
-                        return { status: "done", isNew: isNew };
-                    }
-                    
-                    return { status: "waiting", isNew: isNew };
-                }"#
-            .replace("__STOP_SELECTORS__", stop_selectors)
-            .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
-            .replace("__INITIAL_COUNT__", &initial_assistant_count.to_string());
-            let check_res = match call_mcp_tool(
-                &config_path,
-                "evaluate_script",
-                serde_json::json!({
-                    "function": response_check_js
-                }),
-            ) {
-                Ok(res) => res,
-                Err(e) => {
-                    if command_verbose {
-                        eprintln!(
-                            "Warning: Failed to poll {} response: {}",
-                            provider.display_name(),
-                            e
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                    wait_cycles += 1;
-                    continue;
-                }
-            };
-
-            if let Ok(parsed) = parse_script_result(&check_res) {
-                let status = parsed["status"].as_str().unwrap_or("waiting");
-                let is_new = parsed["isNew"].as_bool().unwrap_or(false);
-
-                if status == "done" && is_new {
-                    stable_done_checks += 1;
-                    if stable_done_checks >= 3 {
-                        finished = true;
-                    }
-                } else {
-                    stable_done_checks = 0;
-                }
+        if Instant::now() >= response_deadline.expires_at {
+            break response_tracker.timeout();
+        }
+        let check_res = match call_mcp_tool_with_deadline(
+            &config_path,
+            "evaluate_script",
+            serde_json::json!({"function": response_probe_script.clone()}),
+            Some(response_deadline),
+        ) {
+            Ok(result) => result,
+            Err(_) if Instant::now() >= response_deadline.expires_at => {
+                break response_tracker.timeout();
             }
+            Err(_) => {
+                break response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed);
+            }
+        };
+        let probe = match parse_script_result(&check_res)
+            .ok()
+            .and_then(|value| serde_json::from_value::<ResponseDomProbe>(value).ok())
+        {
+            Some(probe) => probe,
+            None => {
+                break response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed);
+            }
+        };
+        match response_tracker.observe(probe) {
+            ResponseTrackerDecision::Pending => {}
+            terminal => break terminal,
         }
 
-        thread::sleep(Duration::from_millis(100));
-        wait_cycles += 1;
-    }
+        let remaining = response_deadline
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(RESPONSE_POLL_INTERVAL));
+    };
 
     if is_terminal {
         print!("\r\x1b[K");
         io::stdout().flush()?;
     }
 
-    if !finished {
-        eprintln!(
-            "\nWarning: Output stream did not complete within the timeout period ({} seconds).",
-            cli.timeout
-        );
+    let verified_response = match response_decision {
+        ResponseTrackerDecision::Completed(identity) => identity,
+        ResponseTrackerDecision::Unknown(code) => {
+            if let Some(path) = receipt_path.as_deref() {
+                record_session_response_outcome(path, ResponseCompletion::Unknown, 0, Some(code))
+                    .map_err(|_| "Response became unknown, but receipt audit failed")?;
+            }
+            return Err(format!("Provider response completion is unknown ({code})").into());
+        }
+        ResponseTrackerDecision::Pending => {
+            unreachable!("response wait must end in a terminal state")
+        }
+    };
+
+    let download_result = download_images_from_latest_message(
+        &config_path,
+        provider,
+        cli.image_output.as_deref(),
+        Some((&response_baseline, &verified_response)),
+        command_verbose,
+    );
+    let downloaded_image_count = if expected_output_type == ExpectedOutputType::Image {
+        match enforce_download_contract(expected_output_type, download_result) {
+            Ok(count) => count,
+            Err(code) => {
+                let completion = if code == ResponseFailureCode::ResponseIdentityChanged {
+                    ResponseCompletion::Unknown
+                } else {
+                    ResponseCompletion::Completed
+                };
+                if let Some(path) = receipt_path.as_deref() {
+                    record_session_response_outcome(path, completion, 0, Some(code))
+                        .map_err(|_| "Image download failed, and receipt audit also failed")?;
+                }
+                return Err(format!("Verified image response download failed ({code})").into());
+            }
+        }
+    } else {
+        match download_result {
+            Ok(count) => count,
+            Err(error) => {
+                if command_verbose {
+                    eprintln!("Warning: Optional image download failed: {}", error);
+                }
+                0
+            }
+        }
+    };
+    if let Some(path) = receipt_path.as_deref() {
+        record_session_response_outcome(
+            path,
+            ResponseCompletion::Completed,
+            downloaded_image_count,
+            None,
+        )
+        .map_err(|_| "Failed to persist final response receipt")?;
     }
 
-    if finished {
-        if command_verbose {
-            println!(
-                "Copying final response from {} toolbar...",
-                provider.display_name()
-            );
+    if command_verbose {
+        println!(
+            "Copying final response from {} toolbar...",
+            provider.display_name()
+        );
+    }
+    match copy_latest_markdown(&config_path, provider) {
+        Ok(content) => {
+            last_markdown = content;
         }
-        match copy_latest_markdown(&config_path, provider) {
-            Ok(content) => {
-                last_markdown = content;
-            }
-            Err(e) => {
-                eprintln!(
-                    "Error copying response from {} toolbar: {}",
-                    provider.display_name(),
-                    e
-                );
-            }
+        Err(e) => {
+            eprintln!(
+                "Error copying response from {} toolbar: {}",
+                provider.display_name(),
+                e
+            );
         }
     }
 
     if let Err(e) = render_markdown(&last_markdown, use_glow) {
         eprintln!("Error rendering Markdown: {}", e);
-    }
-
-    if finished {
-        let _ = download_images_from_latest_message(
-            &config_path,
-            provider,
-            cli.image_output.as_deref(),
-            command_verbose,
-        )
-        .map_err(|e| {
-            eprintln!("Error downloading images: {}", e);
-        });
     }
 
     // Print the URL link of the current conversation thread
