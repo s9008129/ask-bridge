@@ -848,6 +848,29 @@ impl ResponseCompletionTracker {
             }
         }
 
+        if probe.generation_control_visible {
+            // Provider UIs can briefly hide and remount Stop while the same
+            // image response is transitioning from an assistant shell to its
+            // loaded artifact.  It is a readiness signal, not an identity
+            // signal; counts, route, ownership token and semantic anchors
+            // above remain the fail-closed identity gates.
+            //
+            // During active generation the DOM legitimately evolves: turn_id
+            // and artifact_ids change as the image artifact is created and
+            // loaded.  Update the stored identity to the latest probe values
+            // rather than treating the drift as a terminal identity violation.
+            // The strict identity gates below only run once generation has
+            // stopped, so a post-generation identity change is still caught.
+            if !probe.turn_id.is_empty() {
+                self.response_turn_id = Some(probe.turn_id.clone());
+            }
+            if !probe.artifact_ids.is_empty() {
+                self.response_artifact_ids = Some(probe.artifact_ids.clone());
+            }
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+
         if !probe.turn_id.is_empty() {
             match &self.response_turn_id {
                 Some(current) if current != &probe.turn_id => {
@@ -865,16 +888,6 @@ impl ResponseCompletionTracker {
                 None => self.response_artifact_ids = Some(probe.artifact_ids.clone()),
                 Some(_) => {}
             }
-        }
-
-        if probe.generation_control_visible {
-            // Provider UIs can briefly hide and remount Stop while the same
-            // image response is transitioning from an assistant shell to its
-            // loaded artifact.  It is a readiness signal, not an identity
-            // signal; counts, route, ownership token and semantic anchors
-            // above remain the fail-closed identity gates.
-            self.reset_stability();
-            return ResponseTrackerDecision::Pending;
         }
 
         if self.expected_output_type == ExpectedOutputType::Image
@@ -3463,8 +3476,19 @@ mod tests {
             ResponseTrackerDecision::Pending
         );
 
+        // During active generation the DOM legitimately evolves: turn_id
+        // and artifact_ids change as the image artifact is created.  This
+        // must be Pending, not a terminal ResponseIdentityChanged.
+        let mut generating_evolved = response_probe(3, true, 0, "shell-mutated-2");
+        generating_evolved.turn_id = "turn-2".to_string();
+        generating_evolved.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            tracker.observe(generating_evolved),
+            ResponseTrackerDecision::Pending
+        );
+
         let mut image = response_probe(3, false, 1, "image-v1");
-        image.turn_id = "turn-1".to_string();
+        image.turn_id = "turn-2".to_string();
         image.artifact_ids = vec!["image-artifact-1".to_string()];
         assert_eq!(
             tracker.observe(image.clone()),
@@ -3494,6 +3518,70 @@ mod tests {
             identity_tracker.observe(changed_turn),
             ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
         );
+    }
+
+    #[test]
+    fn generation_allows_turn_and_artifact_evolution() {
+        // Regression: ChatGPT was still generating an image (Stop button
+        // visible) when turn_id / artifact_ids evolved.  The tracker must
+        // treat this as Pending, not a terminal ResponseIdentityChanged.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+
+        // Assistant shell appears with turn-1, no generation yet.
+        let mut shell = response_probe(3, false, 0, "shell");
+        shell.turn_id = "turn-1".to_string();
+        assert_eq!(tracker.observe(shell), ResponseTrackerDecision::Pending);
+
+        // Generation starts; turn_id stays the same.
+        let mut generating = response_probe(3, true, 0, "shell-generating");
+        generating.turn_id = "turn-1".to_string();
+        assert_eq!(
+            tracker.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+
+        // During generation, turn_id changes to turn-2 and an artifact appears.
+        // This is legitimate DOM evolution during image generation.
+        let mut evolved = response_probe(3, true, 0, "shell-evolved");
+        evolved.turn_id = "turn-2".to_string();
+        evolved.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            tracker.observe(evolved),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Generation continues; artifact_ids grow (second image element).
+        let mut more_artifacts = response_probe(3, true, 0, "shell-more-artifacts");
+        more_artifacts.turn_id = "turn-2".to_string();
+        more_artifacts.artifact_ids = vec![
+            "image-artifact-1".to_string(),
+            "image-artifact-2".to_string(),
+        ];
+        assert_eq!(
+            tracker.observe(more_artifacts),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Generation stops; the loaded image is now present with the latest
+        // identity.  Stability window must accumulate before Completed.
+        let mut image_ready = response_probe(3, false, 1, "image-final");
+        image_ready.turn_id = "turn-2".to_string();
+        image_ready.artifact_ids = vec![
+            "image-artifact-1".to_string(),
+            "image-artifact-2".to_string(),
+        ];
+        assert_eq!(
+            tracker.observe(image_ready.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(image_ready.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(image_ready),
+            ResponseTrackerDecision::Completed(_)
+        ));
     }
 
     #[test]
