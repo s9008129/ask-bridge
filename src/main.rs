@@ -183,7 +183,8 @@ impl Provider {
                             document.querySelector('button[aria-label*="User"]') ||
                             document.querySelector('button[aria-label*="user"]') ||
                             document.querySelector('button[aria-label*="帳戶"]') ||
-                            document.querySelector('button[aria-label*="使用者"]');
+                            document.querySelector('button[aria-label*="使用者"]') ||
+                            document.querySelector('button[aria-label*="設定檔"]');
 
                         return {
                             account: isVisible(accountMenu),
@@ -523,13 +524,15 @@ struct Cli {
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 
-    /// Switch the provider model before sending the prompt.
+    /// Switch the provider model before sending the prompt.  Can be specified
+    /// multiple times to set both the model and the reasoning level, e.g.
+    /// `--model "GPT-5.5" --model "中等"`.
     /// ChatGPT examples: "GPT-5.5", "GPT-5.4", "GPT-5.3", "o3", or thinking levels such as
     /// "即時", "中等", "高", "超高", "專業", "智慧". Gemini examples: "3.5 Flash",
     /// "3.1 Flash-Lite", or "3.1 Pro". Claude examples: "Sonnet", "Opus", "Haiku".
     /// Matching is case- and punctuation-insensitive.
-    #[arg(long = "model", value_name = "MODEL")]
-    model: Option<String>,
+    #[arg(long = "model", value_name = "MODEL", action = clap::ArgAction::Append)]
+    model: Vec<String>,
 
     /// Upload and verify attachments in an isolated tab without typing or
     /// submitting a prompt.  Exits 0 on verified, non-zero on attachment
@@ -6465,6 +6468,7 @@ fn build_attachment_probe_script(
             '[data-testid*="file-preview"]',
             '[data-testid*="file-thumbnail"]',
             '[class*="attachment"]',
+            '[class*="file-tile"]',
             '[class*="file-chip"]',
             '[class*="file-pill"]',
             '[class*="file-preview"]',
@@ -6481,13 +6485,17 @@ fn build_attachment_probe_script(
         const leaves = candidates.filter((candidate) =>
             !candidates.some((other) => other !== candidate && candidate.contains(other))
         );
+        const filteredLeaves = leaves.filter((l) => {
+            const ariaLabel = (l.getAttribute('aria-label') || '').toLowerCase();
+            return !ariaLabel.startsWith('移除') && !ariaLabel.startsWith('remove');
+        });
         const expectedCounts = new Map();
         for (const name of expectedNames) {
             expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
         }
         const observedCounts = new Map();
         let unmatchedVisibleCandidates = 0;
-        for (const candidate of leaves) {
+        for (const candidate of filteredLeaves) {
             const text = textFor(candidate);
             const matches = Array.from(expectedCounts.keys())
                 .filter((name) => text.includes(name))
@@ -6524,13 +6532,13 @@ fn build_attachment_probe_script(
         const uploadingState = Array.from(root.querySelectorAll(
             '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i], [data-testid*="progress" i]'
         )).some(isVisible);
-        const uploadingText = leaves.some((candidate) =>
+        const uploadingText = filteredLeaves.some((candidate) =>
             /uploading|upload in progress|上傳中|正在上傳|上传中|正在上传/i.test(textFor(candidate))
         );
         const errorState = Array.from(root.querySelectorAll(
             '[data-state="error"], [data-status="error"], [data-testid*="upload-error" i], [aria-label*="upload failed" i]'
         )).some(isVisible);
-        const errorText = leaves.some((candidate) =>
+        const errorText = filteredLeaves.some((candidate) =>
             /upload failed|failed to upload|上傳失敗|上传失败/i.test(textFor(candidate))
         );
         const uploading = uploadingState || uploadingText;
@@ -6654,7 +6662,10 @@ fn build_typed_attachment_probe_script(
         // Only keep tiles that are leaf-level (no child tile inside them).
         const docCandidates = allTiles.filter((t) =>
             !allTiles.some((o) => o !== t && t.contains(o))
-        );
+        ).filter((l) => {
+            const ariaLabel = (l.getAttribute('aria-label') || '').toLowerCase();
+            return !ariaLabel.startsWith('移除') && !ariaLabel.startsWith('remove');
+        });
         const textFor = (el) => [
             el.innerText, el.textContent,
             el.getAttribute('aria-label'), el.getAttribute('title')
@@ -7293,6 +7304,8 @@ fn switch_model(
                 + "        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n"
                 + "        const norm = (s) => (s || '').toLowerCase().replace(/[\\s.\\-_]/g, '');\n"
                 + &format!("        const target = norm({});\n", target_json)
+                + "        const aliases = { '中等': '中', '中等推理': '中', '高推理': '高', '即時推理': '即時' };\n"
+                + "        const resolvedTarget = aliases[target] || target;\n"
                 + "        if (!target) { window.__switch_model_status = 'error: empty target'; return; }\n"
                 + "        const visited = new Set();\n"
                 + "        const closeMenus = async () => {\n"
@@ -7318,7 +7331,7 @@ fn switch_model(
                 + "            const leaves = all.filter((it) => it.getAttribute('aria-haspopup') !== 'menu');\n"
                 + "            for (const it of leaves) {\n"
                 + "                const t = norm(it.innerText);\n"
-                + "                if (t && t === target) {\n"
+                + "                if (t && t === resolvedTarget) {\n"
                 + "                    it.click();\n"
                 + "                    clicked = true;\n"
                 + "                    chosen = it.innerText;\n"
@@ -9312,12 +9325,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => {}
     }
 
-    // Switch model if requested (before uploading attachments / typing the prompt)
-    if let Some(m) = &cli.model
-        && let Err(e) = switch_model(&config_path, provider, m, command_verbose)
-    {
-        eprintln!("Error switching model: {}", e);
-        std::process::exit(1);
+    // Switch model if requested (before uploading attachments / typing the prompt).
+    // Each --model value is applied in order, so e.g. `--model "GPT-5.5" --model "中等"`
+    // first selects the model, then the reasoning level.
+    for m in &cli.model {
+        if let Err(e) = switch_model(&config_path, provider, m, command_verbose) {
+            eprintln!("Error switching model '{}': {}", m, e);
+            std::process::exit(1);
+        }
     }
 
     // --verify-attachments-only: upload and verify attachments, then exit
