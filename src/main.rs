@@ -24,10 +24,25 @@ const VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY: &str = "verified_image_resp
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Dynamic attachment verification timeout scaled by the number of files.
+/// ChatGPT renders file tiles progressively; with 4 files (e.g. repair
+/// requests) the 60-second base is not enough for all tiles to appear and
+/// stabilise.  Each file gets an additional 15 seconds of headroom.
+fn attachment_verify_timeout_for_count(count: usize) -> Duration {
+    Duration::from_secs(ATTACHMENT_VERIFY_TIMEOUT.as_secs() + (count as u64 * 15))
+}
 const ATTACHMENT_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ATTACHMENT_REQUIRED_STABLE_PROBES: usize = 2;
 const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RESPONSE_REQUIRED_STABLE_PROBES: usize = 3;
+/// Minimum text content length (in bytes of trimmed textContent) for a text
+/// response to be considered complete.  ChatGPT sometimes shows short
+/// processing-status text (e.g. "Reading Schema For JSON Deck Plan
+/// Validation", ~44 bytes) while the Stop button briefly disappears during
+/// attachment processing.  Without this gate the stability tracker would
+/// declare the response complete and copy the status text instead of the
+/// real response.
+const MINIMUM_TEXT_RESPONSE_BYTES: usize = 200;
 const GENERATED_IMAGE_MIN_DIMENSION: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -722,6 +737,7 @@ struct ResponseDomProbe {
     assistant_count: usize,
     generation_control_visible: bool,
     content_present: bool,
+    content_text_length: usize,
     provider_failure_visible: bool,
     loaded_large_image_count: usize,
     dom_signature: String,
@@ -756,6 +772,7 @@ struct ResponseCompletionTracker {
     stable_probes: usize,
     provider_failure_signature: Option<String>,
     provider_failure_probes: usize,
+    was_generating: bool,
     terminal: Option<ResponseTrackerDecision>,
 }
 
@@ -776,6 +793,7 @@ impl ResponseCompletionTracker {
             stable_probes: 0,
             provider_failure_signature: None,
             provider_failure_probes: 0,
+            was_generating: false,
             terminal: None,
         }
     }
@@ -870,8 +888,24 @@ impl ResponseCompletionTracker {
             if !probe.artifact_ids.is_empty() {
                 self.response_artifact_ids = Some(probe.artifact_ids.clone());
             }
+            self.was_generating = true;
             self.reset_stability();
             return ResponseTrackerDecision::Pending;
+        }
+
+        // When transitioning from generating to not-generating, ChatGPT
+        // re-renders the response DOM (turn_id / artifact_ids may change as
+        // the image artifact is finalised).  Update the stored identity once
+        // to absorb this post-generation evolution, then proceed to the
+        // normal stability + identity checks for subsequent probes.
+        if self.was_generating {
+            if !probe.turn_id.is_empty() {
+                self.response_turn_id = Some(probe.turn_id.clone());
+            }
+            if !probe.artifact_ids.is_empty() {
+                self.response_artifact_ids = Some(probe.artifact_ids.clone());
+            }
+            self.was_generating = false;
         }
 
         if !probe.turn_id.is_empty() {
@@ -922,7 +956,10 @@ impl ResponseCompletionTracker {
         }
 
         let artifact_ready = match self.expected_output_type {
-            ExpectedOutputType::Text => probe.content_present,
+            ExpectedOutputType::Text => {
+                probe.content_present
+                    && probe.content_text_length >= MINIMUM_TEXT_RESPONSE_BYTES
+            }
             ExpectedOutputType::Image => probe.loaded_large_image_count > 0,
         };
         if !artifact_ready || probe.dom_signature.is_empty() {
@@ -1417,6 +1454,7 @@ fn capabilities_value() -> Value {
             "stable_probes": ATTACHMENT_REQUIRED_STABLE_PROBES,
             "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
             "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
+            "timeout_per_file_seconds": 15,
             "submit_before_verified": false
         },
         "verified_mixed_attachment_upload_v1": {
@@ -1427,6 +1465,7 @@ fn capabilities_value() -> Value {
             "stable_probes": ATTACHMENT_REQUIRED_STABLE_PROBES,
             "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
             "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
+            "timeout_per_file_seconds": 15,
             "submit_before_verified": false,
             "receipt_fields": ["attachment_probe"]
         },
@@ -3252,6 +3291,7 @@ mod tests {
             assistant_count,
             generation_control_visible: generating,
             content_present: assistant_count > 0,
+            content_text_length: if assistant_count > 0 { 1000 } else { 0 },
             provider_failure_visible: false,
             loaded_large_image_count,
             dom_signature: signature.to_string(),
@@ -3324,6 +3364,61 @@ mod tests {
             tracker.observe(response_probe(7, false, 0, "stable-text")),
             ResponseTrackerDecision::Completed(_)
         ));
+    }
+
+    #[test]
+    fn text_completion_rejects_short_processing_status_text() {
+        // R8: ChatGPT can show a short processing-status text (e.g. "Reading
+        // Schema For JSON Deck Plan Validation", ~44 bytes) while the Stop
+        // button briefly disappears during attachment processing.  Such a
+        // short text must NOT be treated as a completed response.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+        let mut short_probe = response_probe(7, false, 0, "short-status");
+        short_probe.content_text_length = 44; // simulates "Reading Schema..." status text
+        // Even after 5 probes (well beyond the 3-probe stability window) the
+        // short text should never reach Completed.
+        for _ in 0..5 {
+            assert_eq!(
+                tracker.observe(short_probe.clone()),
+                ResponseTrackerDecision::Pending
+            );
+        }
+    }
+
+    #[test]
+    fn text_completion_accepts_response_meeting_minimum_length() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+        // A response at exactly the minimum boundary should complete normally
+        // after the stability window.
+        let mut min_probe = response_probe(7, false, 0, "min-length-text");
+        min_probe.content_text_length = MINIMUM_TEXT_RESPONSE_BYTES;
+        for _ in 0..(RESPONSE_REQUIRED_STABLE_PROBES - 1) {
+            assert_eq!(
+                tracker.observe(min_probe.clone()),
+                ResponseTrackerDecision::Pending
+            );
+        }
+        assert!(matches!(
+            tracker.observe(min_probe),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn attachment_verify_timeout_scales_with_file_count() {
+        // R10: 4-file repair requests need more than the 60-second base.
+        assert_eq!(
+            attachment_verify_timeout_for_count(0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            attachment_verify_timeout_for_count(2),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            attachment_verify_timeout_for_count(4),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]
@@ -3585,6 +3680,85 @@ mod tests {
             tracker.observe(image_ready),
             ResponseTrackerDecision::Completed(_)
         ));
+    }
+
+    #[test]
+    fn post_generation_dom_re_render_does_not_fail_as_identity_change() {
+        // Regression (S08): ChatGPT re-renders the response DOM when
+        // generation finishes (Stop disappears).  turn_id and/or
+        // artifact_ids can change at this transition.  The tracker must
+        // absorb the one-time post-generation identity evolution instead
+        // of declaring ResponseIdentityChanged, because the image is
+        // already present and the response is legitimately complete.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+
+        // Assistant shell with no image, no Stop.
+        let mut shell = response_probe(3, false, 0, "shell");
+        shell.turn_id = "turn-gen-1".to_string();
+        assert_eq!(tracker.observe(shell), ResponseTrackerDecision::Pending);
+
+        // Generation starts; Stop visible, image being created.
+        let mut generating = response_probe(3, true, 0, "generating");
+        generating.turn_id = "turn-gen-1".to_string();
+        generating.artifact_ids = vec!["img-partial".to_string()];
+        assert_eq!(
+            tracker.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Generation finishes: Stop disappears, DOM re-renders with a new
+        // turn_id and finalised artifact_ids, and the image is now loaded.
+        let mut done = response_probe(3, false, 1, "image-final");
+        done.turn_id = "turn-done-2".to_string();
+        done.artifact_ids = vec!["img-final".to_string()];
+        // This must NOT be ResponseIdentityChanged — it should be Pending
+        // (first stability probe after the post-generation transition).
+        assert_eq!(
+            tracker.observe(done.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(done.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(done),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn post_generation_identity_change_after_stable_is_still_caught() {
+        // After the post-generation transition absorbs one identity change,
+        // subsequent identity changes must still be caught as
+        // ResponseIdentityChanged.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+
+        let mut generating = response_probe(3, true, 0, "generating");
+        generating.turn_id = "turn-A".to_string();
+        generating.artifact_ids = vec!["img-A".to_string()];
+        assert_eq!(
+            tracker.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Post-generation transition: identity changes to turn-B.
+        let mut done = response_probe(3, false, 1, "image-final");
+        done.turn_id = "turn-B".to_string();
+        done.artifact_ids = vec!["img-B".to_string()];
+        assert_eq!(
+            tracker.observe(done.clone()),
+            ResponseTrackerDecision::Pending
+        );
+
+        // A further identity change (turn-C) is still caught.
+        let mut changed = response_probe(3, false, 1, "image-v2");
+        changed.turn_id = "turn-C".to_string();
+        changed.artifact_ids = vec!["img-C".to_string()];
+        assert_eq!(
+            tracker.observe(changed),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
     }
 
     #[test]
@@ -6576,7 +6750,8 @@ fn verify_attachment_completion(
         return Ok(());
     }
     let script = build_attachment_probe_script(provider, expected_file_names)?;
-    let deadline = McpOperationDeadline::from_timeout(ATTACHMENT_VERIFY_TIMEOUT)
+    let verify_timeout = attachment_verify_timeout_for_count(expected_file_names.len());
+    let deadline = McpOperationDeadline::from_timeout(verify_timeout)
         .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
     let mut tracker = AttachmentVerificationTracker::new(expected_file_names.len());
     loop {
@@ -6602,7 +6777,7 @@ fn verify_attachment_completion(
             return Ok(());
         }
         let remaining = deadline
-            .phase_timeout(ATTACHMENT_VERIFY_TIMEOUT, "attachment verification poll")
+            .phase_timeout(verify_timeout, "attachment verification poll")
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
         if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
             return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
@@ -6752,7 +6927,9 @@ fn verify_typed_attachment_completion(
         });
     }
     let script = build_typed_attachment_probe_script(provider, &expectations.document_names)?;
-    let deadline = McpOperationDeadline::from_timeout(ATTACHMENT_VERIFY_TIMEOUT)
+    let total_count = expectations.document_names.len() + expectations.image_count;
+    let verify_timeout = attachment_verify_timeout_for_count(total_count);
+    let deadline = McpOperationDeadline::from_timeout(verify_timeout)
         .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
     let mut tracker = TypedAttachmentTracker::new(expectations);
     loop {
@@ -6791,7 +6968,7 @@ fn verify_typed_attachment_completion(
         }
         let remaining = deadline
             .phase_timeout(
-                ATTACHMENT_VERIFY_TIMEOUT,
+                verify_timeout,
                 "typed attachment verification poll",
             )
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
@@ -8182,6 +8359,7 @@ fn build_response_probe_script(
                 assistant_count: messages.length,
                 generation_control_visible: Boolean(generationControl),
                 content_present: Boolean(latest && (((latest.textContent || '').trim().length > 0) || loadedImages.length > 0)),
+                content_text_length: latest ? (latest.textContent || '').trim().length : 0,
                 provider_failure_visible: providerFailureVisible,
                 loaded_large_image_count: loadedImages.length,
                 dom_signature: domSignature(latest)
