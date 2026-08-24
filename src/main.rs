@@ -21,6 +21,7 @@ const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
 const VERIFIED_FILE_UPLOAD_CAPABILITY: &str = "verified_file_upload_v1";
 const VERIFIED_MIXED_ATTACHMENT_CAPABILITY: &str = "verified_mixed_attachment_upload_v1";
 const VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY: &str = "verified_image_response_completion_v1";
+const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -957,8 +958,7 @@ impl ResponseCompletionTracker {
 
         let artifact_ready = match self.expected_output_type {
             ExpectedOutputType::Text => {
-                probe.content_present
-                    && probe.content_text_length >= MINIMUM_TEXT_RESPONSE_BYTES
+                probe.content_present && probe.content_text_length >= MINIMUM_TEXT_RESPONSE_BYTES
             }
             ExpectedOutputType::Image => probe.loaded_large_image_count > 0,
         };
@@ -1067,6 +1067,7 @@ impl SessionReceipt {
             capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
             capabilities: vec![
                 ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+                BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string(),
                 VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
                 VERIFIED_MIXED_ATTACHMENT_CAPABILITY.to_string(),
                 VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY.to_string(),
@@ -1438,6 +1439,7 @@ fn capabilities_value() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "capabilities": [
             ISOLATED_NEW_TAB_CAPABILITY,
+            BACKGROUND_ISOLATED_TAB_CAPABILITY,
             VERIFIED_FILE_UPLOAD_CAPABILITY,
             VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
             VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY
@@ -1448,6 +1450,11 @@ fn capabilities_value() -> Value {
             "receipt": "0600-json",
             "ownership": "exact-page-id",
             "lease": "provider-scoped-cross-process"
+        },
+        "background_isolated_tab_v1": {
+            "new_page_background": "headless",
+            "foreground": "visible",
+            "scope": "isolated-new-tab-only"
         },
         "verified_file_upload_v1": {
             "verification": "filename-multiset-stable-dom-probe",
@@ -1501,6 +1508,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
     } else {
         println!("ask-bridge capabilities");
         println!("  {}", ISOLATED_NEW_TAB_CAPABILITY);
+        println!("  {}", BACKGROUND_ISOLATED_TAB_CAPABILITY);
         println!("  {}", VERIFIED_FILE_UPLOAD_CAPABILITY);
         println!("  {}", VERIFIED_MIXED_ATTACHMENT_CAPABILITY);
         println!("  {}", VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY);
@@ -3020,6 +3028,103 @@ fn call_mcp_tool_with_deadline(
     call_mcp_tool_raw_with_deadline(config_path, tool, args, deadline)
 }
 
+/// Decide whether to close the owned tab after a verified success.
+///
+/// Returns the exact owned page ID to close, or an `Err` with a reason to
+/// skip. This is a pure decision: it never performs any MCP call, so it can be
+/// tested without a live browser. Cleanup is refused for submitted/unknown
+/// outcomes, identity-changed responses, unknown downloads, and unbounded
+/// pages.
+fn decide_owned_tab_cleanup(
+    binding: Option<&OwnedPageBinding>,
+    receipt: Option<&SessionReceipt>,
+) -> Result<usize, String> {
+    let Some(binding) = binding else {
+        return Err("no active owned page binding; nothing to clean up".to_string());
+    };
+    let Some(receipt) = receipt else {
+        return Err("no session receipt; cannot verify success outcome".to_string());
+    };
+    if receipt.response_completion != ResponseCompletion::Completed {
+        return Err(format!(
+            "response outcome is not Completed ({:?}); skipping cleanup",
+            receipt.response_completion
+        ));
+    }
+    if receipt.response_failure_code.is_some() {
+        return Err("response failure recorded; skipping cleanup".to_string());
+    }
+    if receipt.expected_output_type == ExpectedOutputType::Image
+        && receipt.downloaded_image_count == 0
+    {
+        return Err("image download count is unknown/empty; skipping cleanup".to_string());
+    }
+    Ok(binding.page_id)
+}
+
+/// Verify the exact owned page still exists in the live page list before
+/// closing it, so cleanup can never close an existing or unowned tab (e.g. a
+/// newly-created page that reused the ID after the owned page disappeared).
+fn verify_owned_page_present(
+    page_id: usize,
+    current_page_ids: &std::collections::HashSet<usize>,
+) -> Result<(), String> {
+    if current_page_ids.contains(&page_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "owned page ID {} is no longer present; skipping cleanup",
+            page_id
+        ))
+    }
+}
+
+/// Internal cleanup: after a verified success, raw-close the exact owned page.
+///
+/// This is a SUPPORTING, non-gating step. It deliberately uses
+/// `call_mcp_tool_raw` so it does NOT relax the general isolated mutation
+/// guard in `call_mcp_tool` (which still rejects `close_page`/`new_page`).
+/// Any failure is surfaced as an `Err` for the caller to sanitise into a
+/// warning; it never changes the success receipt, downloaded images, output
+/// files, or process exit success.
+fn cleanup_owned_page_after_success(
+    config_path: &str,
+    receipt_path: Option<&Path>,
+) -> Result<(), String> {
+    let binding = owned_page_binding();
+    let receipt = match receipt_path {
+        Some(path) => Some(read_session_receipt(path)?),
+        None => None,
+    };
+    let page_id = decide_owned_tab_cleanup(binding.as_ref(), receipt.as_ref())?;
+    let current_page_ids: std::collections::HashSet<usize> = list_pages(config_path)?
+        .into_iter()
+        .map(|page| page.id)
+        .collect();
+    verify_owned_page_present(page_id, &current_page_ids)?;
+    call_mcp_tool_raw(
+        config_path,
+        "close_page",
+        serde_json::json!({ "pageId": page_id }),
+    )?;
+    clear_owned_page();
+    Ok(())
+}
+
+/// Run owned-tab cleanup after a verified success, sanitising any failure to a
+/// warning string. Returns `None` on success (or when there is nothing to
+/// clean up) and `Some(warning)` on failure, so the caller can print the
+/// warning without changing the already-verified success result.
+fn run_owned_tab_cleanup_warning(config_path: &str, receipt_path: Option<&Path>) -> Option<String> {
+    match cleanup_owned_page_after_success(config_path, receipt_path) {
+        Ok(()) => None,
+        Err(error) => Some(format!(
+            "Warning: could not close owned tab after success: {}",
+            error
+        )),
+    }
+}
+
 fn parse_pages(text: &str) -> Vec<Page> {
     let mut pages = Vec::new();
     for line in text.lines() {
@@ -3199,12 +3304,25 @@ mod tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
         assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
+        assert!(advertised.contains(&BACKGROUND_ISOLATED_TAB_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
         assert_eq!(
             capabilities["isolated_new_tab_v1"]["flag"].as_str(),
             Some("--new-tab-preserve-existing")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["new_page_background"].as_str(),
+            Some("headless")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["foreground"].as_str(),
+            Some("visible")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["scope"].as_str(),
+            Some("isolated-new-tab-only")
         );
         assert_eq!(
             capabilities["verified_file_upload_v1"]["verification"].as_str(),
@@ -3272,6 +3390,28 @@ mod tests {
             probe.command,
             Some(Commands::SessionProbe { json: true })
         ));
+    }
+
+    #[test]
+    fn isolated_new_page_args_maps_headless_to_background() {
+        let headless = isolated_new_page_args("https://chatgpt.com/", true);
+        assert_eq!(headless["url"].as_str(), Some("https://chatgpt.com/"));
+        assert_eq!(headless["background"].as_bool(), Some(true));
+
+        let visible = isolated_new_page_args("https://chatgpt.com/", false);
+        assert_eq!(visible["url"].as_str(), Some("https://chatgpt.com/"));
+        assert_eq!(visible["background"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn session_receipt_declares_background_isolated_tab_capability() {
+        let receipt = SessionReceipt::new(0, 0);
+        assert!(
+            receipt
+                .capabilities
+                .contains(&BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string())
+        );
+        assert_eq!(receipt.schema_version, SESSION_RECEIPT_SCHEMA_VERSION);
     }
 
     fn response_probe(
@@ -3643,10 +3783,7 @@ mod tests {
         let mut evolved = response_probe(3, true, 0, "shell-evolved");
         evolved.turn_id = "turn-2".to_string();
         evolved.artifact_ids = vec!["image-artifact-1".to_string()];
-        assert_eq!(
-            tracker.observe(evolved),
-            ResponseTrackerDecision::Pending
-        );
+        assert_eq!(tracker.observe(evolved), ResponseTrackerDecision::Pending);
 
         // Generation continues; artifact_ids grow (second image element).
         let mut more_artifacts = response_probe(3, true, 0, "shell-more-artifacts");
@@ -4539,6 +4676,118 @@ mod tests {
         );
         assert!(call_mcp_tool("unused", "select_page", serde_json::json!({"pageId": 8})).is_err());
         clear_owned_page();
+    }
+
+    fn completed_receipt() -> SessionReceipt {
+        let mut receipt = SessionReceipt::new(0, 0);
+        receipt.response_completion = ResponseCompletion::Completed;
+        receipt
+    }
+
+    fn owned_binding(page_id: usize) -> OwnedPageBinding {
+        OwnedPageBinding {
+            session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            page_id,
+        }
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_enters_for_exact_owned_page() {
+        let binding = owned_binding(7);
+        assert_eq!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&completed_receipt())).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_refuses_unbounded_and_other_ids() {
+        let binding = owned_binding(7);
+        let receipt = completed_receipt();
+        // Unbounded page (no binding) is refused.
+        assert!(decide_owned_tab_cleanup(None, Some(&receipt)).is_err());
+        // No receipt is refused.
+        assert!(decide_owned_tab_cleanup(Some(&binding), None).is_err());
+        // The decision only ever returns the exact owned page ID (7), never an
+        // "other" ID.
+        assert_eq!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&receipt)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_refuses_submitted_unknown_and_identity_changed() {
+        let binding = owned_binding(7);
+        // Submitted/unknown outcome (Pending) is refused.
+        assert!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&SessionReceipt::new(0, 0))).is_err()
+        );
+        // Unknown outcome is refused.
+        let mut unknown = SessionReceipt::new(0, 0);
+        unknown.response_completion = ResponseCompletion::Unknown;
+        assert!(decide_owned_tab_cleanup(Some(&binding), Some(&unknown)).is_err());
+        // Identity-changed (failure code present) is refused.
+        let mut identity_changed = completed_receipt();
+        identity_changed.response_failure_code = Some(ResponseFailureCode::ResponseIdentityChanged);
+        assert!(decide_owned_tab_cleanup(Some(&binding), Some(&identity_changed)).is_err());
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_refuses_unknown_image_download() {
+        let binding = owned_binding(7);
+        let mut receipt = completed_receipt();
+        receipt.expected_output_type = ExpectedOutputType::Image;
+        // Image output with zero downloaded images is an unknown download.
+        assert!(decide_owned_tab_cleanup(Some(&binding), Some(&receipt)).is_err());
+        // A known download count allows cleanup.
+        receipt.downloaded_image_count = 3;
+        assert_eq!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&receipt)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn owned_tab_cleanup_verifies_page_present_before_close() {
+        let present: std::collections::HashSet<usize> = [7usize].into_iter().collect();
+        assert!(verify_owned_page_present(7, &present).is_ok());
+        // A newly-created / other page (not the owned page) is refused.
+        let other: std::collections::HashSet<usize> = [8usize].into_iter().collect();
+        assert!(verify_owned_page_present(7, &other).is_err());
+        // An empty page list (owned page disappeared) is refused.
+        let empty: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        assert!(verify_owned_page_present(7, &empty).is_err());
+    }
+
+    #[test]
+    fn owned_tab_cleanup_refuses_without_mcp_for_unsafe_states() {
+        clear_owned_page();
+        // No binding: refused before any MCP call.
+        assert!(cleanup_owned_page_after_success("unused", None).is_err());
+        // Binding but no receipt: refused before any MCP call.
+        bind_owned_page("00000000-0000-4000-8000-000000000001", 7).unwrap();
+        assert!(cleanup_owned_page_after_success("unused", None).is_err());
+        clear_owned_page();
+    }
+
+    #[test]
+    fn owned_tab_cleanup_failure_is_non_gating_warning() {
+        clear_owned_page();
+        // No binding -> cleanup refuses -> a warning is returned, not an error
+        // that would change the already-verified success result.
+        let warning = run_owned_tab_cleanup_warning("unused", None);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Warning:"));
+        // A completed receipt with no binding is still refused (unbounded
+        // page), and the failure is sanitised to a warning.
+        let root = make_test_dir("cleanup_non_gating");
+        let path = root.join("receipt.json");
+        write_private_json(&path, &completed_receipt()).unwrap();
+        let warning = run_owned_tab_cleanup_warning("unused", Some(&path));
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Warning:"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6967,10 +7216,7 @@ fn verify_typed_attachment_completion(
             }
         }
         let remaining = deadline
-            .phase_timeout(
-                verify_timeout,
-                "typed attachment verification poll",
-            )
+            .phase_timeout(verify_timeout, "typed attachment verification poll")
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
         if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
             return Err(format!(
@@ -8425,6 +8671,17 @@ fn list_pages(config_path: &str) -> Result<Vec<Page>, String> {
     Ok(parse_pages(text))
 }
 
+/// Build the `new_page` args for the safe isolated new-tab path.
+///
+/// Headless mode opens the tab in the background so Chrome does not steal
+/// macOS foreground focus; visible mode opens it in the foreground.
+fn isolated_new_page_args(url: &str, headless: bool) -> Value {
+    serde_json::json!({
+        "url": url,
+        "background": headless
+    })
+}
+
 fn ensure_isolated_provider_tab(
     config_path: &str,
     provider: Provider,
@@ -8452,7 +8709,7 @@ fn ensure_isolated_provider_tab(
     call_mcp_tool_raw(
         config_path,
         "new_page",
-        serde_json::json!({"url": provider.home_url()}),
+        isolated_new_page_args(&provider.home_url(), headless),
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -9787,6 +10044,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error writing output file: {}", e);
         } else if command_verbose {
             println!("Successfully wrote Markdown response to {}", output_path);
+        }
+    }
+
+    // WAVE-002: after a verified success, close the exact owned tab. This is a
+    // supporting, non-gating step: any failure is sanitised to a warning and
+    // never changes the success receipt, downloaded images, output files, or
+    // process exit success.
+    if let Some(path) = receipt_path.as_deref() {
+        if let Some(warning) = run_owned_tab_cleanup_warning(&config_path, Some(path)) {
+            eprintln!("{}", warning);
         }
     }
 
