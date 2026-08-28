@@ -87,7 +87,7 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
             aria-describedby="reasoning-announcement"
             tabindex="0"
           ></div>
-          <div id="reasoning-announcement">即時，第 1 項，共 3 項</div>
+          <div id="reasoning-announcement">第 1 項，共 3 項</div>
         </div>
       </div>
       <pre id="result"></pre>
@@ -95,7 +95,7 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
     <script>
       const menu = document.querySelector('#menu');
       const slider = document.querySelector('[data-model-reasoning-effort-slider]');
-      const labels = ['即時', '中', '高'];
+      const labels = ['', '中', '高'];
       document.querySelector('.__composer-pill').addEventListener('click', () => {
         menu.hidden = false;
       });
@@ -107,7 +107,7 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
         if (delta !== 0) {
           slider.setAttribute('aria-valuenow', String(next));
           document.querySelector('#reasoning-announcement').textContent =
-            labels[next] + '，第 ' + (next + 1) + ' 項，共 3 項';
+            (labels[next] ? labels[next] + '，' : '') + '第 ' + (next + 1) + ' 項，共 3 項';
         }
       });
       const norm = (value) => (value || '').toLowerCase().replace(/[\\s.\\-_]/g, '');
@@ -117,22 +117,80 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
         )
           .filter((item) => item.getAttribute('aria-haspopup') !== 'menu')
           .some((item) => norm(item.innerText) === target);
+      const canonicalEffort = (value) => {
+        const normalized = norm(value);
+        if (['即時', 'instant', 'fast', 'light', 'low'].includes(normalized)) return 'instant';
+        if (['中', '中等', 'medium', 'standard', 'thinking'].includes(normalized)) return 'medium';
+        if (['高', '高推理', 'high', 'heavy', 'extended'].includes(normalized)) return 'high';
+        return null;
+      };
+      const readState = () => {
+        const announcement = document.querySelector('#reasoning-announcement').textContent || '';
+        const ordinal = announcement.match(/第\\s*(\\d+)\\s*項\\s*[，,]?\\s*共\\s*(\\d+)\\s*項/);
+        const semantic = announcement.replace(/第\\s*\\d+\\s*項\\s*[，,]?\\s*共\\s*\\d+\\s*項/, '')
+          .replace(/[，,]/g, '').trim();
+        const now = Number(slider.getAttribute('aria-valuenow'));
+        const current = ordinal ? Number(ordinal[1]) : null;
+        const total = ordinal ? Number(ordinal[2]) : null;
+        const actualEffort = semantic ? canonicalEffort(semantic) : null;
+        const expectedEffort = ['instant', 'medium', 'high'][now] || null;
+        return {
+          now,
+          current,
+          total,
+          semanticEffort: actualEffort,
+          semanticContradiction: Boolean(semantic) && actualEffort !== expectedEffort,
+          strictProfile: slider.hasAttribute('data-model-reasoning-effort-slider') &&
+            slider.getAttribute('role') === 'slider' &&
+            slider.getAttribute('aria-valuemin') === '0' &&
+            slider.getAttribute('aria-valuemax') === '2' &&
+            Number.isInteger(now) && current === now + 1 && total === 3,
+        };
+      };
       const selectSlider = (targetLabel) => {
         slider.focus();
-        while (Number(slider.getAttribute('aria-valuenow')) > 0) {
+        let state = readState();
+        if (!state.strictProfile || state.semanticContradiction) return false;
+        while (state.now > 0) {
+          const previous = state;
           slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+          state = readState();
+          if (!state.strictProfile || state.semanticContradiction ||
+              state.now !== previous.now - 1 || state.current !== previous.current - 1) {
+            return false;
+          }
         }
-        for (;;) {
-          const announcement = document.querySelector('#reasoning-announcement').textContent;
-          if (norm(announcement.split('，')[0]) === norm(targetLabel)) return true;
-          const now = Number(slider.getAttribute('aria-valuenow'));
-          if (now >= 2) return false;
+        const targetIndex = canonicalEffort(targetLabel) === 'instant' ? 0 :
+          canonicalEffort(targetLabel) === 'medium' ? 1 :
+          canonicalEffort(targetLabel) === 'high' ? 2 : null;
+        if (targetIndex === null) return false;
+        while (state.now < targetIndex) {
+          const previous = state;
           slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+          state = readState();
+          if (!state.strictProfile || state.semanticContradiction ||
+              state.now !== previous.now + 1 || state.current !== previous.current + 1) {
+            return false;
+          }
         }
+        const stable = readState();
+        if (!stable.strictProfile || stable.semanticContradiction ||
+            stable.now !== state.now || stable.current !== state.current ||
+            stable.total !== state.total) return false;
+        menu.hidden = true;
+        document.querySelector('.__composer-pill').click();
+        const reopened = readState();
+        return reopened.strictProfile && !reopened.semanticContradiction &&
+          reopened.now === targetIndex && reopened.current === targetIndex + 1;
       };
+      const selected = selectSlider('即時');
+      document.querySelector('#reasoning-announcement').textContent = '高，第 1 項，共 3 項';
+      const contradictoryLabelRejected = !selectSlider('即時');
       document.querySelector('#result').textContent = JSON.stringify({
         targetFoundByLegacySelector,
-        selectedLabel: selectSlider('即時') ? '即時' : null,
+        selectedLabel: selected ? '即時' : null,
+        selectionEvidence: selected ? 'bounded_ordinal_v1' : null,
+        contradictoryLabelRejected,
         promptStarted: false,
         sliderPresent: Boolean(document.querySelector('[data-model-reasoning-effort-slider][role="slider"]')),
       });
@@ -149,6 +207,8 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
   assert.deepEqual(result, {
     targetFoundByLegacySelector: false,
     selectedLabel: '即時',
+    selectionEvidence: 'bounded_ordinal_v1',
+    contradictoryLabelRejected: true,
     promptStarted: false,
     sliderPresent: true,
   });

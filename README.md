@@ -240,12 +240,17 @@ session probe 驗證目前登入狀態，不會送出 prompt：
 ask-bridge session-probe --provider chatgpt --json
 ```
 
-若指定 `--model`，整合工具也應檢查 `verified_model_selection_v1`。ChatGPT
-會先驗證模型 radio 或舊式選單；遇到目前三段推理強度 slider 時，工具會從
-ARIA 宣告的最小值開始，以可信任的 ArrowLeft／ArrowRight 鍵逐段走訪並重新讀取
-公告文字。模型或推理強度未驗證時會在附件上傳與 prompt 前 fail-closed，schema-v2
-receipt 會以 `model_selection`、`model_selection_contract`、`failure_stage` 與
-`failure_code` 保存低敏感度狀態，不保存 prompt、DOM 文字或路徑。
+若指定 `--model`，整合工具也應檢查 `verified_model_selection_v2`（並保留
+`verified_model_selection_v1` 以辨識舊 consumer）。ChatGPT 會先驗證模型 radio
+或舊式選單；遇到目前三段推理強度 slider 時，只有具備
+`data-model-reasoning-effort-slider`、`role=slider`、`aria-valuemin=0`、
+`aria-valuemax=2`、整數 `aria-valuenow` 與可解析序位公告的 exact profile 才會
+啟用 ordinal evidence。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐段走訪，確認
+數值與序位同步、目標讀值穩定，並關閉後重新開啟確認持久化；可讀 label 與序位
+矛盾時會 fail-closed。模型或推理強度未驗證時會在附件上傳與 prompt 前停止，
+schema-v2 receipt 會以 `model_selection`、`model_selection_contract`、可選的
+`model_selection_evidence`、`failure_stage` 與 `failure_code` 保存低敏感度狀態，
+不保存 prompt、DOM 文字或路徑。
 
 ### 4. Headless 模式
 
@@ -374,7 +379,7 @@ ask-bridge --provider claude "證明這個數學問題。" --model Opus
 可用的模型名稱（視帳號權限與 provider UI 而定）：
 
 - **ChatGPT 模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
-- **ChatGPT 思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **ChatGPT 思考強度**：目前 exact 三段 profile 的 `即時`、`中等`、`高`
 - **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 - **Claude 模型**：`Sonnet`、`Opus`、`Haiku`（實際名稱依 claude.ai 選單與帳號方案而定）
 
