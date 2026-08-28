@@ -240,19 +240,21 @@ session probe 驗證目前登入狀態，不會送出 prompt：
 ask-bridge session-probe --provider chatgpt --json
 ```
 
-若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v3`；同時保留
-`verified_model_selection_v1` 與 `verified_model_selection_v2` 以辨識舊 consumer 與
-讀取既有 receipt。ChatGPT 會先驗證模型 radio 或舊式選單；遇到目前三段推理強度
-slider 時，v3 會解析唯一的 `data-model-reasoning-effort-slider` control bundle，
-其 state owner 與 focus owner 可是 marker 本身或唯一的 descendant。state 必須仍
-具備 `aria-valuemin=0`、`aria-valuemax=2`、整數目前值與可解析序位公告；實際 owner
-可使用 `role=slider`、native range，或在行為證據完整時缺少 role，但明確衝突的
-互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐段走訪，確認
-數值與序位同步、目標讀值穩定，並關閉後重新開啟確認持久化；新 control-bundle
-證據會記為 `resolved_bounded_ordinal_v2`。模型或推理強度未驗證時會在附件上傳與
-prompt 前停止，schema-v2 receipt 仍以 `model_selection`、`model_selection_contract`、
-可選的 `model_selection_evidence`、`failure_stage` 與 `failure_code` 保存低敏感度
-狀態，不保存 prompt、DOM 文字或路徑。
+若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v4`；同時保留
+`verified_model_selection_v1`、`verified_model_selection_v2` 與
+`verified_model_selection_v3` 以辨識舊 consumer 與讀取既有 receipt。ChatGPT 會先驗證
+模型 radio 或舊式選單；遇到三段推理強度 slider 時，v4 會由 Rust runtime 與 Node
+DOM tests 共用同一個純 `data-model-reasoning-effort-slider` control-bundle resolver。
+唯一 bundle 必須具備 `aria-valuemin=0`、`aria-valuemax=2`、整數目前值與唯一 focus/state
+owner；owner 可使用 `role=slider`、native range，或在行為證據完整時缺少 role，但明確
+衝突的互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐格走訪，
+在三個位置中直接辨識至少兩個不同的 `{instant, medium, high}` 語意，並以唯一剩餘值
+完成閉集合校準；ordinal announcement 只作一致性檢查，缺失不阻擋、矛盾則停止。工具
+會確認目標讀值穩定，並關閉後重新開啟確認持久化；新 control-bundle 證據會記為
+`closed_set_calibration_v1`，契約為 `reasoning_calibrated_control_v2`。模型或推理強度
+未驗證時會在附件上傳與 prompt 前停止，schema-v2 receipt 仍以
+`model_selection`、`model_selection_contract`、可選的 `model_selection_evidence`、
+`failure_stage` 與 `failure_code` 保存低敏感度狀態，不保存 prompt、DOM 文字或路徑。
 
 ### 4. Headless 模式
 

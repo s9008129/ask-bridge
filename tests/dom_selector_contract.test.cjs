@@ -66,10 +66,17 @@ test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome },
 
 test('ChatGPT reasoning slider is selectable before prompt submission', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const resolverSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_control_bundle_resolver.js'),
+    'utf8',
+  );
   assert.match(source, /data-model-reasoning-effort-slider/);
   assert.match(source, /press_provider_key\(&config_path, "ArrowLeft"\)/);
   assert.match(source, /press_provider_key\(&config_path, "ArrowRight"\)/);
+  assert.match(source, /include_str!\("chatgpt_control_bundle_resolver\.js"\)/);
   assert.match(source, /model radio selection was not verified/);
+  assert.match(resolverSource, /semantic_effort/);
+  assert.match(resolverSource, /ordinal_conflict/);
 
   const fixture = `<!doctype html>
     <main>
@@ -86,12 +93,14 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
             aria-describedby="reasoning-announcement"
             tabindex="0"
           ></div>
-          <div id="reasoning-announcement">第 1 項，共 3 項</div>
+          <div id="reasoning-announcement"></div>
         </div>
       </div>
+      <div id="global-live" role="status">高</div>
       <pre id="result"></pre>
     </main>
     <script>
+      const resolveReasoningControlBundle = ${resolverSource};
       const menu = document.querySelector('#menu');
       const slider = document.querySelector('[data-model-reasoning-effort-slider]');
       const labels = ['', '中', '高'];
@@ -105,96 +114,76 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
         const next = Math.max(0, Math.min(2, now + delta));
         if (delta !== 0) {
           slider.setAttribute('aria-valuenow', String(next));
-          document.querySelector('#reasoning-announcement').textContent =
-            (labels[next] ? labels[next] + '，' : '') + '第 ' + (next + 1) + ' 項，共 3 項';
+          document.querySelector('#reasoning-announcement').textContent = labels[next];
         }
       });
-      const norm = (value) => (value || '').toLowerCase().replace(/[\\s.\\-_]/g, '');
-      const target = norm('即時');
-      const targetFoundByLegacySelector = Array.from(
-          document.querySelectorAll('[role="menuitem"], [role="menuitemradio"]'),
-        )
-          .filter((item) => item.getAttribute('aria-haspopup') !== 'menu')
-          .some((item) => norm(item.innerText) === target);
-      const canonicalEffort = (value) => {
-        const normalized = norm(value);
-        if (['即時', 'instant', 'fast', 'light', 'low'].includes(normalized)) return 'instant';
-        if (['中', '中等', 'medium', 'standard', 'thinking'].includes(normalized)) return 'medium';
-        if (['高', '高推理', 'high', 'heavy', 'extended'].includes(normalized)) return 'high';
-        return null;
+      const readState = () => resolveReasoningControlBundle('即時');
+      const press = (key) => {
+        slider.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
       };
-      const readState = () => {
-        const announcement = document.querySelector('#reasoning-announcement').textContent || '';
-        const ordinal = announcement.match(/第\\s*(\\d+)\\s*項\\s*[，,]?\\s*共\\s*(\\d+)\\s*項/);
-        const semantic = announcement.replace(/第\\s*\\d+\\s*項\\s*[，,]?\\s*共\\s*\\d+\\s*項/, '')
-          .replace(/[，,]/g, '').trim();
-        const now = Number(slider.getAttribute('aria-valuenow'));
-        const current = ordinal ? Number(ordinal[1]) : null;
-        const total = ordinal ? Number(ordinal[2]) : null;
-        const actualEffort = semantic ? canonicalEffort(semantic) : null;
-        const expectedEffort = ['instant', 'medium', 'high'][now] || null;
-        const explicitRole = slider.getAttribute('role');
-        const roleEvidence = explicitRole === 'slider' ? 'slider' :
-          slider.matches('input[type="range"]') ? 'native_range' :
-          explicitRole === null ? 'missing' : 'conflict';
-        return {
-          now,
-          current,
-          total,
-          semanticEffort: actualEffort,
-          semanticContradiction: Boolean(semantic) && actualEffort !== expectedEffort,
-          roleEvidence,
-          strictProfile: slider.hasAttribute('data-model-reasoning-effort-slider') &&
-            slider.getAttribute('aria-valuemin') === '0' &&
-            slider.getAttribute('aria-valuemax') === '2' &&
-            Number.isInteger(now) && current === now + 1 && total === 3 &&
-            roleEvidence !== 'conflict',
-        };
-      };
-      const selectSlider = (targetLabel) => {
+      const efforts = ['instant', 'medium', 'high'];
+      const calibrate = (initialAnnouncement) => {
+        slider.setAttribute('aria-valuenow', '0');
+        document.querySelector('#reasoning-announcement').textContent = initialAnnouncement;
         slider.focus();
+        const observations = [readState()];
+        while (observations.at(-1).now < 2) {
+          const previous = observations.at(-1);
+          press('ArrowRight');
+          const next = readState();
+          if (next.now !== previous.now + 1) return { accepted: false, observations };
+          observations.push(next);
+        }
+        const direct = observations.filter((state) => state.semantic_effort !== null);
+        const semanticValues = new Set(direct.map((state) => state.semantic_effort));
+        const missingEfforts = efforts.filter((effort) => !semanticValues.has(effort));
+        const missingPositions = observations
+          .filter((state) => state.semantic_effort === null)
+          .map((state) => state.now);
+        const accepted = direct.length >= 2 && semanticValues.size === direct.length &&
+          missingEfforts.length === 1 && missingPositions.length === 1;
+        return { accepted, observations, missingEfforts, missingPositions };
+      };
+      const calibration = calibrate('');
+      let targetIndex = null;
+      let selected = false;
+      let stable = null;
+      let reopened = null;
+      if (calibration.accepted) {
+        const mapping = new Map(
+          calibration.observations
+            .filter((state) => state.semantic_effort !== null)
+            .map((state) => [state.semantic_effort, state.now]),
+        );
+        mapping.set(calibration.missingEfforts[0], calibration.missingPositions[0]);
+        targetIndex = mapping.get('instant');
         let state = readState();
-        if (!state.strictProfile || state.semanticContradiction) return false;
-        while (state.now > 0) {
+        while (state.now > targetIndex) {
           const previous = state;
-          slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+          press('ArrowLeft');
           state = readState();
-          if (!state.strictProfile || state.semanticContradiction ||
-              state.now !== previous.now - 1 || state.current !== previous.current - 1) {
-            return false;
-          }
+          if (state.now !== previous.now - 1) break;
         }
-        const targetIndex = canonicalEffort(targetLabel) === 'instant' ? 0 :
-          canonicalEffort(targetLabel) === 'medium' ? 1 :
-          canonicalEffort(targetLabel) === 'high' ? 2 : null;
-        if (targetIndex === null) return false;
-        while (state.now < targetIndex) {
-          const previous = state;
-          slider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
-          state = readState();
-          if (!state.strictProfile || state.semanticContradiction ||
-              state.now !== previous.now + 1 || state.current !== previous.current + 1) {
-            return false;
-          }
-        }
-        const stable = readState();
-        if (!stable.strictProfile || stable.semanticContradiction ||
-            stable.now !== state.now || stable.current !== state.current ||
-            stable.total !== state.total) return false;
+        stable = readState();
         menu.hidden = true;
         document.querySelector('.__composer-pill').click();
-        const reopened = readState();
-        return reopened.strictProfile && !reopened.semanticContradiction &&
-          reopened.now === targetIndex && reopened.current === targetIndex + 1;
-      };
-      const selected = selectSlider('即時');
-      document.querySelector('#reasoning-announcement').textContent = '高，第 1 項，共 3 項';
-      const contradictoryLabelRejected = !selectSlider('即時');
+        reopened = readState();
+        selected = stable.now === targetIndex && reopened.now === targetIndex &&
+          stable.ordinal_conflict === false && reopened.ordinal_conflict === false;
+      }
+      const contradictoryCalibration = calibrate('高，第 1 項，共 3 項');
+      slider.setAttribute('aria-valuenow', '0');
+      document.querySelector('#reasoning-announcement').textContent = '第 2 項，共 3 項';
+      const ordinalConflictState = readState();
+      const initialState = calibration.observations[0];
       document.querySelector('#result').textContent = JSON.stringify({
-        targetFoundByLegacySelector,
         selectedLabel: selected ? '即時' : null,
-        selectionEvidence: selected ? 'resolved_bounded_ordinal_v2' : null,
-        contradictoryLabelRejected,
+        selectionEvidence: selected ? 'closed_set_calibration_v1' : null,
+        roleEvidence: initialState.role_evidence,
+        semanticMissingAtTarget: initialState.semantic_effort === null,
+        globalLiveIgnored: initialState.announcement_present === false,
+        contradictoryLabelRejected: contradictoryCalibration.accepted === false,
+        ordinalConflictRejected: ordinalConflictState.ordinal_conflict === true,
         promptStarted: false,
         sliderPresent: Boolean(document.querySelector('[data-model-reasoning-effort-slider]')),
       });
@@ -209,10 +198,13 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
   assert.ok(encoded, 'headless reasoning-slider fixture did not return a result');
   const result = JSON.parse(encoded);
   assert.deepEqual(result, {
-    targetFoundByLegacySelector: false,
     selectedLabel: '即時',
-    selectionEvidence: 'resolved_bounded_ordinal_v2',
+    selectionEvidence: 'closed_set_calibration_v1',
+    roleEvidence: 'missing',
+    semanticMissingAtTarget: true,
+    globalLiveIgnored: true,
     contradictoryLabelRejected: true,
+    ordinalConflictRejected: true,
     promptStarted: false,
     sliderPresent: true,
   });
@@ -220,6 +212,10 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
 
 test('ChatGPT reasoning control bundle resolves a roleless marker with a nested native range', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const resolverSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_control_bundle_resolver.js'),
+    'utf8',
+  );
   assert.match(source, /state_owner_relation/);
   assert.match(source, /focus_owner_relation/);
   assert.match(source, /role_evidence/);
@@ -247,30 +243,10 @@ test('ChatGPT reasoning control bundle resolves a roleless marker with a nested 
       <pre id="result"></pre>
     </main>
     <script>
-      const marker = document.querySelector('[data-model-reasoning-effort-slider]');
-      const stateCandidates = Array.from(marker.querySelectorAll(
-        '[aria-valuemin][aria-valuemax][aria-valuenow], input[type="range"]',
-      ));
-      const stateOwner = stateCandidates.length === 1 ? stateCandidates[0] : null;
-      const focusOwner = stateOwner;
-      const announcement = document.querySelector('#reasoning-announcement').textContent || '';
-      const ordinal = announcement.match(/第\\s*(\\d+)\\s*項\\s*[，,]?\\s*共\\s*(\\d+)\\s*項/);
-      focusOwner.focus();
-      document.querySelector('#result').textContent = JSON.stringify({
-        markerCount: document.querySelectorAll('[data-model-reasoning-effort-slider]').length,
-        stateOwnerRelation: stateOwner && stateOwner.parentElement === marker ? 'descendant' : null,
-        focusOwnerRelation: focusOwner === stateOwner ? 'state_owner' : 'descendant',
-        roleEvidence: stateOwner?.matches('input[type="range"]') ? 'native_range' : 'missing',
-        min: Number(stateOwner?.getAttribute('aria-valuemin')),
-        max: Number(stateOwner?.getAttribute('aria-valuemax')),
-        now: Number(stateOwner?.getAttribute('aria-valuenow')),
-        current: ordinal ? Number(ordinal[1]) : null,
-        total: ordinal ? Number(ordinal[2]) : null,
-        focused: document.activeElement === focusOwner,
-        selectedLabel: '即時',
-        selectionEvidence: 'resolved_bounded_ordinal_v2',
-        promptStarted: false,
-      });
+      const resolveReasoningControlBundle = ${resolverSource};
+      document.querySelector('#result').textContent = JSON.stringify(
+        resolveReasoningControlBundle('即時'),
+      );
     </script>`;
   const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
   const rendered = execFileSync(
@@ -281,18 +257,25 @@ test('ChatGPT reasoning control bundle resolves a roleless marker with a nested 
   const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
   assert.ok(encoded, 'headless nested reasoning fixture did not return a result');
   assert.deepEqual(JSON.parse(encoded), {
-    markerCount: 1,
-    stateOwnerRelation: 'descendant',
-    focusOwnerRelation: 'state_owner',
-    roleEvidence: 'native_range',
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'native_range',
+    role_slider: false,
     min: 0,
     max: 2,
     now: 0,
-    current: 1,
-    total: 3,
+    matched: false,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 1,
+    ordinal_total: 3,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: null,
+    semantic_conflict: false,
     focused: true,
-    selectedLabel: '即時',
-    selectionEvidence: 'resolved_bounded_ordinal_v2',
-    promptStarted: false,
   });
 });

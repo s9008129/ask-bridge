@@ -24,6 +24,7 @@ const VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY: &str = "verified_image_resp
 const VERIFIED_MODEL_SELECTION_CAPABILITY: &str = "verified_model_selection_v1";
 const VERIFIED_MODEL_SELECTION_V2_CAPABILITY: &str = "verified_model_selection_v2";
 const VERIFIED_MODEL_SELECTION_V3_CAPABILITY: &str = "verified_model_selection_v3";
+const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v4";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
@@ -675,6 +676,7 @@ enum ModelSelection {
 enum ModelSelectionContract {
     LegacyMenuV1,
     ReasoningSliderV1,
+    ReasoningCalibratedControlV2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -685,14 +687,6 @@ enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    fn target_index(self) -> i64 {
-        match self {
-            Self::Instant => 0,
-            Self::Medium => 1,
-            Self::High => 2,
-        }
-    }
-
     fn from_label(value: &str) -> Option<Self> {
         let normalized = normalize_model_selection_label(value);
         match normalized.as_str() {
@@ -701,15 +695,6 @@ impl ReasoningEffort {
                 Some(Self::Medium)
             }
             "高" | "高推理" | "high" | "heavy" | "extended" => Some(Self::High),
-            _ => None,
-        }
-    }
-
-    fn from_ordinal_index(index: i64) -> Option<Self> {
-        match index {
-            0 => Some(Self::Instant),
-            1 => Some(Self::Medium),
-            2 => Some(Self::High),
             _ => None,
         }
     }
@@ -739,6 +724,7 @@ enum ModelSelectionEvidence {
     AccessibleLabelV1,
     BoundedOrdinalV1,
     ResolvedBoundedOrdinalV2,
+    ClosedSetCalibrationV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1173,6 +1159,7 @@ impl SessionReceipt {
                 VERIFIED_MODEL_SELECTION_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V2_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V3_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V4_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
@@ -1593,7 +1580,8 @@ fn capabilities_value() -> Value {
             VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
             VERIFIED_MODEL_SELECTION_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V2_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V3_CAPABILITY
+            VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V4_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1707,6 +1695,33 @@ fn capabilities_value() -> Value {
                 "failure_stage",
                 "failure_code"
             ]
+        },
+        "verified_model_selection_v4": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1", "reasoning_calibrated_control_v2"],
+            "evidence": ["checked_state_v1", "accessible_label_v1", "bounded_ordinal_v1", "resolved_bounded_ordinal_v2", "closed_set_calibration_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "calibration": {
+                "closed_set": ["instant", "medium", "high"],
+                "minimum_direct_semantics": 2,
+                "third_value": "unique_remaining_value",
+                "ordinal_is_consistency_check": true
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "failure_stage",
+                "failure_code"
+            ]
         }
     })
 }
@@ -1729,6 +1744,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_MODEL_SELECTION_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V2_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V3_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V4_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -3598,6 +3614,28 @@ mod tests {
             capabilities["verified_model_selection_v3"]["control_bundle"]["role_evidence"],
             serde_json::json!(["slider", "native_range", "missing", "conflict"])
         );
+        assert_eq!(
+            capabilities["verified_model_selection_v4"]["evidence"],
+            serde_json::json!([
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2",
+                "closed_set_calibration_v1"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v4"]["selection_contracts"],
+            serde_json::json!([
+                "legacy_menu_v1",
+                "reasoning_slider_v1",
+                "reasoning_calibrated_control_v2"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v4"]["calibration"]["minimum_direct_semantics"],
+            serde_json::json!(2)
+        );
         assert!(
             capabilities["version"]
                 .as_str()
@@ -4327,8 +4365,8 @@ mod tests {
         record_model_selection_verified(
             &verified_path,
             ModelSelectionOutcome {
-                contract: ModelSelectionContract::ReasoningSliderV1,
-                evidence: ModelSelectionEvidence::BoundedOrdinalV1,
+                contract: ModelSelectionContract::ReasoningCalibratedControlV2,
+                evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
             },
         )
         .unwrap();
@@ -4336,11 +4374,11 @@ mod tests {
         assert_eq!(verified.model_selection, ModelSelection::Verified);
         assert_eq!(
             verified.model_selection_contract,
-            Some(ModelSelectionContract::ReasoningSliderV1)
+            Some(ModelSelectionContract::ReasoningCalibratedControlV2)
         );
         assert_eq!(
             verified.model_selection_evidence,
-            Some(ModelSelectionEvidence::BoundedOrdinalV1)
+            Some(ModelSelectionEvidence::ClosedSetCalibrationV1)
         );
         assert_eq!(verified.failure_stage, None);
         assert_eq!(verified.failure_code, None);
@@ -4382,9 +4420,13 @@ mod tests {
         assert!(selection_script.contains("role_evidence"));
         assert!(selection_script.contains("state owner is ambiguous"));
         assert!(selection_script.contains("focus owner is ambiguous"));
+        assert!(selection_script.contains("aria-labelledby"));
+        assert!(selection_script.contains("ordinal_conflict"));
+        assert!(selection_script.contains("semantic_effort"));
         assert!(selection_script.contains("document.activeElement === focusOwner"));
         assert!(!selection_script.contains("outerHTML"));
         assert!(!selection_script.contains("__CONTROL_BUNDLE_RESOLVER__"));
+        assert!(source.contains("include_str!(\"chatgpt_control_bundle_resolver.js\")"));
         assert!(source.contains("previous.now - 1"));
         assert!(source.contains("previous.now + 1"));
         assert!(source.contains("reasoning slider reopen status"));
@@ -4394,6 +4436,7 @@ mod tests {
         assert!(state_script.contains("aria-valuenow"));
         assert!(state_script.contains("announcement_present"));
         assert!(state_script.contains("state_owner_relation"));
+        assert!(state_script.contains("semantic_effort"));
         assert!(!state_script.contains("__PROMPT__"));
 
         let reopen_script = build_chatgpt_reopen_slider_script();
@@ -4419,10 +4462,6 @@ mod tests {
             ReasoningEffort::from_label("HIGH"),
             Some(ReasoningEffort::High)
         );
-        assert_eq!(ReasoningEffort::Instant.target_index(), 0);
-        assert_eq!(ReasoningEffort::Medium.target_index(), 1);
-        assert_eq!(ReasoningEffort::High.target_index(), 2);
-        assert_eq!(ReasoningEffort::from_ordinal_index(3), None);
     }
 
     #[test]
@@ -4459,16 +4498,23 @@ mod tests {
         marked_without_ordinal["announcement_present"] = serde_json::json!(false);
         let marked_without_ordinal = parse_chatgpt_slider_state(&marked_without_ordinal).unwrap();
         assert!(marked_without_ordinal.requires_bounded_ordinal());
-        assert!(marked_without_ordinal.validate_bounded_ordinal().is_err());
-
-        let mut contradictory = valid.clone();
-        contradictory["semantic_effort"] = serde_json::json!("high");
+        marked_without_ordinal.validate_bounded_ordinal().unwrap();
+        let mut incomplete_calibration = ChatGptSemanticCalibration::default();
+        incomplete_calibration
+            .observe(marked_without_ordinal)
+            .unwrap();
         assert!(
-            parse_chatgpt_slider_state(&contradictory)
-                .unwrap()
-                .validate_bounded_ordinal()
+            incomplete_calibration
+                .target_index(ReasoningEffort::Instant)
                 .is_err()
         );
+
+        let mut direct_semantic = valid.clone();
+        direct_semantic["semantic_effort"] = serde_json::json!("high");
+        parse_chatgpt_slider_state(&direct_semantic)
+            .unwrap()
+            .validate_bounded_ordinal()
+            .unwrap();
 
         let mut semantic_conflict = valid.clone();
         semantic_conflict["semantic_conflict"] = serde_json::json!(true);
@@ -4526,30 +4572,18 @@ mod tests {
         });
         let roleless_state = parse_chatgpt_slider_state(&roleless).unwrap();
         roleless_state.validate_bounded_ordinal().unwrap();
-        assert_eq!(
-            roleless_state.model_selection_evidence(),
-            ModelSelectionEvidence::ResolvedBoundedOrdinalV2
-        );
 
         let mut split_owner = roleless.clone();
         split_owner["state_owner_relation"] = serde_json::json!("descendant");
         split_owner["role_evidence"] = serde_json::json!("native_range");
         let split_state = parse_chatgpt_slider_state(&split_owner).unwrap();
         split_state.validate_bounded_ordinal().unwrap();
-        assert_eq!(
-            split_state.model_selection_evidence(),
-            ModelSelectionEvidence::ResolvedBoundedOrdinalV2
-        );
         assert!(!roleless_state.same_observable_state(split_state));
 
         let mut exact_role = roleless.clone();
         exact_role["role_evidence"] = serde_json::json!("slider");
         let exact_state = parse_chatgpt_slider_state(&exact_role).unwrap();
         exact_state.validate_bounded_ordinal().unwrap();
-        assert_eq!(
-            exact_state.model_selection_evidence(),
-            ModelSelectionEvidence::BoundedOrdinalV1
-        );
 
         let mut conflicting_role = roleless.clone();
         conflicting_role["role_evidence"] = serde_json::json!("conflict");
@@ -4572,6 +4606,65 @@ mod tests {
         let mut invalid_relation = roleless;
         invalid_relation["state_owner_relation"] = serde_json::json!("ancestor");
         assert!(parse_chatgpt_slider_state(&invalid_relation).is_err());
+    }
+
+    #[test]
+    fn closed_set_calibration_resolves_missing_target_and_rejects_incomplete_or_duplicate_evidence()
+    {
+        let base = serde_json::json!({
+            "found": true,
+            "marker_present": true,
+            "marker_count": 1,
+            "role_evidence": "missing",
+            "state_owner_relation": "marker",
+            "focus_owner_relation": "state_owner",
+            "min": 0,
+            "max": 2,
+            "now": 0,
+            "matched": false,
+            "announcement_present": false,
+            "ordinal_present": false,
+            "ordinal_current": null,
+            "ordinal_total": null,
+            "ordinal_consistent": false,
+            "ordinal_conflict": false,
+            "semantic_effort": null,
+            "semantic_conflict": false,
+            "focused": true
+        });
+        let state_for = |now: i64, effort: Option<&str>| {
+            let mut value = base.clone();
+            value["now"] = serde_json::json!(now);
+            value["semantic_effort"] =
+                effort.map_or(serde_json::Value::Null, |value| serde_json::json!(value));
+            parse_chatgpt_slider_state(&value).unwrap()
+        };
+
+        let mut calibration = ChatGptSemanticCalibration::default();
+        calibration.observe(state_for(0, None)).unwrap();
+        calibration.observe(state_for(1, Some("medium"))).unwrap();
+        calibration.observe(state_for(2, Some("high"))).unwrap();
+        assert_eq!(calibration.target_index(ReasoningEffort::Instant), Ok(0));
+        assert_eq!(calibration.target_index(ReasoningEffort::Medium), Ok(1));
+        assert_eq!(calibration.target_index(ReasoningEffort::High), Ok(2));
+
+        let mut incomplete = ChatGptSemanticCalibration::default();
+        incomplete.observe(state_for(0, None)).unwrap();
+        incomplete.observe(state_for(1, Some("medium"))).unwrap();
+        incomplete.observe(state_for(2, None)).unwrap();
+        assert!(incomplete.target_index(ReasoningEffort::Instant).is_err());
+
+        let mut duplicate = ChatGptSemanticCalibration::default();
+        duplicate.observe(state_for(1, Some("medium"))).unwrap();
+        assert!(duplicate.observe(state_for(2, Some("medium"))).is_err());
+
+        let mut semantic_conflict = base.clone();
+        semantic_conflict["semantic_conflict"] = serde_json::json!(true);
+        assert!(
+            ChatGptSemanticCalibration::default()
+                .observe(parse_chatgpt_slider_state(&semantic_conflict).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -8312,6 +8405,7 @@ struct ChatGptSliderState {
     ordinal_current: Option<i64>,
     ordinal_total: Option<i64>,
     ordinal_consistent: bool,
+    ordinal_conflict: bool,
     semantic_effort: Option<ReasoningEffort>,
     semantic_conflict: bool,
 }
@@ -8323,21 +8417,6 @@ impl ChatGptSliderState {
 
     fn requires_bounded_ordinal(&self) -> bool {
         self.marker_present || self.has_ordinal_evidence()
-    }
-
-    fn model_selection_evidence(&self) -> ModelSelectionEvidence {
-        let exact_same_owner = self.marker_present
-            && self.state_owner_relation == Some(ChatGptStateOwnerRelation::Marker)
-            && self.focus_owner_relation == Some(ChatGptFocusOwnerRelation::StateOwner)
-            && matches!(
-                self.role_evidence,
-                ChatGptRoleEvidence::Slider | ChatGptRoleEvidence::NativeRange
-            );
-        if exact_same_owner {
-            ModelSelectionEvidence::BoundedOrdinalV1
-        } else {
-            ModelSelectionEvidence::ResolvedBoundedOrdinalV2
-        }
     }
 
     fn validate_bounded_ordinal(&self) -> Result<(), String> {
@@ -8354,34 +8433,21 @@ impl ChatGptSliderState {
                 "Model switch failed: reasoning slider role conflicts with its control".to_string(),
             );
         }
-        if self.min != 0 || self.max != 2 {
+        if self.min != 0 || self.max != 2 || self.now < self.min || self.now > self.max {
             return Err(
-                "Model switch failed: reasoning slider must expose the exact 0..2 profile"
-                    .to_string(),
+                "Model switch failed: reasoning slider state profile is invalid".to_string(),
             );
         }
-        if !self.announcement_present
-            || !self.ordinal_present
-            || !self.ordinal_consistent
-            || self.ordinal_total != Some(3)
-            || self.ordinal_current != Some(self.now + 1)
+        if self.ordinal_present
+            && (self.ordinal_conflict
+                || !self.ordinal_consistent
+                || self.ordinal_total != Some(3)
+                || self.ordinal_current != Some(self.now + 1))
         {
-            return Err(
-                "Model switch failed: reasoning slider ordinal state is invalid".to_string(),
-            );
+            return Err("Model switch failed: reasoning slider ordinal conflict".to_string());
         }
         if self.semantic_conflict {
-            return Err(
-                "Model switch failed: reasoning slider semantic labels conflict".to_string(),
-            );
-        }
-        if let Some(effort) = self.semantic_effort
-            && Some(effort) != ReasoningEffort::from_ordinal_index(self.now)
-        {
-            return Err(
-                "Model switch failed: reasoning slider semantic label contradicts ordinal"
-                    .to_string(),
-            );
+            return Err("Model switch failed: reasoning slider semantic conflict".to_string());
         }
         Ok(())
     }
@@ -8403,251 +8469,100 @@ impl ChatGptSliderState {
             && self.ordinal_current == other.ordinal_current
             && self.ordinal_total == other.ordinal_total
             && self.ordinal_consistent == other.ordinal_consistent
+            && self.ordinal_conflict == other.ordinal_conflict
             && self.semantic_effort == other.semantic_effort
             && self.semantic_conflict == other.semantic_conflict
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatGptSemanticCalibration {
+    positions: [Option<ReasoningEffort>; 3],
+}
+
+impl Default for ChatGptSemanticCalibration {
+    fn default() -> Self {
+        Self {
+            positions: [None; 3],
+        }
+    }
+}
+
+impl ChatGptSemanticCalibration {
+    fn observe(&mut self, state: ChatGptSliderState) -> Result<(), String> {
+        state.validate_bounded_ordinal()?;
+        let position = usize::try_from(state.now).map_err(|_| {
+            "Model switch failed: reasoning slider state profile is invalid".to_string()
+        })?;
+        if self.positions.get(position).is_none() {
+            return Err(
+                "Model switch failed: reasoning slider state profile is invalid".to_string(),
+            );
+        }
+        if let Some(effort) = state.semantic_effort {
+            if let Some(existing) = self.positions[position]
+                && existing != effort
+            {
+                return Err(
+                    "Model switch failed: reasoning slider semantic calibration conflict"
+                        .to_string(),
+                );
+            }
+            if self
+                .positions
+                .iter()
+                .enumerate()
+                .any(|(index, value)| index != position && *value == Some(effort))
+            {
+                return Err(
+                    "Model switch failed: reasoning slider semantic calibration conflict"
+                        .to_string(),
+                );
+            }
+            self.positions[position] = Some(effort);
+        }
+        Ok(())
+    }
+
+    fn target_index(&mut self, target: ReasoningEffort) -> Result<i64, String> {
+        let direct_count = self
+            .positions
+            .iter()
+            .filter(|value| value.is_some())
+            .count();
+        if direct_count < 2 {
+            return Err(
+                "Model switch failed: reasoning slider semantic calibration incomplete".to_string(),
+            );
+        }
+        let missing_position = self.positions.iter().position(Option::is_none);
+        let missing_effort = [
+            ReasoningEffort::Instant,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ]
+        .into_iter()
+        .find(|effort| !self.positions.contains(&Some(*effort)));
+        if let (Some(position), Some(effort)) = (missing_position, missing_effort) {
+            self.positions[position] = Some(effort);
+        }
+        if self.positions.iter().any(Option::is_none) {
+            return Err(
+                "Model switch failed: reasoning slider semantic calibration incomplete".to_string(),
+            );
+        }
+        self.positions
+            .iter()
+            .position(|effort| *effort == Some(target))
+            .and_then(|position| i64::try_from(position).ok())
+            .ok_or_else(|| {
+                "Model switch failed: reasoning slider semantic calibration conflict".to_string()
+            })
+    }
+}
+
 fn chatgpt_reasoning_control_bundle_resolver_js() -> &'static str {
-    r##"((targetEffort) => {
-    const markerSelector = '[data-model-reasoning-effort-slider]';
-    const ordinalPattern = /第\s*(\d+)\s*(?:項|個)\s*(?:[，,、])?\s*(?:共|總共)\s*(\d+)\s*(?:項|個)|\bitem\s+(\d+)\s+of\s+(\d+)\b|\b(\d+)\s+of\s+(\d+)\b/i;
-    const reasoningPattern = /reasoning|推理強度|思考強度/i;
-    const interactiveRoles = new Set([
-        'button', 'checkbox', 'combobox', 'link', 'listbox', 'menuitem',
-        'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'scrollbar',
-        'searchbox', 'slider', 'spinbutton', 'switch', 'tab', 'textbox',
-        'treeitem'
-    ]);
-    const isVisible = (element) => {
-        if (!element) return false;
-        if (element.closest('[hidden], [aria-hidden="true"]')) return false;
-        const style = window.getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' &&
-            style.opacity !== '0' && rect.width > 0 && rect.height > 0;
-    };
-    const textFor = (element) => [
-        element?.getAttribute?.('aria-label'),
-        element?.getAttribute?.('title'),
-        element?.getAttribute?.('data-testid'),
-        element?.textContent
-    ].filter(Boolean).join(' ').trim();
-    const isReasoningContainer = (element) =>
-        reasoningPattern.test(textFor(element)) ||
-        element?.matches?.('[role="menuitem"], [role="menu"], [role="group"]');
-    const nearestReasoningContainer = (element) => {
-        let owner = element;
-        for (let depth = 0; owner && depth < 6; depth += 1, owner = owner.parentElement) {
-            if (isReasoningContainer(owner)) return owner;
-        }
-        return null;
-    };
-    const isActiveContext = (context) => Boolean(
-        context && (isVisible(context) || context.getAttribute('aria-expanded') === 'true' ||
-            context.getAttribute('data-state') === 'open')
-    );
-    const activeMarkers = Array.from(document.querySelectorAll(markerSelector)).filter((marker) =>
-        isActiveContext(nearestReasoningContainer(marker))
-    );
-    const markerCount = activeMarkers.length;
-    if (markerCount > 1) {
-        return {
-            found: true,
-            marker_count: markerCount,
-            bundle_error: 'reasoning slider marker is ambiguous'
-        };
-    }
-
-    let marker = activeMarkers[0] || null;
-    let stateRoot = marker;
-    if (!marker) {
-        const legacyCandidates = Array.from(document.querySelectorAll(
-            '[role="slider"][aria-valuemin][aria-valuemax], ' +
-            'input[type="range"], ' +
-            '[aria-valuemin][aria-valuemax][aria-valuenow]'
-        )).filter((candidate) => isActiveContext(nearestReasoningContainer(candidate)));
-        if (legacyCandidates.length !== 1) return { found: false, marker_count: 0 };
-        stateRoot = legacyCandidates[0];
-    }
-
-    const isNativeRange = (element) =>
-        element instanceof HTMLInputElement && element.type === 'range';
-    const rawStateValue = (element, key) => {
-        const ariaValue = element.getAttribute('aria-value' + key);
-        if (ariaValue !== null) return ariaValue;
-        if (isNativeRange(element)) {
-            if (key === 'min') return element.getAttribute('min');
-            if (key === 'max') return element.getAttribute('max');
-            return element.value;
-        }
-        return null;
-    };
-    const hasCompleteState = (element) => Boolean(element &&
-        rawStateValue(element, 'min') !== null && rawStateValue(element, 'max') !== null &&
-        rawStateValue(element, 'now') !== null);
-    const stateCandidates = marker
-        ? Array.from(marker.querySelectorAll(
-            '[aria-valuemin][aria-valuemax][aria-valuenow], input[type="range"]'
-        )).filter(hasCompleteState)
-        : [];
-    let stateOwner = null;
-    if (marker && hasCompleteState(marker)) {
-        if (stateCandidates.length > 0) {
-            return {
-                found: true,
-                marker_count: markerCount,
-                bundle_error: 'reasoning slider state owner is ambiguous'
-            };
-        }
-        stateOwner = marker;
-    } else if (marker && stateCandidates.length === 1) {
-        stateOwner = stateCandidates[0];
-    } else if (!marker && hasCompleteState(stateRoot)) {
-        stateOwner = stateRoot;
-    } else {
-        return {
-            found: true,
-            marker_count: markerCount,
-            bundle_error: 'reasoning slider state owner is invalid'
-        };
-    }
-
-    const isFocusable = (element) => Boolean(element &&
-        element.matches('input, button, select, textarea, a[href], [contenteditable="true"], [tabindex]') &&
-        !element.disabled && element.getAttribute('aria-disabled') !== 'true');
-    let focusOwner = isFocusable(stateOwner) ? stateOwner : null;
-    if (!focusOwner) {
-        const focusRoot = marker || stateOwner;
-        const focusCandidates = Array.from(focusRoot.querySelectorAll(
-            'input, button, select, textarea, a[href], [contenteditable="true"], [tabindex]'
-        )).filter(isFocusable);
-        if (focusCandidates.length !== 1) {
-            return {
-                found: true,
-                marker_count: markerCount,
-                bundle_error: 'reasoning slider focus owner is ambiguous'
-            };
-        }
-        focusOwner = focusCandidates[0];
-    }
-    focusOwner.focus();
-
-    const actualOwners = [stateOwner];
-    if (focusOwner !== stateOwner) actualOwners.push(focusOwner);
-    const explicitRole = (element) => (element.getAttribute('role') || '').trim().toLowerCase();
-    const implicitInteractiveRole = (element) => {
-        if (isNativeRange(element)) return null;
-        if (element.matches('button')) return 'button';
-        if (element.matches('a[href]')) return 'link';
-        if (element.matches('input, select, textarea')) return 'textbox';
-        return null;
-    };
-    const ownerRoles = actualOwners.map((owner) =>
-        explicitRole(owner) || implicitInteractiveRole(owner)
-    ).filter(Boolean);
-    const roleConflict = ownerRoles.some((role) => role !== 'slider' && interactiveRoles.has(role));
-    const roleEvidence = roleConflict ? 'conflict' :
-        actualOwners.some(isNativeRange) ? 'native_range' :
-        ownerRoles.includes('slider') ? 'slider' : 'missing';
-
-    const associatedNodes = new Set(actualOwners);
-    const attributeNodes = new Set(actualOwners);
-    if (marker) {
-        associatedNodes.add(marker);
-        attributeNodes.add(marker);
-    }
-    const describedNodes = new Set();
-    for (const owner of [marker, stateOwner, focusOwner].filter(Boolean)) {
-        for (const id of (owner.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean)) {
-            const described = document.getElementById(id);
-            if (described) {
-                associatedNodes.add(described);
-                describedNodes.add(described);
-            }
-        }
-    }
-    const reasoningContainer = nearestReasoningContainer(marker || stateOwner);
-    if (reasoningContainer) {
-        for (const live of reasoningContainer.querySelectorAll(
-            '[aria-live], [role="status"], [role="alert"]'
-        )) associatedNodes.add(live);
-    }
-    const textSources = [];
-    for (const node of associatedNodes) {
-        if (describedNodes.has(node) || node.matches?.('[aria-live], [role="status"], [role="alert"]')) {
-            if (node.textContent) textSources.push(node.textContent.trim());
-        } else if (attributeNodes.has(node)) {
-            for (const value of [node.getAttribute?.('aria-label'), node.getAttribute?.('aria-valuetext')]) {
-                if (value) textSources.push(value.trim());
-            }
-        }
-    }
-    const parseOrdinal = (value) => {
-        const match = String(value || '').match(ordinalPattern);
-        if (!match) return null;
-        const current = Number(match[1] || match[3] || match[5]);
-        const total = Number(match[2] || match[4] || match[6]);
-        return Number.isInteger(current) && Number.isInteger(total) ? { current, total } : null;
-    };
-    const ordinalSources = textSources.filter((value) => ordinalPattern.test(value));
-    const parsedOrdinals = ordinalSources.map(parseOrdinal).filter(Boolean);
-    const firstOrdinal = parsedOrdinals[0] || null;
-    const ordinalConsistent = parsedOrdinals.length > 0 && parsedOrdinals.every((ordinal) =>
-        ordinal.current === firstOrdinal.current && ordinal.total === firstOrdinal.total
-    );
-    const norm = (value) => (value || '').toLowerCase()
-        .replace(/[^\p{Letter}\p{Number}]+/gu, '');
-    const canonicalEffort = (value) => {
-        const normalized = norm(value)
-            .replace(/^(已選取|已選|selected|currentlyselected)/, '')
-            .replace(/(已選取|已選|selected|currentlyselected)$/, '');
-        const aliases = {
-            '中等': 'medium', '中等推理': 'medium', '中': 'medium',
-            '高推理': 'high', '高': 'high',
-            '即時推理': 'instant', '即時': 'instant',
-            'instant': 'instant', 'fast': 'instant', 'light': 'instant', 'low': 'instant',
-            'medium': 'medium', 'standard': 'medium', 'thinking': 'medium',
-            'high': 'high', 'heavy': 'high', 'extended': 'high'
-        };
-        return aliases[normalized] || null;
-    };
-    const semanticEfforts = new Set();
-    for (const value of textSources) {
-        const withoutOrdinal = String(value).replace(ordinalPattern, ' ');
-        for (const part of [withoutOrdinal, ...withoutOrdinal.split(/[\n，,|:：、]/)]) {
-            const effort = canonicalEffort(part);
-            if (effort) semanticEfforts.add(effort);
-        }
-    }
-    const semanticEffortValues = Array.from(semanticEfforts);
-    const numberValue = (value) => value === null || value === '' ? NaN : Number(value);
-    const min = numberValue(rawStateValue(stateOwner, 'min'));
-    const max = numberValue(rawStateValue(stateOwner, 'max'));
-    const now = numberValue(rawStateValue(stateOwner, 'now'));
-    const target = canonicalEffort(targetEffort);
-    return {
-        found: true,
-        marker_present: Boolean(marker),
-        marker_count: markerCount,
-        state_owner_relation: marker ? (stateOwner === marker ? 'marker' : 'descendant') : null,
-        focus_owner_relation: focusOwner === stateOwner ? 'state_owner' : 'descendant',
-        role_evidence: roleEvidence,
-        role_slider: roleEvidence === 'slider',
-        min,
-        max,
-        now,
-        matched: Boolean(target && semanticEffortValues.includes(target)),
-        announcement_present: ordinalSources.length > 0,
-        ordinal_present: ordinalSources.length > 0,
-        ordinal_current: firstOrdinal?.current ?? null,
-        ordinal_total: firstOrdinal?.total ?? null,
-        ordinal_consistent: ordinalConsistent,
-        semantic_effort: semanticEffortValues.length === 1 ? semanticEffortValues[0] : null,
-        semantic_conflict: semanticEffortValues.length > 1,
-        focused: document.activeElement === focusOwner
-    };
-})"##
+    include_str!("chatgpt_control_bundle_resolver.js")
 }
 
 fn build_chatgpt_model_selection_script(target_json: &str) -> String {
@@ -8980,6 +8895,10 @@ fn parse_chatgpt_slider_state(value: &Value) -> Result<ChatGptSliderState, Strin
             .get("ordinal_consistent")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        ordinal_conflict: value
+            .get("ordinal_conflict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         semantic_effort,
         semantic_conflict: value
             .get("semantic_conflict")
@@ -9102,86 +9021,114 @@ fn reopen_chatgpt_slider(config_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn select_chatgpt_bounded_ordinal(
+fn select_chatgpt_calibrated_control(
     config_path: &str,
     target_json: &str,
     target: ReasoningEffort,
     mut state: ChatGptSliderState,
 ) -> Result<ModelSelectionOutcome, String> {
-    state.validate_bounded_ordinal()?;
+    let mut calibration = ChatGptSemanticCalibration::default();
+    calibration.observe(state)?;
 
     while state.now > state.min {
         let previous = state;
-        press_provider_key(&config_path, "ArrowLeft")?;
+        press_provider_key(config_path, "ArrowLeft")?;
         thread::sleep(Duration::from_millis(500));
         let next = read_chatgpt_slider_state(config_path, target_json)?;
-        next.validate_bounded_ordinal()?;
-        if next.now != previous.now - 1
-            || next.ordinal_current != previous.ordinal_current.map(|current| current - 1)
-        {
+        if next.now != previous.now - 1 {
             return Err(
-                "Model switch failed: reasoning slider left movement was not exactly one ordinal"
+                "Model switch failed: reasoning slider left movement was not exactly one state"
                     .to_string(),
             );
         }
+        calibration.observe(next)?;
         state = next;
     }
     if state.now != 0 {
         return Err("Model switch failed: reasoning slider did not reach its minimum".to_string());
     }
 
-    while state.now < target.target_index() {
+    while state.now < state.max {
         let previous = state;
-        press_provider_key(&config_path, "ArrowRight")?;
+        press_provider_key(config_path, "ArrowRight")?;
         thread::sleep(Duration::from_millis(500));
         let next = read_chatgpt_slider_state(config_path, target_json)?;
-        next.validate_bounded_ordinal()?;
-        if next.now != previous.now + 1
-            || next.ordinal_current != previous.ordinal_current.map(|current| current + 1)
-        {
+        if next.now != previous.now + 1 {
             return Err(
-                "Model switch failed: reasoning slider right movement was not exactly one ordinal"
+                "Model switch failed: reasoning slider right movement was not exactly one state"
                     .to_string(),
             );
         }
+        calibration.observe(next)?;
+        state = next;
+    }
+
+    let target_index = calibration.target_index(target)?;
+    while state.now > target_index {
+        let previous = state;
+        press_provider_key(config_path, "ArrowLeft")?;
+        thread::sleep(Duration::from_millis(500));
+        let next = read_chatgpt_slider_state(config_path, target_json)?;
+        if next.now != previous.now - 1 {
+            return Err(
+                "Model switch failed: reasoning slider left movement was not exactly one state"
+                    .to_string(),
+            );
+        }
+        calibration.observe(next)?;
+        state = next;
+    }
+    while state.now < target_index {
+        let previous = state;
+        press_provider_key(config_path, "ArrowRight")?;
+        thread::sleep(Duration::from_millis(500));
+        let next = read_chatgpt_slider_state(config_path, target_json)?;
+        if next.now != previous.now + 1 {
+            return Err(
+                "Model switch failed: reasoning slider right movement was not exactly one state"
+                    .to_string(),
+            );
+        }
+        calibration.observe(next)?;
         state = next;
     }
 
     let stable = read_chatgpt_slider_state(config_path, target_json)?;
-    stable.validate_bounded_ordinal()?;
+    calibration.observe(stable)?;
     if !state.same_observable_state(stable) {
         return Err(
             "Model switch failed: reasoning slider target was not stable across reads".to_string(),
         );
     }
-    if stable.now != target.target_index() {
+    if stable.now != target_index {
         return Err(
-            "Model switch failed: reasoning slider target ordinal is incorrect".to_string(),
+            "Model switch failed: reasoning slider calibrated target state is incorrect"
+                .to_string(),
         );
     }
 
-    press_provider_key(&config_path, "Escape")?;
+    press_provider_key(config_path, "Escape")?;
     thread::sleep(Duration::from_millis(350));
     reopen_chatgpt_slider(config_path)?;
     let reopened = read_chatgpt_slider_state(config_path, target_json)?;
-    reopened.validate_bounded_ordinal()?;
-    if reopened.now != target.target_index() || !stable.same_observable_state(reopened) {
+    calibration.observe(reopened)?;
+    if reopened.now != target_index || !stable.same_observable_state(reopened) {
         return Err(
             "Model switch failed: reasoning slider target did not persist after reopen".to_string(),
         );
     }
     let reopened_stable = read_chatgpt_slider_state(config_path, target_json)?;
-    reopened_stable.validate_bounded_ordinal()?;
+    calibration.observe(reopened_stable)?;
     if !reopened.same_observable_state(reopened_stable) {
         return Err(
             "Model switch failed: reopened reasoning slider target was not stable".to_string(),
         );
     }
-    press_provider_key(&config_path, "Escape")?;
+    press_provider_key(config_path, "Escape")?;
 
     Ok(ModelSelectionOutcome {
-        contract: ModelSelectionContract::ReasoningSliderV1,
-        evidence: state.model_selection_evidence(),
+        contract: ModelSelectionContract::ReasoningCalibratedControlV2,
+        evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
     })
 }
 
@@ -9419,7 +9366,7 @@ fn switch_model(
                     "Model switch failed: reasoning target has no bounded ordinal mapping"
                         .to_string()
                 })?;
-                select_chatgpt_bounded_ordinal(&config_path, &target_json, target, state)?
+                select_chatgpt_calibrated_control(&config_path, &target_json, target, state)?
             } else {
                 select_chatgpt_accessible_label(&config_path, &target_json, state)?
             }
