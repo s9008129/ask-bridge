@@ -80,7 +80,6 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
           推理強度
           <div
             data-model-reasoning-effort-slider
-            role="slider"
             aria-valuemin="0"
             aria-valuemax="2"
             aria-valuenow="0"
@@ -134,17 +133,22 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
         const total = ordinal ? Number(ordinal[2]) : null;
         const actualEffort = semantic ? canonicalEffort(semantic) : null;
         const expectedEffort = ['instant', 'medium', 'high'][now] || null;
+        const explicitRole = slider.getAttribute('role');
+        const roleEvidence = explicitRole === 'slider' ? 'slider' :
+          slider.matches('input[type="range"]') ? 'native_range' :
+          explicitRole === null ? 'missing' : 'conflict';
         return {
           now,
           current,
           total,
           semanticEffort: actualEffort,
           semanticContradiction: Boolean(semantic) && actualEffort !== expectedEffort,
+          roleEvidence,
           strictProfile: slider.hasAttribute('data-model-reasoning-effort-slider') &&
-            slider.getAttribute('role') === 'slider' &&
             slider.getAttribute('aria-valuemin') === '0' &&
             slider.getAttribute('aria-valuemax') === '2' &&
-            Number.isInteger(now) && current === now + 1 && total === 3,
+            Number.isInteger(now) && current === now + 1 && total === 3 &&
+            roleEvidence !== 'conflict',
         };
       };
       const selectSlider = (targetLabel) => {
@@ -189,10 +193,10 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
       document.querySelector('#result').textContent = JSON.stringify({
         targetFoundByLegacySelector,
         selectedLabel: selected ? '即時' : null,
-        selectionEvidence: selected ? 'bounded_ordinal_v1' : null,
+        selectionEvidence: selected ? 'resolved_bounded_ordinal_v2' : null,
         contradictoryLabelRejected,
         promptStarted: false,
-        sliderPresent: Boolean(document.querySelector('[data-model-reasoning-effort-slider][role="slider"]')),
+        sliderPresent: Boolean(document.querySelector('[data-model-reasoning-effort-slider]')),
       });
     </script>`;
   const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
@@ -207,9 +211,88 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
   assert.deepEqual(result, {
     targetFoundByLegacySelector: false,
     selectedLabel: '即時',
-    selectionEvidence: 'bounded_ordinal_v1',
+    selectionEvidence: 'resolved_bounded_ordinal_v2',
     contradictoryLabelRejected: true,
     promptStarted: false,
     sliderPresent: true,
+  });
+});
+
+test('ChatGPT reasoning control bundle resolves a roleless marker with a nested native range', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  assert.match(source, /state_owner_relation/);
+  assert.match(source, /focus_owner_relation/);
+  assert.match(source, /role_evidence/);
+
+  const fixture = `<!doctype html>
+    <main>
+      <div role="group" aria-label="推理強度">
+        <div
+          data-model-reasoning-effort-slider
+          aria-describedby="reasoning-announcement"
+        >
+          <input
+            type="range"
+            min="0"
+            max="2"
+            value="0"
+            aria-valuemin="0"
+            aria-valuemax="2"
+            aria-valuenow="0"
+            tabindex="0"
+          >
+        </div>
+        <div id="reasoning-announcement" role="status">第 1 項，共 3 項</div>
+      </div>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const marker = document.querySelector('[data-model-reasoning-effort-slider]');
+      const stateCandidates = Array.from(marker.querySelectorAll(
+        '[aria-valuemin][aria-valuemax][aria-valuenow], input[type="range"]',
+      ));
+      const stateOwner = stateCandidates.length === 1 ? stateCandidates[0] : null;
+      const focusOwner = stateOwner;
+      const announcement = document.querySelector('#reasoning-announcement').textContent || '';
+      const ordinal = announcement.match(/第\\s*(\\d+)\\s*項\\s*[，,]?\\s*共\\s*(\\d+)\\s*項/);
+      focusOwner.focus();
+      document.querySelector('#result').textContent = JSON.stringify({
+        markerCount: document.querySelectorAll('[data-model-reasoning-effort-slider]').length,
+        stateOwnerRelation: stateOwner && stateOwner.parentElement === marker ? 'descendant' : null,
+        focusOwnerRelation: focusOwner === stateOwner ? 'state_owner' : 'descendant',
+        roleEvidence: stateOwner?.matches('input[type="range"]') ? 'native_range' : 'missing',
+        min: Number(stateOwner?.getAttribute('aria-valuemin')),
+        max: Number(stateOwner?.getAttribute('aria-valuemax')),
+        now: Number(stateOwner?.getAttribute('aria-valuenow')),
+        current: ordinal ? Number(ordinal[1]) : null,
+        total: ordinal ? Number(ordinal[2]) : null,
+        focused: document.activeElement === focusOwner,
+        selectedLabel: '即時',
+        selectionEvidence: 'resolved_bounded_ordinal_v2',
+        promptStarted: false,
+      });
+    </script>`;
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    ['--headless=new', '--disable-gpu', '--no-sandbox', '--dump-dom', url],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'headless nested reasoning fixture did not return a result');
+  assert.deepEqual(JSON.parse(encoded), {
+    markerCount: 1,
+    stateOwnerRelation: 'descendant',
+    focusOwnerRelation: 'state_owner',
+    roleEvidence: 'native_range',
+    min: 0,
+    max: 2,
+    now: 0,
+    current: 1,
+    total: 3,
+    focused: true,
+    selectedLabel: '即時',
+    selectionEvidence: 'resolved_bounded_ordinal_v2',
+    promptStarted: false,
   });
 });

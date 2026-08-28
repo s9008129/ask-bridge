@@ -240,17 +240,19 @@ session probe 驗證目前登入狀態，不會送出 prompt：
 ask-bridge session-probe --provider chatgpt --json
 ```
 
-若指定 `--model`，整合工具也應檢查 `verified_model_selection_v2`（並保留
-`verified_model_selection_v1` 以辨識舊 consumer）。ChatGPT 會先驗證模型 radio
-或舊式選單；遇到目前三段推理強度 slider 時，只有具備
-`data-model-reasoning-effort-slider`、`role=slider`、`aria-valuemin=0`、
-`aria-valuemax=2`、整數 `aria-valuenow` 與可解析序位公告的 exact profile 才會
-啟用 ordinal evidence。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐段走訪，確認
-數值與序位同步、目標讀值穩定，並關閉後重新開啟確認持久化；可讀 label 與序位
-矛盾時會 fail-closed。模型或推理強度未驗證時會在附件上傳與 prompt 前停止，
-schema-v2 receipt 會以 `model_selection`、`model_selection_contract`、可選的
-`model_selection_evidence`、`failure_stage` 與 `failure_code` 保存低敏感度狀態，
-不保存 prompt、DOM 文字或路徑。
+若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v3`；同時保留
+`verified_model_selection_v1` 與 `verified_model_selection_v2` 以辨識舊 consumer 與
+讀取既有 receipt。ChatGPT 會先驗證模型 radio 或舊式選單；遇到目前三段推理強度
+slider 時，v3 會解析唯一的 `data-model-reasoning-effort-slider` control bundle，
+其 state owner 與 focus owner 可是 marker 本身或唯一的 descendant。state 必須仍
+具備 `aria-valuemin=0`、`aria-valuemax=2`、整數目前值與可解析序位公告；實際 owner
+可使用 `role=slider`、native range，或在行為證據完整時缺少 role，但明確衝突的
+互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐段走訪，確認
+數值與序位同步、目標讀值穩定，並關閉後重新開啟確認持久化；新 control-bundle
+證據會記為 `resolved_bounded_ordinal_v2`。模型或推理強度未驗證時會在附件上傳與
+prompt 前停止，schema-v2 receipt 仍以 `model_selection`、`model_selection_contract`、
+可選的 `model_selection_evidence`、`failure_stage` 與 `failure_code` 保存低敏感度
+狀態，不保存 prompt、DOM 文字或路徑。
 
 ### 4. Headless 模式
 
