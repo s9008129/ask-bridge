@@ -21,9 +21,12 @@ const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
 const VERIFIED_FILE_UPLOAD_CAPABILITY: &str = "verified_file_upload_v1";
 const VERIFIED_MIXED_ATTACHMENT_CAPABILITY: &str = "verified_mixed_attachment_upload_v1";
 const VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY: &str = "verified_image_response_completion_v1";
+const VERIFIED_MODEL_SELECTION_CAPABILITY: &str = "verified_model_selection_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
+const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
+const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dynamic attachment verification timeout scaled by the number of files.
 /// ChatGPT renders file tiles progressively; with 4 files (e.g. repair
@@ -658,6 +661,22 @@ enum PromptSubmission {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+enum ModelSelection {
+    #[default]
+    NotRequested,
+    Verified,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ModelSelectionContract {
+    LegacyMenuV1,
+    ReasoningSliderV1,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 enum ExpectedOutputType {
     #[default]
     Text,
@@ -1038,6 +1057,12 @@ struct SessionReceipt {
     prompt_submission: PromptSubmission,
     failure_code: Option<String>,
     #[serde(default)]
+    model_selection: ModelSelection,
+    #[serde(default)]
+    model_selection_contract: Option<ModelSelectionContract>,
+    #[serde(default)]
+    failure_stage: Option<String>,
+    #[serde(default)]
     expected_output_type: ExpectedOutputType,
     #[serde(default)]
     response_completion: ResponseCompletion,
@@ -1077,6 +1102,9 @@ impl SessionReceipt {
             attachment_total_bytes,
             prompt_submission: PromptSubmission::NotStarted,
             failure_code: None,
+            model_selection: ModelSelection::NotRequested,
+            model_selection_contract: None,
+            failure_stage: None,
             expected_output_type,
             response_completion: ResponseCompletion::Pending,
             downloaded_image_count: 0,
@@ -1318,6 +1346,46 @@ fn write_session_receipt_preserving_attachment_probe(
     write_private_json(path, &updated)
 }
 
+fn record_model_selection_verified(
+    path: &Path,
+    contract: ModelSelectionContract,
+) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission != PromptSubmission::NotStarted {
+        return Err("prompt 已開始後不得回寫模型選擇 verified".to_string());
+    }
+    if receipt.model_selection == ModelSelection::Failed {
+        return Err("模型選擇已失敗後不得回寫 verified".to_string());
+    }
+    receipt.model_selection = ModelSelection::Verified;
+    receipt.model_selection_contract = Some(contract);
+    receipt.failure_stage = None;
+    receipt.failure_code = None;
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("模型選擇 verified receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn record_model_selection_failed(path: &Path) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission != PromptSubmission::NotStarted {
+        return Err("prompt 已開始後不得標記模型選擇安全失敗".to_string());
+    }
+    receipt.model_selection = ModelSelection::Failed;
+    receipt.model_selection_contract = None;
+    receipt.failure_stage = Some(MODEL_SELECTION_FAILURE_STAGE.to_string());
+    receipt.failure_code = Some(MODEL_SELECTION_FAILURE_CODE.to_string());
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("模型選擇 failed receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
 fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     match event {
@@ -1442,7 +1510,8 @@ fn capabilities_value() -> Value {
             BACKGROUND_ISOLATED_TAB_CAPABILITY,
             VERIFIED_FILE_UPLOAD_CAPABILITY,
             VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
-            VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY
+            VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1493,6 +1562,17 @@ fn capabilities_value() -> Value {
                 "downloaded_image_count",
                 "response_failure_code"
             ]
+        },
+        "verified_model_selection_v1": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "failure_stage",
+                "failure_code"
+            ]
         }
     })
 }
@@ -1512,6 +1592,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_FILE_UPLOAD_CAPABILITY);
         println!("  {}", VERIFIED_MIXED_ATTACHMENT_CAPABILITY);
         println!("  {}", VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -3308,6 +3389,7 @@ mod tests {
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_CAPABILITY));
         assert_eq!(
             capabilities["isolated_new_tab_v1"]["flag"].as_str(),
             Some("--new-tab-preserve-existing")
@@ -3344,6 +3426,14 @@ mod tests {
         assert_eq!(
             capabilities["verified_image_response_completion_v1"]["user_delta"].as_u64(),
             Some(1)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v1"]["pre_submit_fail_closed"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v1"]["selection_contracts"],
+            serde_json::json!(["legacy_menu_v1", "reasoning_slider_v1"])
         );
         assert!(
             capabilities["version"]
@@ -4054,7 +4144,90 @@ mod tests {
         assert_eq!(receipt.response_completion, ResponseCompletion::Pending);
         assert_eq!(receipt.downloaded_image_count, 0);
         assert_eq!(receipt.response_failure_code, None);
+        assert_eq!(receipt.model_selection, ModelSelection::NotRequested);
+        assert_eq!(receipt.model_selection_contract, None);
+        assert_eq!(receipt.failure_stage, None);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_selection_receipt_records_verified_and_failed_states() {
+        let verified_root = make_test_dir("model_selection_verified");
+        let verified_path = verified_root.join("receipt.json");
+        write_private_json(&verified_path, &SessionReceipt::new(0, 0)).unwrap();
+        record_model_selection_verified(&verified_path, ModelSelectionContract::ReasoningSliderV1)
+            .unwrap();
+        let verified = read_session_receipt(&verified_path).unwrap();
+        assert_eq!(verified.model_selection, ModelSelection::Verified);
+        assert_eq!(
+            verified.model_selection_contract,
+            Some(ModelSelectionContract::ReasoningSliderV1)
+        );
+        assert_eq!(verified.failure_stage, None);
+        assert_eq!(verified.failure_code, None);
+
+        let failed_root = make_test_dir("model_selection_failed");
+        let failed_path = failed_root.join("receipt.json");
+        write_private_json(&failed_path, &SessionReceipt::new(0, 0)).unwrap();
+        record_model_selection_failed(&failed_path).unwrap();
+        let failed = read_session_receipt(&failed_path).unwrap();
+        assert_eq!(failed.model_selection, ModelSelection::Failed);
+        assert_eq!(failed.model_selection_contract, None);
+        assert_eq!(
+            failed.failure_stage.as_deref(),
+            Some(MODEL_SELECTION_FAILURE_STAGE)
+        );
+        assert_eq!(
+            failed.failure_code.as_deref(),
+            Some(MODEL_SELECTION_FAILURE_CODE)
+        );
+        assert_eq!(failed.prompt_submission, PromptSubmission::NotStarted);
+
+        std::fs::remove_dir_all(verified_root).unwrap();
+        std::fs::remove_dir_all(failed_root).unwrap();
+    }
+
+    #[test]
+    fn chatgpt_model_selection_scripts_declare_both_contracts_without_dom_payloads() {
+        let target_json = serde_json::to_string("即時").unwrap();
+        let selection_script = build_chatgpt_model_selection_script(&target_json);
+        assert!(selection_script.contains("data-model-reasoning-effort-slider"));
+        assert!(selection_script.contains("aria-valuemin"));
+        assert!(selection_script.contains("model radio selection was not verified"));
+        assert!(selection_script.contains("legacy_menu_v1"));
+        assert!(selection_script.contains("slider_ready"));
+
+        let state_script = build_chatgpt_slider_state_script(&target_json);
+        assert!(state_script.contains("aria-describedby"));
+        assert!(state_script.contains("aria-valuenow"));
+        assert!(state_script.contains("announcement_present"));
+        assert!(!state_script.contains("__PROMPT__"));
+    }
+
+    #[test]
+    fn chatgpt_slider_state_parser_rejects_invalid_or_unverified_state() {
+        let invalid = serde_json::json!({
+            "found": true,
+            "min": 0,
+            "max": 2,
+            "now": 3,
+            "matched": true,
+            "announcement_present": true
+        });
+        assert!(parse_chatgpt_slider_state(&invalid).is_err());
+
+        let valid_unmatched = serde_json::json!({
+            "found": true,
+            "min": 0,
+            "max": 2,
+            "now": 1,
+            "matched": false,
+            "announcement_present": true,
+            "focused": true
+        });
+        let state = parse_chatgpt_slider_state(&valid_unmatched).unwrap();
+        assert_eq!(state.now, 1);
+        assert!(!state.matched);
     }
 
     #[test]
@@ -7694,6 +7867,427 @@ fn upload_attachments_to_provider(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChatGptSliderState {
+    min: i64,
+    max: i64,
+    now: i64,
+    matched: bool,
+    announcement_present: bool,
+    focused: bool,
+}
+
+fn build_chatgpt_model_selection_script(target_json: &str) -> String {
+    let template = r##"() => {
+    window.__switch_model_status = 'pending';
+    (async () => {
+        try {
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const norm = (value) => (value || '').toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '');
+            const aliases = {
+                '中等': '中',
+                '中等推理': '中',
+                '高推理': '高',
+                '即時推理': '即時',
+                'instant': '即時',
+                'fast': '即時',
+                'light': '即時',
+                'low': '即時',
+                'medium': '中',
+                'standard': '中',
+                'thinking': '中',
+                'high': '高',
+                'heavy': '高',
+                'extended': '高'
+            };
+            const canonical = (value) => {
+                const normalized = norm(value)
+                    .replace(/^(已選取|已選|selected|currentlyselected)/, '')
+                    .replace(/(已選取|已選|selected|currentlyselected)$/, '');
+                return aliases[normalized] || normalized;
+            };
+            const target = canonical(__TARGET_MODEL__);
+            if (!target) {
+                window.__switch_model_status = 'error: empty target';
+                return;
+            }
+            const isVisible = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+            };
+            const isVisibleOrOwned = (element) => isVisible(element) ||
+                isVisible(element.closest('[role="menuitemradio"], [role="radio"], label'));
+            const labelValues = (element) => [
+                element?.getAttribute('aria-label'),
+                element?.getAttribute('title'),
+                element?.innerText,
+                element?.textContent
+            ].filter(Boolean).map((value) => value.trim()).filter(Boolean);
+            const labelOf = (element) => labelValues(element).join(' ');
+            const matchesTarget = (element) => labelValues(element).some((value) =>
+                canonical(value) === target
+            );
+            const hasCheckedEvidence = (element) => {
+                if (!element) return false;
+                if (element.matches(':checked')) return true;
+                if (element.getAttribute('aria-checked') === 'true') return true;
+                if (element.getAttribute('aria-selected') === 'true') return true;
+                if (element.getAttribute('data-state') === 'checked') return true;
+                const nested = element.querySelector('input[type="radio"], [role="radio"]');
+                return Boolean(nested && (
+                    nested.matches(':checked') ||
+                    nested.getAttribute('aria-checked') === 'true' ||
+                    nested.getAttribute('data-state') === 'checked'
+                ));
+            };
+            const closeMenus = async () => {
+                document.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Escape', keyCode: 27, bubbles: true
+                }));
+                await sleep(350);
+            };
+            await closeMenus();
+            let pill = null;
+            for (let attempt = 0; attempt < 20; attempt++) {
+                pill = document.querySelector('button.__composer-pill');
+                if (pill && isVisible(pill)) break;
+                await sleep(250);
+            }
+            if (!pill || !isVisible(pill)) {
+                window.__switch_model_status = 'error: composer pill not found';
+                return;
+            }
+            // React's composer control may attach its menu opener to the
+            // pointer sequence.  These events only open the menu; all model
+            // and slider selections remain verified below.
+            pill.dispatchEvent(new PointerEvent('pointerdown', {
+                bubbles: true, pointerType: 'mouse', isPrimary: true
+            }));
+            pill.dispatchEvent(new PointerEvent('pointerup', {
+                bubbles: true, pointerType: 'mouse', isPrimary: true
+            }));
+            pill.click();
+            await sleep(800);
+
+            const radioCandidates = () => Array.from(document.querySelectorAll(
+                '[role="menuitemradio"], [role="radio"], input[type="radio"]'
+            ));
+            const matchingRadio = () => radioCandidates().find((item) =>
+                isVisibleOrOwned(item) && matchesTarget(item)
+            );
+            const radio = matchingRadio();
+            if (radio) {
+                radio.click();
+                await sleep(500);
+                const selected = radioCandidates().find((item) =>
+                    matchesTarget(item) && hasCheckedEvidence(item)
+                );
+                if (!selected) {
+                    window.__switch_model_status = 'error: model radio selection was not verified';
+                    return;
+                }
+                await closeMenus();
+                window.__switch_model_status = 'success:legacy_menu_v1';
+                return;
+            }
+
+            const hasReasoningContext = (item) => {
+                let owner = item;
+                const context = [];
+                for (let depth = 0; owner && depth < 4; depth++, owner = owner.parentElement) {
+                    context.push(
+                        owner.getAttribute?.('aria-label'),
+                        owner.getAttribute?.('aria-describedby'),
+                        owner.innerText,
+                        owner.textContent
+                    );
+                }
+                return /reasoning|推理強度|思考強度/i.test(context.filter(Boolean).join(' '));
+            };
+            const findReasoningSlider = () => Array.from(document.querySelectorAll(
+                '[data-model-reasoning-effort-slider], ' +
+                '[role="slider"][aria-valuemin][aria-valuemax], ' +
+                'input[type="range"][aria-valuemin][aria-valuemax], ' +
+                '[aria-valuemin][aria-valuemax][aria-valuenow]'
+            )).find((item) =>
+                item.hasAttribute('data-model-reasoning-effort-slider') || hasReasoningContext(item)
+            );
+            const focusTargetForSlider = (slider) => {
+                if (!slider) return null;
+                if (slider.matches('input, button, [role="slider"], [tabindex]')) return slider;
+                return slider.querySelector('input, button, [role="slider"], [tabindex]');
+            };
+            let slider = findReasoningSlider();
+            let reasoningTriggerCount = 0;
+            let reasoningOpenAttempts = 0;
+            if (!slider) {
+                const triggers = Array.from(document.querySelectorAll(
+                    '[aria-expanded], [role="menuitem"], button'
+                )).filter((item) =>
+                    isVisibleOrOwned(item) && item.getAttribute('role') !== 'slider' &&
+                    /reasoning|推理強度|思考強度/i.test(labelValues(item).join(' '))
+                );
+                reasoningTriggerCount = triggers.length;
+                for (const trigger of triggers) {
+                    if (trigger.getAttribute('aria-expanded') === 'true') continue;
+                    reasoningOpenAttempts += 1;
+                    trigger.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));
+                    trigger.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));
+                    trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    trigger.click();
+                    await sleep(700);
+                    slider = findReasoningSlider();
+                    if (slider) break;
+                }
+            }
+            if (slider) {
+                const min = Number(slider.getAttribute('aria-valuemin'));
+                const max = Number(slider.getAttribute('aria-valuemax'));
+                if (!Number.isInteger(min) || !Number.isInteger(max) || max < min || max - min > 20) {
+                    window.__switch_model_status = 'error: reasoning slider range is invalid';
+                    return;
+                }
+                const focusTarget = focusTargetForSlider(slider);
+                if (!focusTarget) {
+                    window.__switch_model_status = 'error: reasoning slider focus target not found';
+                    return;
+                }
+                focusTarget.focus();
+                if (document.activeElement !== focusTarget) {
+                    window.__switch_model_status = 'error: reasoning slider could not be focused';
+                    return;
+                }
+                window.__switch_model_status = 'slider_ready';
+                return;
+            }
+
+            const visited = new Set();
+            for (let depth = 0; depth < 6; depth++) {
+                const all = Array.from(document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"]'
+                ));
+                const leaves = all.filter((item) => item.getAttribute('aria-haspopup') !== 'menu');
+                const match = leaves.find((item) =>
+                    isVisibleOrOwned(item) && matchesTarget(item)
+                );
+                if (match) {
+                    match.click();
+                    await sleep(500);
+                    const verified = Array.from(document.querySelectorAll(
+                        '[role="menuitem"], [role="menuitemradio"], [role="option"]'
+                    )).some((item) => matchesTarget(item) && hasCheckedEvidence(item));
+                    if (!verified) {
+                        window.__switch_model_status = 'error: legacy menu selection was not verified';
+                        return;
+                    }
+                    await closeMenus();
+                    window.__switch_model_status = 'success:legacy_menu_v1';
+                    return;
+                }
+                const triggers = all.filter((item) => item.getAttribute('aria-haspopup') === 'menu');
+                const trigger = triggers.find((item) => {
+                    const key = canonical(labelOf(item));
+                    return key && !visited.has(key);
+                });
+                if (!trigger) break;
+                visited.add(canonical(labelOf(trigger)));
+                trigger.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));
+                trigger.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));
+                trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                trigger.click();
+                await sleep(750);
+            }
+            await closeMenus();
+            window.__switch_model_status = 'error: model not found in verified selectors' +
+                ' (radios=' + radioCandidates().length +
+                ', slider=' + (slider ? 1 : 0) +
+                ', reasoning_triggers=' + reasoningTriggerCount +
+                ', reasoning_attempts=' + reasoningOpenAttempts + ')';
+        } catch (error) {
+            window.__switch_model_status = 'error: ' + error.message;
+        }
+    })();
+    return true;
+}"##;
+    template.replace("__TARGET_MODEL__", target_json)
+}
+
+fn build_chatgpt_slider_state_script(target_json: &str) -> String {
+    let template = r##"() => {
+    const norm = (value) => (value || '').toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '');
+    const aliases = {
+        '中等': '中',
+        '中等推理': '中',
+        '高推理': '高',
+        '即時推理': '即時',
+        'instant': '即時',
+        'fast': '即時',
+        'light': '即時',
+        'low': '即時',
+        'medium': '中',
+        'standard': '中',
+        'thinking': '中',
+        'high': '高',
+        'heavy': '高',
+        'extended': '高'
+    };
+    const canonical = (value) => {
+        const normalized = norm(value)
+            .replace(/^(已選取|已選|selected|currentlyselected)/, '')
+            .replace(/(已選取|已選|selected|currentlyselected)$/, '');
+        return aliases[normalized] || normalized;
+    };
+    const target = canonical(__TARGET_MODEL__);
+    const hasReasoningContext = (item) => {
+        let owner = item;
+        const context = [];
+        for (let depth = 0; owner && depth < 4; depth++, owner = owner.parentElement) {
+            context.push(
+                owner.getAttribute?.('aria-label'),
+                owner.getAttribute?.('aria-describedby'),
+                owner.innerText,
+                owner.textContent
+            );
+        }
+        return /reasoning|推理強度|思考強度/i.test(context.filter(Boolean).join(' '));
+    };
+    const slider = Array.from(document.querySelectorAll(
+        '[data-model-reasoning-effort-slider], ' +
+        '[role="slider"][aria-valuemin][aria-valuemax], ' +
+        'input[type="range"][aria-valuemin][aria-valuemax], ' +
+        '[aria-valuemin][aria-valuemax][aria-valuenow]'
+    )).find((item) =>
+        item.hasAttribute('data-model-reasoning-effort-slider') || hasReasoningContext(item)
+    );
+    if (!slider) return { found: false };
+    const focusTarget = (slider.matches('input, button, [role="slider"], [tabindex]')
+        ? slider
+        : slider.querySelector('input, button, [role="slider"], [tabindex]'));
+    const described = (slider.getAttribute('aria-describedby') || '').split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent || '')
+        .filter(Boolean).join(' ');
+    const ordinalAnnouncement = /第\s*\d+\s*(?:項|個)\s*(?:[，,、])?\s*(?:共|總共)\s*\d+\s*(?:項|個)|\bitem\s+\d+\s+of\s+\d+\b|\b\d+\s+of\s+\d+\b/i;
+    const contextTexts = [
+        slider.getAttribute('aria-label') || '',
+        slider.getAttribute('aria-valuetext') || '',
+        ...Array.from(slider.parentElement?.querySelectorAll(
+            '[aria-live], [role="status"], [role="alert"]'
+        ) || []).map((item) => item.textContent || ''),
+        ...Array.from(document.querySelectorAll(
+            '[aria-live], [role="status"], [role="alert"]'
+        )).map((item) => item.textContent || '')
+    ];
+    let owner = slider.parentElement;
+    for (let depth = 0; owner && depth < 5; depth++, owner = owner.parentElement) {
+        contextTexts.push(owner.textContent || '');
+    }
+    const nearbyAnnouncement = contextTexts.filter((value) => ordinalAnnouncement.test(value));
+    const values = [
+        slider.getAttribute('aria-valuetext') || '',
+        described,
+        slider.getAttribute('aria-label') || '',
+        ...nearbyAnnouncement
+    ].filter(Boolean);
+    if (focusTarget) focusTarget.focus();
+    const splitAnnouncementParts = (value) => {
+        const parts = [value, ...value.split(/[\n，,|:：、]/)];
+        const ordinal = value.match(ordinalAnnouncement);
+        if (ordinal && ordinal.index !== undefined) {
+            parts.push(
+                value.slice(0, ordinal.index),
+                value.slice(ordinal.index + ordinal[0].length)
+            );
+        }
+        return parts;
+    };
+    const matchesValue = (value) => splitAnnouncementParts(value).some((part) => {
+        const candidate = canonical(part);
+        return candidate === target || candidate.startsWith(target);
+    });
+    const matched = values.some(matchesValue);
+    return {
+        found: true,
+        min: Number(slider.getAttribute('aria-valuemin')),
+        max: Number(slider.getAttribute('aria-valuemax')),
+        now: Number(slider.getAttribute('aria-valuenow')),
+        matched,
+        announcement_present: nearbyAnnouncement.length > 0 ||
+            ordinalAnnouncement.test(described) ||
+            ordinalAnnouncement.test(slider.getAttribute('aria-valuetext') || ''),
+        focused: Boolean(focusTarget && document.activeElement === focusTarget)
+    };
+}"##;
+    template.replace("__TARGET_MODEL__", target_json)
+}
+
+fn parse_chatgpt_slider_state(value: &Value) -> Result<ChatGptSliderState, String> {
+    if value.get("found").and_then(Value::as_bool) != Some(true) {
+        return Err("reasoning slider disappeared".to_string());
+    }
+    let min = value
+        .get("min")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "reasoning slider minimum is unavailable".to_string())?;
+    let max = value
+        .get("max")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "reasoning slider maximum is unavailable".to_string())?;
+    let now = value
+        .get("now")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "reasoning slider value is unavailable".to_string())?;
+    if min < 0 || max < min || max - min > 20 || now < min || now > max {
+        return Err("reasoning slider state is invalid".to_string());
+    }
+    if value.get("focused").and_then(Value::as_bool) != Some(true) {
+        return Err("reasoning slider could not be focused".to_string());
+    }
+    Ok(ChatGptSliderState {
+        min,
+        max,
+        now,
+        matched: value
+            .get("matched")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        announcement_present: value
+            .get("announcement_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        focused: true,
+    })
+}
+
+fn read_chatgpt_slider_state(
+    config_path: &str,
+    target_json: &str,
+) -> Result<ChatGptSliderState, String> {
+    let response = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": build_chatgpt_slider_state_script(target_json)
+        }),
+    )?;
+    let value = parse_script_result(&response)?;
+    parse_chatgpt_slider_state(&value)
+}
+
+fn press_provider_key(config_path: &str, key: &str) -> Result<(), String> {
+    call_mcp_tool(
+        config_path,
+        "press_key",
+        serde_json::json!({
+            "key": key,
+            "includeSnapshot": false
+        }),
+    )?;
+    Ok(())
+}
+
 /// Switch the selected provider to the specified model. The page must already be
 /// loaded and logged in. `model` is matched case- and punctuation-insensitively.
 fn switch_model(
@@ -7701,7 +8295,7 @@ fn switch_model(
     provider: Provider,
     model: &str,
     verbose: bool,
-) -> Result<(), String> {
+) -> Result<ModelSelectionContract, String> {
     if model.trim().is_empty() {
         return Err("Empty model name".to_string());
     }
@@ -7717,77 +8311,7 @@ fn switch_model(
     }
 
     let js = match provider {
-        Provider::ChatGpt => {
-            // The script opens the composer pill menu, walks visible leaves and submenu
-            // triggers, and clicks the first leaf whose normalized label matches.
-            "() => {\n".to_string()
-                + "    window.__switch_model_status = 'pending';\n"
-                + "    (async () => {\n"
-                + "    try {\n"
-                + "        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n"
-                + "        const norm = (s) => (s || '').toLowerCase().replace(/[\\s.\\-_]/g, '');\n"
-                + &format!("        const target = norm({});\n", target_json)
-                + "        const aliases = { '中等': '中', '中等推理': '中', '高推理': '高', '即時推理': '即時' };\n"
-                + "        const resolvedTarget = aliases[target] || target;\n"
-                + "        if (!target) { window.__switch_model_status = 'error: empty target'; return; }\n"
-                + "        const visited = new Set();\n"
-                + "        const closeMenus = async () => {\n"
-                + "            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
-                + "            await sleep(400);\n"
-                + "        };\n"
-                + "        await closeMenus();\n"
-                + "        let pill = null;\n"
-                + "        for (let i = 0; i < 20; i++) {\n"
-                + "            pill = document.querySelector('button.__composer-pill');\n"
-                + "            if (pill) break;\n"
-                + "            await sleep(250);\n"
-                + "        }\n"
-                + "        if (!pill) { window.__switch_model_status = 'error: composer pill not found'; return; }\n"
-                + "        pill.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));\n"
-                + "        pill.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));\n"
-                + "        pill.click();\n"
-                + "        await sleep(800);\n"
-                + "        let clicked = false;\n"
-                + "        let chosen = '';\n"
-                + "        for (let depth = 0; depth < 6 && !clicked; depth++) {\n"
-                + "            const all = Array.from(document.querySelectorAll('[role=\"menuitem\"], [role=\"menuitemradio\"]'));\n"
-                + "            const leaves = all.filter((it) => it.getAttribute('aria-haspopup') !== 'menu');\n"
-                + "            for (const it of leaves) {\n"
-                + "                const t = norm(it.innerText);\n"
-                + "                if (t && t === resolvedTarget) {\n"
-                + "                    it.click();\n"
-                + "                    clicked = true;\n"
-                + "                    chosen = it.innerText;\n"
-                + "                    break;\n"
-                + "                }\n"
-                + "            }\n"
-                + "            if (clicked) break;\n"
-                + "            const trigs = all.filter((it) => it.getAttribute('aria-haspopup') === 'menu');\n"
-                + "            const trig = trigs.find((it) => {\n"
-                + "                const k = norm(it.innerText) + '|' + (it.getAttribute('aria-label') || '');\n"
-                + "                return !visited.has(k);\n"
-                + "            });\n"
-                + "            if (!trig) break;\n"
-                + "            visited.add(norm(trig.innerText) + '|' + (trig.getAttribute('aria-label') || ''));\n"
-                + "            trig.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));\n"
-                + "            trig.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));\n"
-                + "            trig.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));\n"
-                + "            trig.click();\n"
-                + "            await sleep(750);\n"
-                + "        }\n"
-                + "        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
-                + "        if (!clicked) {\n"
-                + "            window.__switch_model_status = 'error: model not found in menu';\n"
-                + "            return;\n"
-                + "        }\n"
-                + "        window.__switch_model_status = 'success:' + chosen;\n"
-                + "    } catch (e) {\n"
-                + "        window.__switch_model_status = 'error: ' + e.message;\n"
-                + "    }\n"
-                + "    })();\n"
-                + "    return true;\n"
-                + "}"
-        }
+        Provider::ChatGpt => build_chatgpt_model_selection_script(&target_json),
         Provider::Gemini => {
             let template = r#"() => {
                 window.__switch_model_status = 'pending';
@@ -7937,6 +8461,68 @@ fn switch_model(
         return Err("Timed out waiting for model switch".to_string());
     }
 
+    let contract = if provider == Provider::ChatGpt {
+        if status == "slider_ready" {
+            let mut state = read_chatgpt_slider_state(&config_path, &target_json)?;
+            if !state.announcement_present {
+                return Err(
+                    "Model switch failed: reasoning slider announcement was not verified"
+                        .to_string(),
+                );
+            }
+
+            // Reset to the declared minimum using MCP's trusted key input.  A
+            // synthetic KeyboardEvent is deliberately not used for the
+            // selection itself because ChatGPT ignores untrusted key events.
+            let left_attempts = (state.max - state.min + 1) as usize;
+            for _ in 0..=left_attempts {
+                if state.now == state.min {
+                    break;
+                }
+                press_provider_key(&config_path, "ArrowLeft")?;
+                thread::sleep(Duration::from_millis(500));
+                state = read_chatgpt_slider_state(&config_path, &target_json)?;
+            }
+            if state.now != state.min {
+                return Err(
+                    "Model switch failed: reasoning slider did not reach its minimum".to_string(),
+                );
+            }
+
+            loop {
+                if state.matched {
+                    let verified = read_chatgpt_slider_state(&config_path, &target_json)?;
+                    if verified.now == state.now && verified.matched {
+                        press_provider_key(&config_path, "Escape")?;
+                        return Ok(ModelSelectionContract::ReasoningSliderV1);
+                    }
+                    state = verified;
+                }
+                if state.now >= state.max {
+                    break;
+                }
+                let previous = state.now;
+                press_provider_key(&config_path, "ArrowRight")?;
+                thread::sleep(Duration::from_millis(500));
+                state = read_chatgpt_slider_state(&config_path, &target_json)?;
+                if state.now <= previous {
+                    return Err("Model switch failed: reasoning slider did not advance".to_string());
+                }
+            }
+            return Err(
+                "Model switch failed: reasoning target was not found in slider announcement"
+                    .to_string(),
+            );
+        }
+        if status == "success:legacy_menu_v1" {
+            ModelSelectionContract::LegacyMenuV1
+        } else {
+            return Err("Model switch failed: selector contract was not verified".to_string());
+        }
+    } else {
+        ModelSelectionContract::LegacyMenuV1
+    };
+
     if verbose {
         println!("Model switched successfully ({})", status);
     }
@@ -7944,7 +8530,7 @@ fn switch_model(
     // Give the UI a moment to settle after switching models
     thread::sleep(Duration::from_millis(500));
 
-    Ok(())
+    Ok(contract)
 }
 
 fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
@@ -9763,11 +10349,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Switch model if requested (before uploading attachments / typing the prompt).
     // Each --model value is applied in order, so e.g. `--model "GPT-5.5" --model "中等"`
     // first selects the model, then the reasoning level.
+    let mut model_selection_contract = None;
     for m in &cli.model {
-        if let Err(e) = switch_model(&config_path, provider, m, command_verbose) {
-            eprintln!("Error switching model '{}': {}", m, e);
-            std::process::exit(1);
+        match switch_model(&config_path, provider, m, command_verbose) {
+            Ok(contract) if provider == Provider::ChatGpt => {
+                model_selection_contract = Some(contract);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if provider == Provider::ChatGpt {
+                    if let Some(path) = receipt_path.as_deref()
+                        && let Err(receipt_error) = record_model_selection_failed(path)
+                    {
+                        eprintln!(
+                            "Error switching model '{}': {} (receipt failed: {})",
+                            m, MODEL_SELECTION_FAILURE_CODE, receipt_error
+                        );
+                        std::process::exit(1);
+                    }
+                    eprintln!(
+                        "Error switching model '{}': {}: {}",
+                        m, MODEL_SELECTION_FAILURE_CODE, error
+                    );
+                } else {
+                    eprintln!("Error switching model '{}': {}", m, error);
+                }
+                std::process::exit(1);
+            }
         }
+    }
+    if let Some(contract) = model_selection_contract
+        && let Some(path) = receipt_path.as_deref()
+        && let Err(error) = record_model_selection_verified(path, contract)
+    {
+        eprintln!(
+            "Error recording {}: {}",
+            VERIFIED_MODEL_SELECTION_CAPABILITY, error
+        );
+        std::process::exit(1);
     }
 
     // --verify-attachments-only: upload and verify attachments, then exit

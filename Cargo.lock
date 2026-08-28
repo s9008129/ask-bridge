@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "ask-bridge"
-version = "0.2.8-preserve.1"
+version = "0.2.9-preserve.1"
 dependencies = [
  "base64",
  "clap",

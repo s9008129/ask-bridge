@@ -240,6 +240,13 @@ session probe 驗證目前登入狀態，不會送出 prompt：
 ask-bridge session-probe --provider chatgpt --json
 ```
 
+若指定 `--model`，整合工具也應檢查 `verified_model_selection_v1`。ChatGPT
+會先驗證模型 radio 或舊式選單；遇到目前三段推理強度 slider 時，工具會從
+ARIA 宣告的最小值開始，以可信任的 ArrowLeft／ArrowRight 鍵逐段走訪並重新讀取
+公告文字。模型或推理強度未驗證時會在附件上傳與 prompt 前 fail-closed，schema-v2
+receipt 會以 `model_selection`、`model_selection_contract`、`failure_stage` 與
+`failure_code` 保存低敏感度狀態，不保存 prompt、DOM 文字或路徑。
+
 ### 4. Headless 模式
 
 一般提問預設使用 headless Chrome，也就是 `--headless=true`。Chrome 會在背景執行，不會搶走焦點或跳出視窗。
