@@ -25,11 +25,22 @@ const VERIFIED_MODEL_SELECTION_CAPABILITY: &str = "verified_model_selection_v1";
 const VERIFIED_MODEL_SELECTION_V2_CAPABILITY: &str = "verified_model_selection_v2";
 const VERIFIED_MODEL_SELECTION_V3_CAPABILITY: &str = "verified_model_selection_v3";
 const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v4";
+const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v5";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
 const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
+
+/// v5 ordered-domain rank for `instant < medium < high` on an exact
+/// three-state profile. Direct semantic labels are supporting evidence only.
+fn reasoning_effort_rank(effort: ReasoningEffort) -> i64 {
+    match effort {
+        ReasoningEffort::Instant => 0,
+        ReasoningEffort::Medium => 1,
+        ReasoningEffort::High => 2,
+    }
+}
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dynamic attachment verification timeout scaled by the number of files.
 /// ChatGPT renders file tiles progressively; with 4 files (e.g. repair
@@ -677,6 +688,7 @@ enum ModelSelectionContract {
     LegacyMenuV1,
     ReasoningSliderV1,
     ReasoningCalibratedControlV2,
+    ReasoningOrderedControlV3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -725,12 +737,15 @@ enum ModelSelectionEvidence {
     BoundedOrdinalV1,
     ResolvedBoundedOrdinalV2,
     ClosedSetCalibrationV1,
+    OrderedBoundedEffortV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ModelSelectionOutcome {
     contract: ModelSelectionContract,
     evidence: ModelSelectionEvidence,
+    #[allow(dead_code)]
+    direct_semantic_count: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1120,6 +1135,10 @@ struct SessionReceipt {
     model_selection_contract: Option<ModelSelectionContract>,
     #[serde(default)]
     model_selection_evidence: Option<ModelSelectionEvidence>,
+    /// v5 only: number of positions with a directly observed semantic label
+    /// (0..=3). Null for non-v5 verified selections and for failed paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_selection_direct_semantic_count: Option<u8>,
     #[serde(default)]
     failure_stage: Option<String>,
     #[serde(default)]
@@ -1160,6 +1179,7 @@ impl SessionReceipt {
                 VERIFIED_MODEL_SELECTION_V2_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V3_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V4_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V5_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
@@ -1169,6 +1189,7 @@ impl SessionReceipt {
             model_selection: ModelSelection::NotRequested,
             model_selection_contract: None,
             model_selection_evidence: None,
+            model_selection_direct_semantic_count: None,
             failure_stage: None,
             expected_output_type,
             response_completion: ResponseCompletion::Pending,
@@ -1425,6 +1446,17 @@ fn record_model_selection_verified(
     receipt.model_selection = ModelSelection::Verified;
     receipt.model_selection_contract = Some(outcome.contract);
     receipt.model_selection_evidence = Some(outcome.evidence);
+    receipt.model_selection_direct_semantic_count = match outcome.contract {
+        ModelSelectionContract::ReasoningOrderedControlV3 => {
+            outcome.direct_semantic_count.filter(|count| *count <= 3)
+        }
+        _ => None,
+    };
+    if receipt.model_selection_contract == Some(ModelSelectionContract::ReasoningOrderedControlV3)
+        && receipt.model_selection_direct_semantic_count.is_none()
+    {
+        return Err("v5 verified receipt 缺少合法的 direct semantic count".to_string());
+    }
     receipt.failure_stage = None;
     receipt.failure_code = None;
     write_session_receipt_preserving_attachment_probe(path, &receipt)?;
@@ -1443,6 +1475,7 @@ fn record_model_selection_failed(path: &Path) -> Result<(), String> {
     receipt.model_selection = ModelSelection::Failed;
     receipt.model_selection_contract = None;
     receipt.model_selection_evidence = None;
+    receipt.model_selection_direct_semantic_count = None;
     receipt.failure_stage = Some(MODEL_SELECTION_FAILURE_STAGE.to_string());
     receipt.failure_code = Some(MODEL_SELECTION_FAILURE_CODE.to_string());
     write_session_receipt_preserving_attachment_probe(path, &receipt)?;
@@ -1581,7 +1614,8 @@ fn capabilities_value() -> Value {
             VERIFIED_MODEL_SELECTION_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V2_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V4_CAPABILITY
+            VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V5_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1719,6 +1753,38 @@ fn capabilities_value() -> Value {
                 "model_selection",
                 "model_selection_contract",
                 "model_selection_evidence",
+                "failure_stage",
+                "failure_code"
+            ]
+        },
+        "verified_model_selection_v5": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1", "reasoning_ordered_control_v3"],
+            "evidence": ["checked_state_v1", "accessible_label_v1", "bounded_ordinal_v1", "resolved_bounded_ordinal_v2", "ordered_bounded_effort_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "calibration": {
+                "domain": "typed_ordered_three_state",
+                "closed_set": ["instant", "medium", "high"],
+                "rank_mapping": {"instant": 0, "medium": 1, "high": 2},
+                "minimum_direct_semantics": 0,
+                "maximum_direct_semantics": 3,
+                "direct_semantics": "supporting_contradiction_veto_only",
+                "target_index_source": "typed_effort_rank",
+                "ordinal_is_consistency_check": true
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "model_selection_direct_semantic_count",
                 "failure_stage",
                 "failure_code"
             ]
@@ -3636,6 +3702,43 @@ mod tests {
             capabilities["verified_model_selection_v4"]["calibration"]["minimum_direct_semantics"],
             serde_json::json!(2)
         );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["evidence"],
+            serde_json::json!([
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2",
+                "ordered_bounded_effort_v1"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["selection_contracts"],
+            serde_json::json!([
+                "legacy_menu_v1",
+                "reasoning_slider_v1",
+                "reasoning_ordered_control_v3"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["calibration"]["rank_mapping"],
+            serde_json::json!({"instant": 0, "medium": 1, "high": 2})
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["calibration"]["minimum_direct_semantics"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["calibration"]["maximum_direct_semantics"],
+            serde_json::json!(3)
+        );
+        assert!(
+            capabilities["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "verified_model_selection_v5")
+        );
         assert!(
             capabilities["version"]
                 .as_str()
@@ -4247,7 +4350,14 @@ mod tests {
         );
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(!json.contains(canary));
-        for forbidden in ["prompt", "response_content", "url", "file_name", "dom"] {
+        for forbidden in [
+            "prompt",
+            "response_content",
+            "url",
+            "file_name",
+            "dom",
+            "semantic_label",
+        ] {
             assert!(!json.contains(&format!("\"{forbidden}\"")));
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -4367,6 +4477,7 @@ mod tests {
             ModelSelectionOutcome {
                 contract: ModelSelectionContract::ReasoningCalibratedControlV2,
                 evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
+                direct_semantic_count: None,
             },
         )
         .unwrap();
@@ -4503,11 +4614,6 @@ mod tests {
         incomplete_calibration
             .observe(marked_without_ordinal)
             .unwrap();
-        assert!(
-            incomplete_calibration
-                .target_index(ReasoningEffort::Instant)
-                .is_err()
-        );
 
         let mut direct_semantic = valid.clone();
         direct_semantic["semantic_effort"] = serde_json::json!("high");
@@ -4648,11 +4754,19 @@ mod tests {
         assert_eq!(calibration.target_index(ReasoningEffort::Medium), Ok(1));
         assert_eq!(calibration.target_index(ReasoningEffort::High), Ok(2));
 
-        let mut incomplete = ChatGptSemanticCalibration::default();
-        incomplete.observe(state_for(0, None)).unwrap();
-        incomplete.observe(state_for(1, Some("medium"))).unwrap();
-        incomplete.observe(state_for(2, None)).unwrap();
-        assert!(incomplete.target_index(ReasoningEffort::Instant).is_err());
+        // Revision 5: rank mapping is fixed by the typed ordered domain, so a
+        // zero/low direct-label calibration still resolves every target.
+        let mut sparse = ChatGptSemanticCalibration::default();
+        sparse.observe(state_for(0, None)).unwrap();
+        sparse.observe(state_for(1, None)).unwrap();
+        sparse.observe(state_for(2, None)).unwrap();
+        assert_eq!(sparse.target_index(ReasoningEffort::Instant), Ok(0));
+        assert_eq!(sparse.direct_semantic_count(), 0);
+
+        let mut single = ChatGptSemanticCalibration::default();
+        single.observe(state_for(1, Some("medium"))).unwrap();
+        assert_eq!(single.target_index(ReasoningEffort::Instant), Ok(0));
+        assert_eq!(single.direct_semantic_count(), 1);
 
         let mut duplicate = ChatGptSemanticCalibration::default();
         duplicate.observe(state_for(1, Some("medium"))).unwrap();
@@ -4665,6 +4779,78 @@ mod tests {
                 .observe(parse_chatgpt_slider_state(&semantic_conflict).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn v5_receipt_carries_direct_semantic_count_only_for_v5_verified_selections() {
+        let dir = make_test_dir("v5_receipt_count");
+        let path = dir.join("receipt.json");
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+
+        record_model_selection_verified(
+            &path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                direct_semantic_count: Some(1),
+            },
+        )
+        .unwrap();
+        let v5 = read_session_receipt(&path).unwrap();
+        assert_eq!(v5.model_selection_direct_semantic_count, Some(1));
+
+        // Legacy (v1/v4) verified selection must never carry a v5 count.
+        record_model_selection_verified(
+            &path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningCalibratedControlV2,
+                evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
+                direct_semantic_count: None,
+            },
+        )
+        .unwrap();
+        let v4 = read_session_receipt(&path).unwrap();
+        assert_eq!(v4.model_selection_direct_semantic_count, None);
+        assert_eq!(
+            v4.model_selection_contract,
+            Some(ModelSelectionContract::ReasoningCalibratedControlV2)
+        );
+
+        // Failed receipts clear contract/evidence/count entirely.
+        record_model_selection_failed(&path).unwrap();
+        let failed = read_session_receipt(&path).unwrap();
+        assert_eq!(failed.model_selection_direct_semantic_count, None);
+        assert_eq!(failed.model_selection_contract, None);
+        assert_eq!(failed.model_selection_evidence, None);
+
+        // A v5 verified outcome without a legal count is rejected.
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        assert!(
+            record_model_selection_verified(
+                &path,
+                ModelSelectionOutcome {
+                    contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                    evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                    direct_semantic_count: None,
+                },
+            )
+            .is_err()
+        );
+
+        // A v5 verified outcome above 3 is rejected (unknown profile).
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        assert!(
+            record_model_selection_verified(
+                &path,
+                ModelSelectionOutcome {
+                    contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                    evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                    direct_semantic_count: Some(4),
+                },
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -8525,39 +8711,21 @@ impl ChatGptSemanticCalibration {
     }
 
     fn target_index(&mut self, target: ReasoningEffort) -> Result<i64, String> {
-        let direct_count = self
-            .positions
-            .iter()
-            .filter(|value| value.is_some())
-            .count();
-        if direct_count < 2 {
-            return Err(
-                "Model switch failed: reasoning slider semantic calibration incomplete".to_string(),
-            );
-        }
-        let missing_position = self.positions.iter().position(Option::is_none);
-        let missing_effort = [
-            ReasoningEffort::Instant,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-        ]
-        .into_iter()
-        .find(|effort| !self.positions.contains(&Some(*effort)));
-        if let (Some(position), Some(effort)) = (missing_position, missing_effort) {
-            self.positions[position] = Some(effort);
-        }
-        if self.positions.iter().any(Option::is_none) {
-            return Err(
-                "Model switch failed: reasoning slider semantic calibration incomplete".to_string(),
-            );
-        }
+        // Revision 5: direct semantic labels are supporting evidence only.
+        // The target index comes from the fixed typed ordered domain
+        // `instant < medium < high`; observed labels only veto contradictions.
+        // Rust's array indexing on the exact `0..2` validated profile already
+        // encodes the rank mapping `0→instant, 1→medium, 2→high`.
+        Ok(reasoning_effort_rank(target))
+    }
+
+    /// Number of distinct positions carrying a directly observed semantic
+    /// label. Stable/reopen re-observations do not inflate the count.
+    fn direct_semantic_count(&self) -> u8 {
         self.positions
             .iter()
-            .position(|effort| *effort == Some(target))
-            .and_then(|position| i64::try_from(position).ok())
-            .ok_or_else(|| {
-                "Model switch failed: reasoning slider semantic calibration conflict".to_string()
-            })
+            .filter(|value| value.is_some())
+            .count() as u8
     }
 }
 
@@ -9127,8 +9295,9 @@ fn select_chatgpt_calibrated_control(
     press_provider_key(config_path, "Escape")?;
 
     Ok(ModelSelectionOutcome {
-        contract: ModelSelectionContract::ReasoningCalibratedControlV2,
-        evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
+        contract: ModelSelectionContract::ReasoningOrderedControlV3,
+        evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+        direct_semantic_count: Some(calibration.direct_semantic_count()),
     })
 }
 
@@ -9167,6 +9336,7 @@ fn select_chatgpt_accessible_label(
                 return Ok(ModelSelectionOutcome {
                     contract: ModelSelectionContract::ReasoningSliderV1,
                     evidence: ModelSelectionEvidence::AccessibleLabelV1,
+                    direct_semantic_count: None,
                 });
             }
             state = verified;
@@ -9374,6 +9544,7 @@ fn switch_model(
             ModelSelectionOutcome {
                 contract: ModelSelectionContract::LegacyMenuV1,
                 evidence: ModelSelectionEvidence::CheckedStateV1,
+                direct_semantic_count: None,
             }
         } else {
             return Err("Model switch failed: selector contract was not verified".to_string());
@@ -9382,6 +9553,7 @@ fn switch_model(
         ModelSelectionOutcome {
             contract: ModelSelectionContract::LegacyMenuV1,
             evidence: ModelSelectionEvidence::CheckedStateV1,
+            direct_semantic_count: None,
         }
     };
 

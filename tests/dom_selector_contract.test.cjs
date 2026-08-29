@@ -103,7 +103,7 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
       const resolveReasoningControlBundle = ${resolverSource};
       const menu = document.querySelector('#menu');
       const slider = document.querySelector('[data-model-reasoning-effort-slider]');
-      const labels = ['', '中', '高'];
+      const labels = ['', '', ''];
       document.querySelector('.__composer-pill').addEventListener('click', () => {
         menu.hidden = false;
       });
@@ -122,6 +122,7 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
         slider.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
       };
       const efforts = ['instant', 'medium', 'high'];
+      const ranks = { instant: 0, medium: 1, high: 2 };
       const calibrate = (initialAnnouncement) => {
         slider.setAttribute('aria-valuenow', '0');
         document.querySelector('#reasoning-announcement').textContent = initialAnnouncement;
@@ -135,28 +136,23 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
           observations.push(next);
         }
         const direct = observations.filter((state) => state.semantic_effort !== null);
-        const semanticValues = new Set(direct.map((state) => state.semantic_effort));
-        const missingEfforts = efforts.filter((effort) => !semanticValues.has(effort));
-        const missingPositions = observations
-          .filter((state) => state.semantic_effort === null)
-          .map((state) => state.now);
-        const accepted = direct.length >= 2 && semanticValues.size === direct.length &&
-          missingEfforts.length === 1 && missingPositions.length === 1;
-        return { accepted, observations, missingEfforts, missingPositions };
+        for (const state of direct) {
+          if (ranks[state.semantic_effort] !== state.now) {
+            return { accepted: false, observations, rankConflict: true };
+          }
+        }
+        const directCount = direct.length;
+        return { accepted: true, observations, directCount };
       };
       const calibration = calibrate('');
       let targetIndex = null;
       let selected = false;
       let stable = null;
       let reopened = null;
+      let directCount = null;
       if (calibration.accepted) {
-        const mapping = new Map(
-          calibration.observations
-            .filter((state) => state.semantic_effort !== null)
-            .map((state) => [state.semantic_effort, state.now]),
-        );
-        mapping.set(calibration.missingEfforts[0], calibration.missingPositions[0]);
-        targetIndex = mapping.get('instant');
+        targetIndex = ranks['instant'];
+        directCount = calibration.directCount;
         let state = readState();
         while (state.now > targetIndex) {
           const previous = state;
@@ -178,11 +174,14 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
       const initialState = calibration.observations[0];
       document.querySelector('#result').textContent = JSON.stringify({
         selectedLabel: selected ? '即時' : null,
-        selectionEvidence: selected ? 'closed_set_calibration_v1' : null,
+        selectionEvidence: selected ? 'ordered_bounded_effort_v1' : null,
+        directSemanticCount: selected ? directCount : null,
+        targetIndex: selected ? targetIndex : null,
         roleEvidence: initialState.role_evidence,
         semanticMissingAtTarget: initialState.semantic_effort === null,
         globalLiveIgnored: initialState.announcement_present === false,
         contradictoryLabelRejected: contradictoryCalibration.accepted === false,
+        rankConflictRejected: contradictoryCalibration.rankConflict === true,
         ordinalConflictRejected: ordinalConflictState.ordinal_conflict === true,
         promptStarted: false,
         sliderPresent: Boolean(document.querySelector('[data-model-reasoning-effort-slider]')),
@@ -199,11 +198,14 @@ test('ChatGPT reasoning slider is selectable before prompt submission', { skip: 
   const result = JSON.parse(encoded);
   assert.deepEqual(result, {
     selectedLabel: '即時',
-    selectionEvidence: 'closed_set_calibration_v1',
+    selectionEvidence: 'ordered_bounded_effort_v1',
+    directSemanticCount: 0,
+    targetIndex: 0,
     roleEvidence: 'missing',
     semanticMissingAtTarget: true,
     globalLiveIgnored: true,
     contradictoryLabelRejected: true,
+    rankConflictRejected: true,
     ordinalConflictRejected: true,
     promptStarted: false,
     sliderPresent: true,

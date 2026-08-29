@@ -240,19 +240,24 @@ session probe 驗證目前登入狀態，不會送出 prompt：
 ask-bridge session-probe --provider chatgpt --json
 ```
 
-若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v4`；同時保留
-`verified_model_selection_v1`、`verified_model_selection_v2` 與
-`verified_model_selection_v3` 以辨識舊 consumer 與讀取既有 receipt。ChatGPT 會先驗證
-模型 radio 或舊式選單；遇到三段推理強度 slider 時，v4 會由 Rust runtime 與 Node
-DOM tests 共用同一個純 `data-model-reasoning-effort-slider` control-bundle resolver。
-唯一 bundle 必須具備 `aria-valuemin=0`、`aria-valuemax=2`、整數目前值與唯一 focus/state
-owner；owner 可使用 `role=slider`、native range，或在行為證據完整時缺少 role，但明確
-衝突的互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐格走訪，
-在三個位置中直接辨識至少兩個不同的 `{instant, medium, high}` 語意，並以唯一剩餘值
-完成閉集合校準；ordinal announcement 只作一致性檢查，缺失不阻擋、矛盾則停止。工具
-會確認目標讀值穩定，並關閉後重新開啟確認持久化；新 control-bundle 證據會記為
-`closed_set_calibration_v1`，契約為 `reasoning_calibrated_control_v2`。模型或推理強度
-未驗證時會在附件上傳與 prompt 前停止，schema-v2 receipt 仍以
+若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v5`；同時保留
+`verified_model_selection_v1`、`verified_model_selection_v2`、
+`verified_model_selection_v3` 與 `verified_model_selection_v4` 以辨識舊 consumer 與讀取
+既有 receipt。ChatGPT 會先驗證模型 radio 或舊式選單；遇到三段推理強度 slider 時，v5 會
+由 Rust runtime 與 Node DOM tests 共用同一個純
+`data-model-reasoning-effort-slider` control-bundle resolver。唯一 bundle 必須具備
+`aria-valuemin=0`、`aria-valuemax=2`、整數目前值與唯一 focus/state owner；owner 可使用
+`role=slider`、native range，或在行為證據完整時缺少 role，但明確衝突的互動 role 會
+fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐格走訪，並使用固定的有序
+三段領域 `instant < medium < high`（rank `0→instant`、`1→medium`、`2→high`）直接由
+typed effort rank 得出目標位置；直接語意 label 僅為 supporting 交叉檢查，0 到 3 個皆可
+成功，凡可辨識的 label 與 rank 矛盾、重複 effort 或 semantic conflict 都會 fail-closed，
+缺失不阻擋。ordinal announcement 只作一致性檢查，缺失不阻擋、矛盾則停止。工具會確認
+目標讀值穩定，並關閉後重新開啟確認持久化；v5 證據記為 `ordered_bounded_effort_v1`，
+契約為 `reasoning_ordered_control_v3`，並在 schema-v2 receipt 以 nullable
+`model_selection_direct_semantic_count`（整數 `0..3`，v5 verified 必填；v1-v4 或 failed
+為 null）記錄低敏感度直接語意數量，不保存原始 label 文字。模型或推理強度未驗證時會在
+附件上傳與 prompt 前停止，schema-v2 receipt 仍以
 `model_selection`、`model_selection_contract`、可選的 `model_selection_evidence`、
 `failure_stage` 與 `failure_code` 保存低敏感度狀態，不保存 prompt、DOM 文字或路徑。
 
