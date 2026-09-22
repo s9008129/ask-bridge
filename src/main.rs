@@ -4,6 +4,7 @@ use fs2::FileExt;
 use mcp_cli::{McpClient, McpConnection, ServerConfig, StdioClient};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
@@ -26,21 +27,13 @@ const VERIFIED_MODEL_SELECTION_V2_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_MODEL_SELECTION_V3_CAPABILITY: &str = "verified_model_selection_v3";
 const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v4";
 const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v5";
+const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
 const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
 
-/// v5 ordered-domain rank for `instant < medium < high` on an exact
-/// three-state profile. Direct semantic labels are supporting evidence only.
-fn reasoning_effort_rank(effort: ReasoningEffort) -> i64 {
-    match effort {
-        ReasoningEffort::Instant => 0,
-        ReasoningEffort::Medium => 1,
-        ReasoningEffort::High => 2,
-    }
-}
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dynamic attachment verification timeout scaled by the number of files.
 /// ChatGPT renders file tiles progressively; with 4 files (e.g. repair
@@ -561,7 +554,11 @@ struct Cli {
     /// multiple times to set both the model and the reasoning level, e.g.
     /// `--model "GPT-5.5" --model "中等"`.
     /// ChatGPT examples: "GPT-5.5", "GPT-5.4", "GPT-5.3", "o3", or thinking levels such as
-    /// "即時", "中等", "高", "超高", "專業", "智慧". Gemini examples: "3.5 Flash",
+    /// "即時", "中等", "高" (plus English aliases such as "instant"/"medium"/"high").
+    /// Thinking levels are matched
+    /// against the labels the page itself announces for its reasoning control (a
+    /// bounded, labeled domain of 2-8 positions); positions the page reports as
+    /// upgrade-locked are never selected.  Gemini examples: "3.5 Flash",
     /// "3.1 Flash-Lite", or "3.1 Pro". Claude examples: "Sonnet", "Opus", "Haiku".
     /// Matching is case- and punctuation-insensitive.
     #[arg(long = "model", value_name = "MODEL", action = clap::ArgAction::Append)]
@@ -689,6 +686,7 @@ enum ModelSelectionContract {
     ReasoningSliderV1,
     ReasoningCalibratedControlV2,
     ReasoningOrderedControlV3,
+    ReasoningLabeledOrderedControlV4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -738,14 +736,19 @@ enum ModelSelectionEvidence {
     ResolvedBoundedOrdinalV2,
     ClosedSetCalibrationV1,
     OrderedBoundedEffortV1,
+    LabeledEffortPositionMapV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ModelSelectionOutcome {
     contract: ModelSelectionContract,
     evidence: ModelSelectionEvidence,
-    #[allow(dead_code)]
+    /// v5/v6 only: number of positions carrying a directly observed semantic
+    /// label within the verified selection window.
     direct_semantic_count: Option<u8>,
+    /// v6 only: span (`max - min + 1`) of the window that carried the verified
+    /// selection. `None` for every legacy contract.
+    position_count: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1135,10 +1138,15 @@ struct SessionReceipt {
     model_selection_contract: Option<ModelSelectionContract>,
     #[serde(default)]
     model_selection_evidence: Option<ModelSelectionEvidence>,
-    /// v5 only: number of positions with a directly observed semantic label
-    /// (0..=3). Null for non-v5 verified selections and for failed paths.
+    /// v5 (0..=3) and v6 (1..=position_count) verified selections only:
+    /// number of positions with a directly observed semantic label. Null for
+    /// other verified selections and for failed paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_selection_direct_semantic_count: Option<u8>,
+    /// v6 only: span (`max - min + 1`, 2..=8) of the verified selection
+    /// window. Null for every legacy contract and for failed paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_selection_position_count: Option<u8>,
     #[serde(default)]
     failure_stage: Option<String>,
     #[serde(default)]
@@ -1180,6 +1188,7 @@ impl SessionReceipt {
                 VERIFIED_MODEL_SELECTION_V3_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V4_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V5_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V6_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
@@ -1190,6 +1199,7 @@ impl SessionReceipt {
             model_selection_contract: None,
             model_selection_evidence: None,
             model_selection_direct_semantic_count: None,
+            model_selection_position_count: None,
             failure_stage: None,
             expected_output_type,
             response_completion: ResponseCompletion::Pending,
@@ -1446,16 +1456,36 @@ fn record_model_selection_verified(
     receipt.model_selection = ModelSelection::Verified;
     receipt.model_selection_contract = Some(outcome.contract);
     receipt.model_selection_evidence = Some(outcome.evidence);
-    receipt.model_selection_direct_semantic_count = match outcome.contract {
+    match outcome.contract {
         ModelSelectionContract::ReasoningOrderedControlV3 => {
-            outcome.direct_semantic_count.filter(|count| *count <= 3)
+            let count = outcome.direct_semantic_count.filter(|count| *count <= 3);
+            if count.is_none() {
+                return Err("v5 verified receipt 缺少合法的 direct semantic count".to_string());
+            }
+            receipt.model_selection_direct_semantic_count = count;
+            receipt.model_selection_position_count = None;
         }
-        _ => None,
-    };
-    if receipt.model_selection_contract == Some(ModelSelectionContract::ReasoningOrderedControlV3)
-        && receipt.model_selection_direct_semantic_count.is_none()
-    {
-        return Err("v5 verified receipt 缺少合法的 direct semantic count".to_string());
+        ModelSelectionContract::ReasoningLabeledOrderedControlV4 => {
+            let position_count = outcome
+                .position_count
+                .filter(|count| (2..=8).contains(count));
+            let count = outcome.direct_semantic_count;
+            let counts_are_legal = match (position_count, count) {
+                (Some(span), Some(count)) => count >= 1 && count <= span,
+                _ => false,
+            };
+            if !counts_are_legal {
+                return Err("v6 verified receipt 缺少合法的 labeled position count".to_string());
+            }
+            receipt.model_selection_position_count = position_count;
+            receipt.model_selection_direct_semantic_count = count;
+        }
+        ModelSelectionContract::LegacyMenuV1
+        | ModelSelectionContract::ReasoningSliderV1
+        | ModelSelectionContract::ReasoningCalibratedControlV2 => {
+            receipt.model_selection_direct_semantic_count = None;
+            receipt.model_selection_position_count = None;
+        }
     }
     receipt.failure_stage = None;
     receipt.failure_code = None;
@@ -1476,6 +1506,7 @@ fn record_model_selection_failed(path: &Path) -> Result<(), String> {
     receipt.model_selection_contract = None;
     receipt.model_selection_evidence = None;
     receipt.model_selection_direct_semantic_count = None;
+    receipt.model_selection_position_count = None;
     receipt.failure_stage = Some(MODEL_SELECTION_FAILURE_STAGE.to_string());
     receipt.failure_code = Some(MODEL_SELECTION_FAILURE_CODE.to_string());
     write_session_receipt_preserving_attachment_probe(path, &receipt)?;
@@ -1615,7 +1646,8 @@ fn capabilities_value() -> Value {
             VERIFIED_MODEL_SELECTION_V2_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V5_CAPABILITY
+            VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V6_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1788,6 +1820,56 @@ fn capabilities_value() -> Value {
                 "failure_stage",
                 "failure_code"
             ]
+        },
+        "verified_model_selection_v6": {
+            "selection_contracts": [
+                "legacy_menu_v1",
+                "reasoning_slider_v1",
+                "reasoning_labeled_ordered_control_v4"
+            ],
+            "evidence": [
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2",
+                "labeled_effort_position_map_v1"
+            ],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "labeled_position_map": {
+                "domain": "labeled_ordered_position_map",
+                "minimum_span": 2,
+                "maximum_span": 8,
+                "label_source": "nearest_reasoning_container_aria_describedby",
+                "target_index_source": "direct_label_match",
+                "lock_evidence": [
+                    "tick_data_locked",
+                    "root_data_locked",
+                    "announcement_upgrade_hint"
+                ],
+                "unknown_label_policy": "skippable_not_selectable",
+                "duplicate_label_policy": "fail_closed",
+                "minimum_direct_semantics": 1,
+                "maximum_direct_semantics": 8,
+                "ordinal_is_consistency_check": true
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "model_selection_position_count",
+                "model_selection_direct_semantic_count",
+                "failure_stage",
+                "failure_code"
+            ]
         }
     })
 }
@@ -1811,6 +1893,8 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_MODEL_SELECTION_V2_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V3_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V4_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -4478,6 +4562,7 @@ mod tests {
                 contract: ModelSelectionContract::ReasoningCalibratedControlV2,
                 evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
                 direct_semantic_count: None,
+                position_count: None,
             },
         )
         .unwrap();
@@ -4576,7 +4661,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_ordinal_state_requires_exact_profile_and_consistent_labels() {
+    fn ordered_domain_state_requires_consistent_span_ordinal_and_labels() {
         let valid = serde_json::json!({
             "found": true,
             "marker_present": true,
@@ -4599,7 +4684,7 @@ mod tests {
             "focused": true
         });
         let state = parse_chatgpt_slider_state(&valid).unwrap();
-        state.validate_bounded_ordinal().unwrap();
+        state.validate_ordered_domain().unwrap();
         assert!(state.requires_bounded_ordinal());
 
         let mut marked_without_ordinal = valid.clone();
@@ -4609,17 +4694,16 @@ mod tests {
         marked_without_ordinal["announcement_present"] = serde_json::json!(false);
         let marked_without_ordinal = parse_chatgpt_slider_state(&marked_without_ordinal).unwrap();
         assert!(marked_without_ordinal.requires_bounded_ordinal());
-        marked_without_ordinal.validate_bounded_ordinal().unwrap();
-        let mut incomplete_calibration = ChatGptSemanticCalibration::default();
-        incomplete_calibration
-            .observe(marked_without_ordinal)
+        marked_without_ordinal.validate_ordered_domain().unwrap();
+        ChatGptLabeledPositionLedger::default()
+            .observe(&marked_without_ordinal)
             .unwrap();
 
         let mut direct_semantic = valid.clone();
         direct_semantic["semantic_effort"] = serde_json::json!("high");
         parse_chatgpt_slider_state(&direct_semantic)
             .unwrap()
-            .validate_bounded_ordinal()
+            .validate_ordered_domain()
             .unwrap();
 
         let mut semantic_conflict = valid.clone();
@@ -4627,7 +4711,7 @@ mod tests {
         assert!(
             parse_chatgpt_slider_state(&semantic_conflict)
                 .unwrap()
-                .validate_bounded_ordinal()
+                .validate_ordered_domain()
                 .is_err()
         );
 
@@ -4636,7 +4720,7 @@ mod tests {
         assert!(
             parse_chatgpt_slider_state(&ordinal_mismatch)
                 .unwrap()
-                .validate_bounded_ordinal()
+                .validate_ordered_domain()
                 .is_err()
         );
 
@@ -4644,12 +4728,40 @@ mod tests {
         focus_failure["focused"] = serde_json::json!(false);
         assert!(parse_chatgpt_slider_state(&focus_failure).is_err());
 
-        let mut unknown_cardinality = valid;
+        // An ordinal that disagrees with the announced span still fails,
+        // even when the value itself is legal.
+        let mut unknown_cardinality = valid.clone();
         unknown_cardinality["ordinal_total"] = serde_json::json!(4);
         assert!(
             parse_chatgpt_slider_state(&unknown_cardinality)
                 .unwrap()
-                .validate_bounded_ordinal()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        // A four-position page with a matching ordinal is a legal labeled
+        // domain (the former hard-coded three-state profile is gone).
+        let mut four_position = valid.clone();
+        four_position["max"] = serde_json::json!(3);
+        four_position["now"] = serde_json::json!(2);
+        four_position["ordinal_current"] = serde_json::json!(3);
+        four_position["ordinal_total"] = serde_json::json!(4);
+        four_position["semantic_effort"] = serde_json::json!("high");
+        four_position["tick_count"] = serde_json::json!(4);
+        four_position["lock_map_present"] = serde_json::json!(true);
+        four_position["locked_positions"] = serde_json::json!([3]);
+        four_position["current_locked"] = serde_json::json!(false);
+        let four_position = parse_chatgpt_slider_state(&four_position).unwrap();
+        four_position.validate_ordered_domain().unwrap();
+        assert_eq!(four_position.span(), 4);
+
+        // The same page whose ordinal claims three positions fails closed.
+        let mut three_position_ordinal = valid;
+        three_position_ordinal["ordinal_current"] = serde_json::json!(2);
+        assert!(
+            parse_chatgpt_slider_state(&three_position_ordinal)
+                .unwrap()
+                .validate_ordered_domain()
                 .is_err()
         );
     }
@@ -4677,26 +4789,26 @@ mod tests {
             "focused": true
         });
         let roleless_state = parse_chatgpt_slider_state(&roleless).unwrap();
-        roleless_state.validate_bounded_ordinal().unwrap();
+        roleless_state.validate_ordered_domain().unwrap();
 
         let mut split_owner = roleless.clone();
         split_owner["state_owner_relation"] = serde_json::json!("descendant");
         split_owner["role_evidence"] = serde_json::json!("native_range");
         let split_state = parse_chatgpt_slider_state(&split_owner).unwrap();
-        split_state.validate_bounded_ordinal().unwrap();
-        assert!(!roleless_state.same_observable_state(split_state));
+        split_state.validate_ordered_domain().unwrap();
+        assert!(!roleless_state.same_observable_state(&split_state));
 
         let mut exact_role = roleless.clone();
         exact_role["role_evidence"] = serde_json::json!("slider");
         let exact_state = parse_chatgpt_slider_state(&exact_role).unwrap();
-        exact_state.validate_bounded_ordinal().unwrap();
+        exact_state.validate_ordered_domain().unwrap();
 
         let mut conflicting_role = roleless.clone();
         conflicting_role["role_evidence"] = serde_json::json!("conflict");
         assert!(
             parse_chatgpt_slider_state(&conflicting_role)
                 .unwrap()
-                .validate_bounded_ordinal()
+                .validate_ordered_domain()
                 .is_err()
         );
 
@@ -4705,7 +4817,7 @@ mod tests {
         assert!(
             parse_chatgpt_slider_state(&ambiguous_marker)
                 .unwrap()
-                .validate_bounded_ordinal()
+                .validate_ordered_domain()
                 .is_err()
         );
 
@@ -4715,8 +4827,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_set_calibration_resolves_missing_target_and_rejects_incomplete_or_duplicate_evidence()
-    {
+    fn labeled_position_ledger_counts_only_the_accepted_window_and_rejects_contradictions() {
         let base = serde_json::json!({
             "found": true,
             "marker_present": true,
@@ -4725,7 +4836,7 @@ mod tests {
             "state_owner_relation": "marker",
             "focus_owner_relation": "state_owner",
             "min": 0,
-            "max": 2,
+            "max": 3,
             "now": 0,
             "matched": false,
             "announcement_present": false,
@@ -4738,45 +4849,65 @@ mod tests {
             "semantic_conflict": false,
             "focused": true
         });
-        let state_for = |now: i64, effort: Option<&str>| {
+        let state_for = |min: i64, max: i64, now: i64, effort: Option<&str>| {
             let mut value = base.clone();
+            value["min"] = serde_json::json!(min);
+            value["max"] = serde_json::json!(max);
             value["now"] = serde_json::json!(now);
             value["semantic_effort"] =
-                effort.map_or(serde_json::Value::Null, |value| serde_json::json!(value));
+                effort.map_or(serde_json::Value::Null, |effort| serde_json::json!(effort));
             parse_chatgpt_slider_state(&value).unwrap()
         };
 
-        let mut calibration = ChatGptSemanticCalibration::default();
-        calibration.observe(state_for(0, None)).unwrap();
-        calibration.observe(state_for(1, Some("medium"))).unwrap();
-        calibration.observe(state_for(2, Some("high"))).unwrap();
-        assert_eq!(calibration.target_index(ReasoningEffort::Instant), Ok(0));
-        assert_eq!(calibration.target_index(ReasoningEffort::Medium), Ok(1));
-        assert_eq!(calibration.target_index(ReasoningEffort::High), Ok(2));
+        // Only reads taken in the exact accepted window are counted.
+        let mut ledger = ChatGptLabeledPositionLedger::default();
+        ledger
+            .observe(&state_for(0, 3, 0, Some("instant")))
+            .unwrap();
+        ledger.observe(&state_for(0, 3, 1, Some("medium"))).unwrap();
+        ledger.observe(&state_for(0, 3, 2, Some("high"))).unwrap();
+        ledger.observe(&state_for(0, 3, 3, None)).unwrap();
+        assert_eq!(ledger.window_count(0, 3), 3);
+        assert_eq!(ledger.window_count(0, 2), 0);
+        assert_eq!(ledger.window_count(1, 3), 0);
 
-        // Revision 5: rank mapping is fixed by the typed ordered domain, so a
-        // zero/low direct-label calibration still resolves every target.
-        let mut sparse = ChatGptSemanticCalibration::default();
-        sparse.observe(state_for(0, None)).unwrap();
-        sparse.observe(state_for(1, None)).unwrap();
-        sparse.observe(state_for(2, None)).unwrap();
-        assert_eq!(sparse.target_index(ReasoningEffort::Instant), Ok(0));
-        assert_eq!(sparse.direct_semantic_count(), 0);
+        // A re-rendered window may observe the same tier again without
+        // inflating the accepted window's count (F2).
+        let mut rerendered = ledger.clone();
+        rerendered
+            .observe(&state_for(1, 3, 2, Some("high")))
+            .unwrap();
+        assert_eq!(rerendered.window_count(0, 3), 3);
+        assert_eq!(rerendered.window_count(1, 3), 1);
 
-        let mut single = ChatGptSemanticCalibration::default();
-        single.observe(state_for(1, Some("medium"))).unwrap();
-        assert_eq!(single.target_index(ReasoningEffort::Instant), Ok(0));
-        assert_eq!(single.direct_semantic_count(), 1);
+        // The same position may not change its label inside one window.
+        let mut changed = ChatGptLabeledPositionLedger::default();
+        changed
+            .observe(&state_for(0, 3, 1, Some("medium")))
+            .unwrap();
+        assert!(changed.observe(&state_for(0, 3, 1, Some("high"))).is_err());
 
-        let mut duplicate = ChatGptSemanticCalibration::default();
-        duplicate.observe(state_for(1, Some("medium"))).unwrap();
-        assert!(duplicate.observe(state_for(2, Some("medium"))).is_err());
+        // Two positions may not carry the same recognizable label.
+        let mut duplicate = ChatGptLabeledPositionLedger::default();
+        duplicate
+            .observe(&state_for(0, 3, 1, Some("high")))
+            .unwrap();
+        assert!(
+            duplicate
+                .observe(&state_for(0, 3, 2, Some("high")))
+                .is_err()
+        );
+
+        // Unrecognizable announcements are skipped, never counted.
+        let mut unknown_only = ChatGptLabeledPositionLedger::default();
+        unknown_only.observe(&state_for(0, 3, 3, None)).unwrap();
+        assert_eq!(unknown_only.window_count(0, 3), 0);
 
         let mut semantic_conflict = base.clone();
         semantic_conflict["semantic_conflict"] = serde_json::json!(true);
         assert!(
-            ChatGptSemanticCalibration::default()
-                .observe(parse_chatgpt_slider_state(&semantic_conflict).unwrap())
+            ChatGptLabeledPositionLedger::default()
+                .observe(&parse_chatgpt_slider_state(&semantic_conflict).unwrap())
                 .is_err()
         );
     }
@@ -4793,6 +4924,7 @@ mod tests {
                 contract: ModelSelectionContract::ReasoningOrderedControlV3,
                 evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
                 direct_semantic_count: Some(1),
+                position_count: None,
             },
         )
         .unwrap();
@@ -4806,6 +4938,7 @@ mod tests {
                 contract: ModelSelectionContract::ReasoningCalibratedControlV2,
                 evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
                 direct_semantic_count: None,
+                position_count: None,
             },
         )
         .unwrap();
@@ -4832,6 +4965,7 @@ mod tests {
                     contract: ModelSelectionContract::ReasoningOrderedControlV3,
                     evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
                     direct_semantic_count: None,
+                    position_count: None,
                 },
             )
             .is_err()
@@ -4846,11 +4980,542 @@ mod tests {
                     contract: ModelSelectionContract::ReasoningOrderedControlV3,
                     evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
                     direct_semantic_count: Some(4),
+                    position_count: None,
                 },
             )
             .is_err()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct FakeSliderPage {
+        labels: Vec<Option<ReasoningEffort>>,
+        locked: Vec<bool>,
+        target: ReasoningEffort,
+        min: i64,
+        now: i64,
+        announcement: bool,
+        reads: usize,
+        drop_last_after_reads: Option<usize>,
+        shift_min_after_reads: Option<usize>,
+        presses: Vec<String>,
+        reopen_calls: usize,
+    }
+
+    impl FakeSliderPage {
+        fn new(
+            labels: Vec<Option<ReasoningEffort>>,
+            locked: Vec<bool>,
+            now: i64,
+            target: ReasoningEffort,
+        ) -> Self {
+            assert_eq!(labels.len(), locked.len());
+            Self {
+                labels,
+                locked,
+                target,
+                min: 0,
+                now,
+                announcement: true,
+                reads: 0,
+                drop_last_after_reads: None,
+                shift_min_after_reads: None,
+                presses: Vec::new(),
+                reopen_calls: 0,
+            }
+        }
+
+        fn span(&self) -> i64 {
+            i64::try_from(self.labels.len()).unwrap_or(0)
+        }
+
+        fn max(&self) -> i64 {
+            self.min + self.span() - 1
+        }
+
+        fn locked_positions(&self) -> Vec<i64> {
+            self.locked
+                .iter()
+                .enumerate()
+                .filter(|(_, locked)| **locked)
+                .map(|(index, _)| self.min + i64::try_from(index).unwrap_or(0))
+                .collect()
+        }
+
+        fn projection(&self) -> serde_json::Value {
+            let index = usize::try_from(self.now - self.min).unwrap_or(0);
+            let effort = self.labels.get(index).copied().flatten();
+            let locked = self.locked.get(index).copied().unwrap_or(false);
+            serde_json::json!({
+                "found": true,
+                "marker_present": true,
+                "marker_count": 1,
+                "role_evidence": "slider",
+                "state_owner_relation": "marker",
+                "focus_owner_relation": "state_owner",
+                "min": self.min,
+                "max": self.max(),
+                "now": self.now,
+                "matched": effort == Some(self.target),
+                "announcement_present": self.announcement,
+                "ordinal_present": self.announcement,
+                "ordinal_current": self.now - self.min + 1,
+                "ordinal_total": self.span(),
+                "ordinal_consistent": true,
+                "ordinal_conflict": false,
+                "semantic_effort": effort.map(|effort| match effort {
+                    ReasoningEffort::Instant => "instant",
+                    ReasoningEffort::Medium => "medium",
+                    ReasoningEffort::High => "high",
+                }),
+                "semantic_conflict": false,
+                "semantic_unknown": self.announcement && effort.is_none(),
+                "focused": true,
+                "tick_count": self.span(),
+                "lock_map_present": true,
+                "locked_positions": self.locked_positions(),
+                "current_locked": locked,
+            })
+        }
+
+        fn state(&self) -> ChatGptSliderState {
+            parse_chatgpt_slider_state(&self.projection()).unwrap()
+        }
+    }
+
+    impl ChatGptSliderPage for FakeSliderPage {
+        fn read_slider(&mut self) -> Result<ChatGptSliderState, String> {
+            self.reads += 1;
+            if let Some(threshold) = self.shift_min_after_reads
+                && self.reads > threshold
+            {
+                self.min += 1;
+                self.now += 1;
+                self.shift_min_after_reads = None;
+            }
+            if let Some(threshold) = self.drop_last_after_reads
+                && self.reads > threshold
+                && self.span() > 2
+            {
+                self.labels.pop();
+                self.locked.pop();
+                self.drop_last_after_reads = None;
+            }
+            Ok(self.state())
+        }
+
+        fn press_key(&mut self, key: &str) -> Result<(), String> {
+            self.presses.push(key.to_string());
+            match key {
+                "ArrowLeft" => self.now = (self.now - 1).max(self.min),
+                "ArrowRight" => self.now = (self.now + 1).min(self.max()),
+                "Escape" => {}
+                other => return Err(format!("unexpected key {}", other)),
+            }
+            Ok(())
+        }
+
+        fn reopen_slider(&mut self) -> Result<(), String> {
+            self.reopen_calls += 1;
+            Ok(())
+        }
+
+        fn settle(&mut self) {}
+    }
+
+    #[test]
+    fn labeled_walker_selects_the_target_label_on_a_four_position_page() {
+        let mut page = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        let initial = page.state();
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut page, ReasoningEffort::High, initial)
+                .unwrap();
+        assert_eq!(
+            outcome.contract,
+            ModelSelectionContract::ReasoningLabeledOrderedControlV4
+        );
+        assert_eq!(
+            outcome.evidence,
+            ModelSelectionEvidence::LabeledEffortPositionMapV1
+        );
+        assert_eq!(outcome.position_count, Some(4));
+        assert_eq!(outcome.direct_semantic_count, Some(3));
+        assert_eq!(page.now, 2);
+        assert_eq!(page.reopen_calls, 1);
+        assert_eq!(
+            page.presses
+                .iter()
+                .filter(|key| key.as_str() == "Escape")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn labeled_walker_accepts_a_locked_start_and_a_minimum_target() {
+        let mut page = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            3,
+            ReasoningEffort::Instant,
+        );
+        let initial = page.state();
+        assert!(initial.current_locked);
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut page, ReasoningEffort::Instant, initial)
+                .unwrap();
+        assert_eq!(page.now, 0);
+        assert_eq!(outcome.position_count, Some(4));
+        assert_eq!(outcome.direct_semantic_count, Some(3));
+    }
+
+    #[test]
+    fn labeled_walker_refuses_locked_barriers_duplicate_labels_and_missing_announcements() {
+        let mut barrier = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                None,
+            ],
+            vec![false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        let initial = barrier.state();
+        let error =
+            select_chatgpt_labeled_ordered_control(&mut barrier, ReasoningEffort::High, initial)
+                .unwrap_err();
+        assert!(error.contains("unlocked slider domain"), "{}", error);
+
+        let mut duplicate = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::High),
+            ],
+            vec![false, false, false],
+            2,
+            ReasoningEffort::High,
+        );
+        let initial = duplicate.state();
+        let error =
+            select_chatgpt_labeled_ordered_control(&mut duplicate, ReasoningEffort::High, initial)
+                .unwrap_err();
+        assert!(
+            error.contains("duplicate semantic labels")
+                || error.contains("semantic calibration conflict"),
+            "{}",
+            error
+        );
+
+        let mut silent = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+            ],
+            vec![false, false, false],
+            2,
+            ReasoningEffort::High,
+        );
+        silent.announcement = false;
+        let initial = silent.state();
+        let error =
+            select_chatgpt_labeled_ordered_control(&mut silent, ReasoningEffort::High, initial)
+                .unwrap_err();
+        assert!(error.contains("announcement was not verified"), "{}", error);
+    }
+
+    #[test]
+    fn labeled_walker_survives_domain_rerender_without_losing_the_selection() {
+        // The trailing locked tier disappears mid-run (F2: 4 -> 3 positions).
+        let mut shrinking = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        shrinking.drop_last_after_reads = Some(3);
+        let initial = shrinking.state();
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut shrinking, ReasoningEffort::High, initial)
+                .unwrap();
+        assert_eq!(outcome.position_count, Some(3));
+        assert_eq!(outcome.direct_semantic_count, Some(3));
+
+        // The whole window shifts by one position before the walk starts
+        // (min 0 -> 1). The legal selection must survive and the receipt
+        // count must stay inside the accepted window.
+        let mut shifting = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        shifting.shift_min_after_reads = Some(0);
+        let shifted = shifting.read_slider().unwrap();
+        assert_eq!(shifted.min, 1);
+        assert_eq!(shifted.now, 3);
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut shifting, ReasoningEffort::High, shifted)
+                .unwrap();
+        assert_eq!(outcome.position_count, Some(4));
+        let position_count = outcome.position_count.unwrap();
+        let count = outcome.direct_semantic_count.unwrap();
+        assert!(count >= 1 && count <= position_count, "{}", count);
+    }
+
+    #[test]
+    fn ordered_domain_accepts_wide_labeled_profiles_and_rejects_lock_or_span_drift() {
+        let base = serde_json::json!({
+            "found": true,
+            "marker_present": true,
+            "marker_count": 1,
+            "role_evidence": "slider",
+            "state_owner_relation": "marker",
+            "focus_owner_relation": "state_owner",
+            "min": 0,
+            "max": 3,
+            "now": 2,
+            "matched": true,
+            "announcement_present": true,
+            "ordinal_present": true,
+            "ordinal_current": 3,
+            "ordinal_total": 4,
+            "ordinal_consistent": true,
+            "ordinal_conflict": false,
+            "semantic_effort": "high",
+            "semantic_conflict": false,
+            "focused": true,
+            "tick_count": 4,
+            "lock_map_present": true,
+            "locked_positions": [3],
+            "current_locked": false,
+            "semantic_unknown": false
+        });
+        let four = parse_chatgpt_slider_state(&base).unwrap();
+        four.validate_ordered_domain().unwrap();
+        assert_eq!(four.span(), 4);
+
+        // A locked start is legal evidence as long as the map agrees (F-05).
+        let mut locked_start = base.clone();
+        locked_start["now"] = serde_json::json!(3);
+        locked_start["ordinal_current"] = serde_json::json!(4);
+        locked_start["semantic_effort"] = serde_json::Value::Null;
+        locked_start["semantic_unknown"] = serde_json::json!(true);
+        locked_start["current_locked"] = serde_json::json!(true);
+        parse_chatgpt_slider_state(&locked_start)
+            .unwrap()
+            .validate_ordered_domain()
+            .unwrap();
+
+        // Root-only lock evidence (no ticks) must not fail the whole domain.
+        let mut root_only = base.clone();
+        root_only["lock_map_present"] = serde_json::json!(false);
+        root_only["tick_count"] = serde_json::Value::Null;
+        root_only["locked_positions"] = serde_json::Value::Null;
+        root_only["current_locked"] = serde_json::json!(false);
+        parse_chatgpt_slider_state(&root_only)
+            .unwrap()
+            .validate_ordered_domain()
+            .unwrap();
+
+        // Spans outside 2..=8 fail closed at parse time.
+        let mut too_small = base.clone();
+        too_small["max"] = serde_json::json!(0);
+        too_small["now"] = serde_json::json!(0);
+        assert!(parse_chatgpt_slider_state(&too_small).is_err());
+
+        let mut too_large = base.clone();
+        too_large["max"] = serde_json::json!(8);
+        assert!(parse_chatgpt_slider_state(&too_large).is_err());
+
+        // A short lock map, an out-of-range lock and a lock verdict that
+        // contradicts the map all fail closed.
+        let mut short_map = base.clone();
+        short_map["tick_count"] = serde_json::json!(2);
+        assert!(
+            parse_chatgpt_slider_state(&short_map)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut out_of_range = base.clone();
+        out_of_range["locked_positions"] = serde_json::json!([5]);
+        assert!(
+            parse_chatgpt_slider_state(&out_of_range)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut contradicting = base.clone();
+        contradicting["current_locked"] = serde_json::json!(true);
+        assert!(
+            parse_chatgpt_slider_state(&contradicting)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        // The ordinal must match the announced span, never a fixed total.
+        let mut bad_ordinal = base;
+        bad_ordinal["ordinal_total"] = serde_json::json!(3);
+        assert!(
+            parse_chatgpt_slider_state(&bad_ordinal)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v6_receipt_requires_position_and_direct_semantic_counts_inside_the_hit_window() {
+        let dir = make_test_dir("v6_receipt_count");
+        let path = dir.join("receipt.json");
+        let fresh = || write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        let v6 =
+            |position_count: Option<u8>, direct_semantic_count: Option<u8>| ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningLabeledOrderedControlV4,
+                evidence: ModelSelectionEvidence::LabeledEffortPositionMapV1,
+                direct_semantic_count,
+                position_count,
+            };
+
+        for (position_count, direct_semantic_count) in [(2u8, 1u8), (4, 1), (4, 4), (8, 1), (8, 8)]
+        {
+            fresh();
+            record_model_selection_verified(
+                &path,
+                v6(Some(position_count), Some(direct_semantic_count)),
+            )
+            .unwrap();
+            let receipt = read_session_receipt(&path).unwrap();
+            assert_eq!(receipt.model_selection_position_count, Some(position_count));
+            assert_eq!(
+                receipt.model_selection_direct_semantic_count,
+                Some(direct_semantic_count)
+            );
+            assert_eq!(
+                receipt.model_selection_contract,
+                Some(ModelSelectionContract::ReasoningLabeledOrderedControlV4)
+            );
+            assert_eq!(
+                receipt.model_selection_evidence,
+                Some(ModelSelectionEvidence::LabeledEffortPositionMapV1)
+            );
+        }
+
+        for (position_count, direct_semantic_count) in [
+            (None, Some(1u8)),
+            (Some(4u8), None),
+            (Some(1), Some(1)),
+            (Some(9), Some(1)),
+            (Some(4), Some(0)),
+            (Some(4), Some(5)),
+        ] {
+            fresh();
+            assert!(
+                record_model_selection_verified(&path, v6(position_count, direct_semantic_count))
+                    .is_err(),
+                "{:?}",
+                (position_count, direct_semantic_count)
+            );
+        }
+
+        // Legacy contracts never carry the v6 position count.
+        fresh();
+        record_model_selection_verified(
+            &path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                direct_semantic_count: Some(3),
+                position_count: Some(4),
+            },
+        )
+        .unwrap();
+        let legacy = read_session_receipt(&path).unwrap();
+        assert_eq!(legacy.model_selection_position_count, None);
+        assert_eq!(legacy.model_selection_direct_semantic_count, Some(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn capabilities_and_receipts_declare_v5_and_v6_everywhere() {
+        let value = capabilities_value();
+        let capabilities = value["capabilities"].as_array().unwrap();
+        for capability in [
+            VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
+        ] {
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(capability)),
+                "{}",
+                capability
+            );
+        }
+        let v6 = &value["verified_model_selection_v6"];
+        assert_eq!(v6["labeled_position_map"]["minimum_span"], 2);
+        assert_eq!(v6["labeled_position_map"]["maximum_span"], 8);
+        assert_eq!(
+            v6["labeled_position_map"]["target_index_source"],
+            "direct_label_match"
+        );
+        assert!(
+            v6["selection_contracts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some("reasoning_labeled_ordered_control_v4"))
+        );
+        assert!(
+            v6["receipt_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some("model_selection_position_count"))
+        );
+
+        let receipt = SessionReceipt::new(0, 0);
+        assert!(
+            receipt
+                .capabilities
+                .iter()
+                .any(|entry| entry == VERIFIED_MODEL_SELECTION_V6_CAPABILITY)
+        );
+
+        let source = include_str!("main.rs");
+        assert!(source.contains("println!(\"  {}\", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);"));
+        assert!(source.contains("println!(\"  {}\", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);"));
     }
 
     #[test]
@@ -8573,7 +9238,7 @@ impl ChatGptRoleEvidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatGptSliderState {
     min: i64,
     max: i64,
@@ -8594,7 +9259,24 @@ struct ChatGptSliderState {
     ordinal_conflict: bool,
     semantic_effort: Option<ReasoningEffort>,
     semantic_conflict: bool,
+    /// v6: number of lock ticks reported by the resolver (`None` when the
+    /// resolver could not enumerate a lock map at all).
+    tick_count: Option<i64>,
+    /// v6: whether the resolver enumerated a usable lock map (root + ticks).
+    lock_map_present: bool,
+    /// v6: absolute slider values whose tick carries `data-locked="true"`.
+    locked_positions: Vec<i64>,
+    /// v6: current position is locked (root mark, lock map membership or an
+    /// upgrade hint in the announcement).
+    current_locked: bool,
+    /// v6: an announcement exists but carries no recognizable effort label.
+    semantic_unknown: bool,
 }
+
+/// Labeled ordered domains are bounded; anything outside this span is treated
+/// as third-party UI contract drift and fails closed.
+const MIN_LABELED_DOMAIN_SPAN: i64 = 2;
+const MAX_LABELED_DOMAIN_SPAN: i64 = 8;
 
 impl ChatGptSliderState {
     fn has_ordinal_evidence(&self) -> bool {
@@ -8605,7 +9287,15 @@ impl ChatGptSliderState {
         self.marker_present || self.has_ordinal_evidence()
     }
 
-    fn validate_bounded_ordinal(&self) -> Result<(), String> {
+    fn span(&self) -> i64 {
+        self.max - self.min + 1
+    }
+
+    /// v6 label-driven domain validation. The domain size is a consistency
+    /// check, never a hard-coded three-state profile: what must hold is that
+    /// the announced ordinal matches the announced span, that any lock map is
+    /// complete, and that lock evidence agrees with the current value.
+    fn validate_ordered_domain(&self) -> Result<(), String> {
         if !self.marker_present || self.marker_count != 1 {
             return Err("Model switch failed: reasoning slider marker is missing".to_string());
         }
@@ -8619,7 +9309,11 @@ impl ChatGptSliderState {
                 "Model switch failed: reasoning slider role conflicts with its control".to_string(),
             );
         }
-        if self.min != 0 || self.max != 2 || self.now < self.min || self.now > self.max {
+        let span = self.span();
+        if !(MIN_LABELED_DOMAIN_SPAN..=MAX_LABELED_DOMAIN_SPAN).contains(&span)
+            || self.now < self.min
+            || self.now > self.max
+        {
             return Err(
                 "Model switch failed: reasoning slider state profile is invalid".to_string(),
             );
@@ -8627,18 +9321,41 @@ impl ChatGptSliderState {
         if self.ordinal_present
             && (self.ordinal_conflict
                 || !self.ordinal_consistent
-                || self.ordinal_total != Some(3)
-                || self.ordinal_current != Some(self.now + 1))
+                || self.ordinal_total != Some(span)
+                || self.ordinal_current != Some(self.now - self.min + 1))
         {
             return Err("Model switch failed: reasoning slider ordinal conflict".to_string());
         }
         if self.semantic_conflict {
             return Err("Model switch failed: reasoning slider semantic conflict".to_string());
         }
+        if self.lock_map_present {
+            let tick_count = self.tick_count.unwrap_or(-1);
+            if tick_count != span {
+                return Err(format!(
+                    "Model switch failed: reasoning slider lock map has {} ticks for {} positions",
+                    tick_count, span
+                ));
+            }
+            if self
+                .locked_positions
+                .iter()
+                .any(|position| *position < self.min || *position > self.max)
+            {
+                return Err(
+                    "Model switch failed: reasoning slider lock map is out of range".to_string(),
+                );
+            }
+            if self.current_locked != self.locked_positions.contains(&self.now) {
+                return Err(
+                    "Model switch failed: reasoning slider lock evidence conflicts".to_string(),
+                );
+            }
+        }
         Ok(())
     }
 
-    fn same_observable_state(self, other: Self) -> bool {
+    fn same_observable_state(&self, other: &Self) -> bool {
         self.min == other.min
             && self.max == other.max
             && self.now == other.now
@@ -8658,74 +9375,78 @@ impl ChatGptSliderState {
             && self.ordinal_conflict == other.ordinal_conflict
             && self.semantic_effort == other.semantic_effort
             && self.semantic_conflict == other.semantic_conflict
+            && self.tick_count == other.tick_count
+            && self.lock_map_present == other.lock_map_present
+            && self.locked_positions == other.locked_positions
+            && self.current_locked == other.current_locked
+            && self.semantic_unknown == other.semantic_unknown
+    }
+
+    /// Cross-read stability predicate for the accepted selection.
+    ///
+    /// Plan line 64: the domain window (`min`/`max`) is deliberately excluded
+    /// because the live page can re-render its span between two reads (F2)
+    /// while the selected value, its direct label and the lock state stay
+    /// identical. Every individual read is still validated by
+    /// `validate_ordered_domain`, so `now` always falls inside that read's own
+    /// `[min, max]`.
+    fn same_target_observation(&self, other: &Self) -> bool {
+        self.now == other.now
+            && self.semantic_effort == other.semantic_effort
+            && self.matched
+            && other.matched
+            && !self.semantic_unknown
+            && !other.semantic_unknown
+            && !self.current_locked
+            && !other.current_locked
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ChatGptSemanticCalibration {
-    positions: [Option<ReasoningEffort>; 3],
+/// Records the directly observed page label per `(min, max)` window and
+/// per-position value.
+///
+/// The verified receipt reports how many distinct positions carried a
+/// recognizable label *inside the exact window that carried the accepted
+/// selection* (plan B-01). Reads taken while the page was re-rendering under a
+/// different window are still validated for movement, but they never inflate
+/// the count.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChatGptLabeledPositionLedger {
+    windows: BTreeMap<(i64, i64), BTreeMap<i64, ReasoningEffort>>,
 }
 
-impl Default for ChatGptSemanticCalibration {
-    fn default() -> Self {
-        Self {
-            positions: [None; 3],
-        }
-    }
-}
-
-impl ChatGptSemanticCalibration {
-    fn observe(&mut self, state: ChatGptSliderState) -> Result<(), String> {
-        state.validate_bounded_ordinal()?;
-        let position = usize::try_from(state.now).map_err(|_| {
-            "Model switch failed: reasoning slider state profile is invalid".to_string()
-        })?;
-        if self.positions.get(position).is_none() {
+impl ChatGptLabeledPositionLedger {
+    fn observe(&mut self, state: &ChatGptSliderState) -> Result<(), String> {
+        state.validate_ordered_domain()?;
+        let Some(effort) = state.semantic_effort else {
+            return Ok(());
+        };
+        let window = self.windows.entry((state.min, state.max)).or_default();
+        if let Some(existing) = window.get(&state.now)
+            && *existing != effort
+        {
             return Err(
-                "Model switch failed: reasoning slider state profile is invalid".to_string(),
+                "Model switch failed: reasoning slider semantic calibration conflict".to_string(),
             );
         }
-        if let Some(effort) = state.semantic_effort {
-            if let Some(existing) = self.positions[position]
-                && existing != effort
-            {
-                return Err(
-                    "Model switch failed: reasoning slider semantic calibration conflict"
-                        .to_string(),
-                );
-            }
-            if self
-                .positions
-                .iter()
-                .enumerate()
-                .any(|(index, value)| index != position && *value == Some(effort))
-            {
-                return Err(
-                    "Model switch failed: reasoning slider semantic calibration conflict"
-                        .to_string(),
-                );
-            }
-            self.positions[position] = Some(effort);
+        if window
+            .iter()
+            .any(|(position, value)| *position != state.now && *value == effort)
+        {
+            return Err(
+                "Model switch failed: reasoning slider duplicate semantic labels".to_string(),
+            );
         }
+        window.insert(state.now, effort);
         Ok(())
     }
 
-    fn target_index(&mut self, target: ReasoningEffort) -> Result<i64, String> {
-        // Revision 5: direct semantic labels are supporting evidence only.
-        // The target index comes from the fixed typed ordered domain
-        // `instant < medium < high`; observed labels only veto contradictions.
-        // Rust's array indexing on the exact `0..2` validated profile already
-        // encodes the rank mapping `0→instant, 1→medium, 2→high`.
-        Ok(reasoning_effort_rank(target))
-    }
-
-    /// Number of distinct positions carrying a directly observed semantic
-    /// label. Stable/reopen re-observations do not inflate the count.
-    fn direct_semantic_count(&self) -> u8 {
-        self.positions
-            .iter()
-            .filter(|value| value.is_some())
-            .count() as u8
+    /// Distinct labeled positions observed inside the given window.
+    fn window_count(&self, min: i64, max: i64) -> u8 {
+        self.windows
+            .get(&(min, max))
+            .map(|window| u8::try_from(window.len()).unwrap_or(u8::MAX))
+            .unwrap_or(0)
     }
 }
 
@@ -9003,8 +9724,17 @@ fn parse_chatgpt_slider_state(value: &Value) -> Result<ChatGptSliderState, Strin
         .get("now")
         .and_then(Value::as_i64)
         .ok_or_else(|| "reasoning slider value is unavailable".to_string())?;
-    if min < 0 || max < min || max - min > 20 || now < min || now > max {
-        return Err("reasoning slider state is invalid".to_string());
+    let span = max - min + 1;
+    if min < 0
+        || max < min
+        || !(MIN_LABELED_DOMAIN_SPAN..=MAX_LABELED_DOMAIN_SPAN).contains(&span)
+        || now < min
+        || now > max
+    {
+        return Err(format!(
+            "reasoning slider domain span {} is outside the supported {}-{} range",
+            span, MIN_LABELED_DOMAIN_SPAN, MAX_LABELED_DOMAIN_SPAN
+        ));
     }
     if value.get("focused").and_then(Value::as_bool) != Some(true) {
         return Err("reasoning slider could not be focused".to_string());
@@ -9034,6 +9764,25 @@ fn parse_chatgpt_slider_state(value: &Value) -> Result<ChatGptSliderState, Strin
         .get("focused")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let tick_count = optional_integer("tick_count")?;
+    let lock_map_present = value
+        .get("lock_map_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let locked_positions = match value.get("locked_positions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_i64()
+                    .ok_or_else(|| "reasoning slider locked position is not an integer".to_string())
+            })
+            .collect::<Result<Vec<i64>, String>>()?,
+        Some(_) => {
+            return Err("reasoning slider locked positions are invalid".to_string());
+        }
+    };
     Ok(ChatGptSliderState {
         min,
         max,
@@ -9070,6 +9819,17 @@ fn parse_chatgpt_slider_state(value: &Value) -> Result<ChatGptSliderState, Strin
         semantic_effort,
         semantic_conflict: value
             .get("semantic_conflict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        tick_count,
+        lock_map_present,
+        locked_positions,
+        current_locked: value
+            .get("current_locked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        semantic_unknown: value
+            .get("semantic_unknown")
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
@@ -9189,116 +9949,293 @@ fn reopen_chatgpt_slider(config_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn select_chatgpt_calibrated_control(
-    config_path: &str,
-    target_json: &str,
+/// Bounded stability window used after the target position was reached.
+const SELECTION_STABILITY_MAX_READS: usize = 5;
+
+/// Minimal page surface the label-driven selector needs. Production uses the
+/// MCP-backed page below; tests drive the same algorithm with a simulated
+/// page so movement, lock and drift rules are covered without a browser.
+trait ChatGptSliderPage {
+    fn read_slider(&mut self) -> Result<ChatGptSliderState, String>;
+    fn press_key(&mut self, key: &str) -> Result<(), String>;
+    fn reopen_slider(&mut self) -> Result<(), String>;
+    fn settle(&mut self);
+}
+
+struct LiveChatGptSliderPage<'a> {
+    config_path: &'a str,
+    target_json: &'a str,
+}
+
+impl ChatGptSliderPage for LiveChatGptSliderPage<'_> {
+    fn read_slider(&mut self) -> Result<ChatGptSliderState, String> {
+        read_chatgpt_slider_state(self.config_path, self.target_json)
+    }
+
+    fn press_key(&mut self, key: &str) -> Result<(), String> {
+        press_provider_key(self.config_path, key)
+    }
+
+    fn reopen_slider(&mut self) -> Result<(), String> {
+        reopen_chatgpt_slider(self.config_path)
+    }
+
+    fn settle(&mut self) {
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Every read the selector acts on must carry an announcement, and the read
+/// must describe a legal labeled ordered domain. Unknown labels are skippable
+/// but never selectable (plan step 4).
+fn observe_visited_position(
+    ledger: &mut ChatGptLabeledPositionLedger,
+    state: &ChatGptSliderState,
+) -> Result<(), String> {
+    if !state.announcement_present {
+        return Err(
+            "Model switch failed: reasoning slider announcement was not verified".to_string(),
+        );
+    }
+    ledger.observe(state)
+}
+
+fn label_matches_target(state: &ChatGptSliderState, target: ReasoningEffort) -> bool {
+    state.matched
+        && state.semantic_effort == Some(target)
+        && !state.semantic_unknown
+        && !state.current_locked
+}
+
+/// Re-reads the slider (which re-focuses the thumb, F1), presses one key and
+/// reads again. Callers validate the exact +/-1 transition.
+fn press_slider_key_and_read(
+    page: &mut impl ChatGptSliderPage,
+    ledger: &mut ChatGptLabeledPositionLedger,
+    key: &str,
+) -> Result<ChatGptSliderState, String> {
+    let focus_read = page.read_slider()?;
+    observe_visited_position(ledger, &focus_read)?;
+    page.press_key(key)?;
+    page.settle();
+    let next = page.read_slider()?;
+    observe_visited_position(ledger, &next)?;
+    Ok(next)
+}
+
+/// Walks the slider to the labeled position whose direct label equals `target`
+/// and returns the read that carried the match. Movement is label-driven: the
+/// domain size only bounds the walk, it never maps a label to an index.
+fn walk_chatgpt_labeled_domain(
+    page: &mut impl ChatGptSliderPage,
     target: ReasoningEffort,
+    ledger: &mut ChatGptLabeledPositionLedger,
     mut state: ChatGptSliderState,
-) -> Result<ModelSelectionOutcome, String> {
-    let mut calibration = ChatGptSemanticCalibration::default();
-    calibration.observe(state)?;
+) -> Result<ChatGptSliderState, String> {
+    observe_visited_position(ledger, &state)?;
 
+    // Step 1: reach `min`. A locked starting position is allowed (F-05);
+    // ArrowLeft still leaves it.
+    let mut left_steps = 0usize;
     while state.now > state.min {
+        if left_steps >= usize::try_from(MAX_LABELED_DOMAIN_SPAN).unwrap_or(8) {
+            return Err(
+                "Model switch failed: reasoning slider did not reach its minimum".to_string(),
+            );
+        }
         let previous = state;
-        press_provider_key(config_path, "ArrowLeft")?;
-        thread::sleep(Duration::from_millis(500));
-        let next = read_chatgpt_slider_state(config_path, target_json)?;
+        let next = press_slider_key_and_read(page, ledger, "ArrowLeft")?;
         if next.now != previous.now - 1 {
             return Err(
                 "Model switch failed: reasoning slider left movement was not exactly one state"
                     .to_string(),
             );
         }
-        calibration.observe(next)?;
         state = next;
-    }
-    if state.now != 0 {
-        return Err("Model switch failed: reasoning slider did not reach its minimum".to_string());
+        left_steps += 1;
     }
 
-    while state.now < state.max {
+    // Step 2: the minimum itself may already carry the target (R3).
+    if label_matches_target(&state, target) {
+        return Ok(state);
+    }
+
+    // Step 3: walk right, never entering a locked position.
+    loop {
+        if state.now >= state.max {
+            return Err(
+                "Model switch failed: reasoning target was not found in the labeled domain"
+                    .to_string(),
+            );
+        }
+        if state.lock_map_present && state.locked_positions.contains(&(state.now + 1)) {
+            return Err(
+                "Model switch failed: reasoning target is not in the unlocked slider domain"
+                    .to_string(),
+            );
+        }
         let previous = state;
-        press_provider_key(config_path, "ArrowRight")?;
-        thread::sleep(Duration::from_millis(500));
-        let next = read_chatgpt_slider_state(config_path, target_json)?;
+        let next = press_slider_key_and_read(page, ledger, "ArrowRight")?;
         if next.now != previous.now + 1 {
             return Err(
                 "Model switch failed: reasoning slider right movement was not exactly one state"
                     .to_string(),
             );
         }
-        calibration.observe(next)?;
-        state = next;
-    }
-
-    let target_index = calibration.target_index(target)?;
-    while state.now > target_index {
-        let previous = state;
-        press_provider_key(config_path, "ArrowLeft")?;
-        thread::sleep(Duration::from_millis(500));
-        let next = read_chatgpt_slider_state(config_path, target_json)?;
-        if next.now != previous.now - 1 {
+        if next.current_locked {
             return Err(
-                "Model switch failed: reasoning slider left movement was not exactly one state"
-                    .to_string(),
+                "Model switch failed: reasoning slider reached a locked position".to_string(),
             );
         }
-        calibration.observe(next)?;
         state = next;
-    }
-    while state.now < target_index {
-        let previous = state;
-        press_provider_key(config_path, "ArrowRight")?;
-        thread::sleep(Duration::from_millis(500));
-        let next = read_chatgpt_slider_state(config_path, target_json)?;
-        if next.now != previous.now + 1 {
-            return Err(
-                "Model switch failed: reasoning slider right movement was not exactly one state"
-                    .to_string(),
-            );
+        if label_matches_target(&state, target) {
+            return Ok(state);
         }
-        calibration.observe(next)?;
-        state = next;
     }
+}
 
-    let stable = read_chatgpt_slider_state(config_path, target_json)?;
-    calibration.observe(stable)?;
-    if !state.same_observable_state(stable) {
+fn select_chatgpt_labeled_ordered_control(
+    page: &mut impl ChatGptSliderPage,
+    target: ReasoningEffort,
+    state: ChatGptSliderState,
+) -> Result<ModelSelectionOutcome, String> {
+    let mut ledger = ChatGptLabeledPositionLedger::default();
+    let mut hit = walk_chatgpt_labeled_domain(page, target, &mut ledger, state)?;
+
+    // Step 6: bounded stability window. The page may re-render its span
+    // between reads (F2), so only the value, the direct label and the lock
+    // state must agree; every individual read still validates its own domain.
+    let mut stable = false;
+    let mut relocated = false;
+    let mut previous: Option<ChatGptSliderState> = None;
+    for _ in 0..SELECTION_STABILITY_MAX_READS {
+        let read = page.read_slider()?;
+        observe_visited_position(&mut ledger, &read)?;
+        if read.now != hit.now || !label_matches_target(&read, target) {
+            if relocated {
+                return Err(
+                    "Model switch failed: reasoning slider target was not stable across reads"
+                        .to_string(),
+                );
+            }
+            relocated = true;
+            // Re-anchor by label, not by value: a re-render may shift the
+            // window (F2) so the same position can carry a different value.
+            hit = walk_chatgpt_labeled_domain(page, target, &mut ledger, read)?;
+            previous = Some(hit.clone());
+            continue;
+        }
+        if let Some(last) = previous
+            && last.same_target_observation(&read)
+            && (last.min != read.min || last.max != read.max || last.same_observable_state(&read))
+        {
+            stable = true;
+            break;
+        }
+        previous = Some(read);
+    }
+    if !stable {
         return Err(
             "Model switch failed: reasoning slider target was not stable across reads".to_string(),
         );
     }
-    if stable.now != target_index {
-        return Err(
-            "Model switch failed: reasoning slider calibrated target state is incorrect"
-                .to_string(),
-        );
-    }
 
-    press_provider_key(config_path, "Escape")?;
-    thread::sleep(Duration::from_millis(350));
-    reopen_chatgpt_slider(config_path)?;
-    let reopened = read_chatgpt_slider_state(config_path, target_json)?;
-    calibration.observe(reopened)?;
-    if reopened.now != target_index || !stable.same_observable_state(reopened) {
-        return Err(
-            "Model switch failed: reasoning slider target did not persist after reopen".to_string(),
-        );
+    // Step 7: close and reopen the menu; the labeled position must persist.
+    page.press_key("Escape")?;
+    page.settle();
+    page.reopen_slider()?;
+    let mut reopen_stable = false;
+    let mut reopen_previous: Option<ChatGptSliderState> = None;
+    for _ in 0..SELECTION_STABILITY_MAX_READS {
+        let read = page.read_slider()?;
+        observe_visited_position(&mut ledger, &read)?;
+        if read.now != hit.now || !label_matches_target(&read, target) {
+            return Err(
+                "Model switch failed: reasoning slider target did not persist after reopen"
+                    .to_string(),
+            );
+        }
+        if let Some(last) = reopen_previous
+            && last.same_target_observation(&read)
+            && (last.min != read.min || last.max != read.max || last.same_observable_state(&read))
+        {
+            reopen_stable = true;
+            break;
+        }
+        reopen_previous = Some(read);
     }
-    let reopened_stable = read_chatgpt_slider_state(config_path, target_json)?;
-    calibration.observe(reopened_stable)?;
-    if !reopened.same_observable_state(reopened_stable) {
+    if !reopen_stable {
         return Err(
             "Model switch failed: reopened reasoning slider target was not stable".to_string(),
         );
     }
-    press_provider_key(config_path, "Escape")?;
+    page.press_key("Escape")?;
 
+    // Step 8: the receipt counts only reads taken in the exact window that
+    // carried the accepted selection (B-01); the hit read is one of them.
+    let direct_semantic_count = ledger.window_count(hit.min, hit.max);
     Ok(ModelSelectionOutcome {
-        contract: ModelSelectionContract::ReasoningOrderedControlV3,
-        evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
-        direct_semantic_count: Some(calibration.direct_semantic_count()),
+        contract: ModelSelectionContract::ReasoningLabeledOrderedControlV4,
+        evidence: ModelSelectionEvidence::LabeledEffortPositionMapV1,
+        direct_semantic_count: Some(direct_semantic_count),
+        position_count: u8::try_from(hit.span()).ok(),
     })
+}
+
+/// Best-effort menu cleanup after a failed model selection. The failed
+/// receipt is already written by the caller; this helper only closes the menu,
+/// reports warnings, and never changes the original failure semantics.
+fn best_effort_close_reasoning_menu(config_path: &str, target_json: &str) {
+    let mut page = LiveChatGptSliderPage {
+        config_path,
+        target_json,
+    };
+    match page.read_slider() {
+        Ok(mut state) => {
+            let max_steps =
+                usize::try_from(state.span().clamp(1, MAX_LABELED_DOMAIN_SPAN)).unwrap_or(1);
+            let mut steps = 0usize;
+            while state.current_locked && steps < max_steps {
+                let before = state.now;
+                if let Err(error) = page.press_key("ArrowLeft") {
+                    eprintln!(
+                        "Warning: reasoning slider cleanup key press failed: {}",
+                        error
+                    );
+                    break;
+                }
+                page.settle();
+                match page.read_slider() {
+                    Ok(next) => {
+                        if next.now >= before {
+                            break;
+                        }
+                        state = next;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: reasoning slider cleanup re-read failed: {}",
+                            error
+                        );
+                        break;
+                    }
+                }
+                steps += 1;
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: reasoning slider cleanup could not re-read the slider: {}",
+                error
+            );
+        }
+    }
+    if let Err(error) = page.press_key("Escape") {
+        eprintln!(
+            "Warning: reasoning slider cleanup could not close the menu: {}",
+            error
+        );
+    }
 }
 
 fn select_chatgpt_accessible_label(
@@ -9337,6 +10274,7 @@ fn select_chatgpt_accessible_label(
                     contract: ModelSelectionContract::ReasoningSliderV1,
                     evidence: ModelSelectionEvidence::AccessibleLabelV1,
                     direct_semantic_count: None,
+                    position_count: None,
                 });
             }
             state = verified;
@@ -9536,7 +10474,14 @@ fn switch_model(
                     "Model switch failed: reasoning target has no bounded ordinal mapping"
                         .to_string()
                 })?;
-                select_chatgpt_calibrated_control(&config_path, &target_json, target, state)?
+                select_chatgpt_labeled_ordered_control(
+                    &mut LiveChatGptSliderPage {
+                        config_path: &config_path,
+                        target_json: &target_json,
+                    },
+                    target,
+                    state,
+                )?
             } else {
                 select_chatgpt_accessible_label(&config_path, &target_json, state)?
             }
@@ -9545,6 +10490,7 @@ fn switch_model(
                 contract: ModelSelectionContract::LegacyMenuV1,
                 evidence: ModelSelectionEvidence::CheckedStateV1,
                 direct_semantic_count: None,
+                position_count: None,
             }
         } else {
             return Err("Model switch failed: selector contract was not verified".to_string());
@@ -9554,6 +10500,7 @@ fn switch_model(
             contract: ModelSelectionContract::LegacyMenuV1,
             evidence: ModelSelectionEvidence::CheckedStateV1,
             direct_semantic_count: None,
+            position_count: None,
         }
     };
 
@@ -11400,6 +12347,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             m, MODEL_SELECTION_FAILURE_CODE, receipt_error
                         );
                         std::process::exit(1);
+                    }
+                    if let Ok(cleanup_json) = serde_json::to_string(m.trim()) {
+                        best_effort_close_reasoning_menu(&config_path, &cleanup_json);
                     }
                     eprintln!(
                         "Error switching model '{}': {}: {}",

@@ -240,24 +240,27 @@ session probe 驗證目前登入狀態，不會送出 prompt：
 ask-bridge session-probe --provider chatgpt --json
 ```
 
-若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v5`；同時保留
+若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v6`；同時保留
 `verified_model_selection_v1`、`verified_model_selection_v2`、
-`verified_model_selection_v3` 與 `verified_model_selection_v4` 以辨識舊 consumer 與讀取
-既有 receipt。ChatGPT 會先驗證模型 radio 或舊式選單；遇到三段推理強度 slider 時，v5 會
-由 Rust runtime 與 Node DOM tests 共用同一個純
-`data-model-reasoning-effort-slider` control-bundle resolver。唯一 bundle 必須具備
-`aria-valuemin=0`、`aria-valuemax=2`、整數目前值與唯一 focus/state owner；owner 可使用
-`role=slider`、native range，或在行為證據完整時缺少 role，但明確衝突的互動 role 會
-fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵逐格走訪，並使用固定的有序
-三段領域 `instant < medium < high`（rank `0→instant`、`1→medium`、`2→high`）直接由
-typed effort rank 得出目標位置；直接語意 label 僅為 supporting 交叉檢查，0 到 3 個皆可
-成功，凡可辨識的 label 與 rank 矛盾、重複 effort 或 semantic conflict 都會 fail-closed，
-缺失不阻擋。ordinal announcement 只作一致性檢查，缺失不阻擋、矛盾則停止。工具會確認
-目標讀值穩定，並關閉後重新開啟確認持久化；v5 證據記為 `ordered_bounded_effort_v1`，
-契約為 `reasoning_ordered_control_v3`，並在 schema-v2 receipt 以 nullable
-`model_selection_direct_semantic_count`（整數 `0..3`，v5 verified 必填；v1-v4 或 failed
-為 null）記錄低敏感度直接語意數量，不保存原始 label 文字。模型或推理強度未驗證時會在
-附件上傳與 prompt 前停止，schema-v2 receipt 仍以
+`verified_model_selection_v3`、`verified_model_selection_v4` 與
+`verified_model_selection_v5` 以辨識舊 consumer 與讀取既有 receipt。ChatGPT 會先驗證
+模型 radio 或舊式選單；遇到推理強度 slider 時，v6 會由 Rust runtime 與 Node DOM tests
+共用同一個純 `data-model-reasoning-effort-slider` control-bundle resolver。唯一 bundle
+必須具備整數 `aria-valuemin`／`aria-valuemax`／`aria-valuenow`（或 native range 的
+min／max／value）、唯一 focus/state owner，且位置數量（`max - min + 1`）必須落在 2 到 8
+之間；owner 可使用 `role=slider`、native range，或在行為證據完整時缺少
+role，但明確衝突的互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵
+逐格走訪，並以頁面公告的語意標籤驅動選取：每個走訪到的位置都必須有公告，無法辨識標籤
+的位置可略過但不可被選取，目標位置則必須由公告直接對應到目標推理等級；頁面標示
+`data-locked`（例如需要升級的 Pro 位置）不得選取，但可作為走訪的停止邊界。ordinal
+announcement 只作一致性檢查（存在時必須與位置數量及目前位置相符），缺失不阻擋、矛盾
+則停止。工具會確認目標讀值穩定，並關閉後重新開啟確認持久化；v6 證據記為
+`labeled_effort_position_map_v1`，契約為 `reasoning_labeled_ordered_control_v4`，並在
+schema-v2 receipt 以 nullable `model_selection_position_count`（整數 `2..8`，僅 v6
+verified 填寫）與 `model_selection_direct_semantic_count`（v6 為整數 `1..position_count`，
+v5 為 `0..3`；其他契約或 failed 為 null）記錄低敏感度位置數量，不保存原始 label 文字。
+模型或推理強度未驗證時會在附件上傳與 prompt 前停止；session 模式下會先寫入 failed
+receipt，再以最佳努力關閉 reasoning 選單（清理失敗只輸出警告）。schema-v2 receipt 仍以
 `model_selection`、`model_selection_contract`、可選的 `model_selection_evidence`、
 `failure_stage` 與 `failure_code` 保存低敏感度狀態，不保存 prompt、DOM 文字或路徑。
 
@@ -388,7 +391,7 @@ ask-bridge --provider claude "證明這個數學問題。" --model Opus
 可用的模型名稱（視帳號權限與 provider UI 而定）：
 
 - **ChatGPT 模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
-- **ChatGPT 思考強度**：目前 exact 三段 profile 的 `即時`、`中等`、`高`
+- **ChatGPT 思考強度**：`即時`、`中等`、`高`；切換時會與頁面自己公告的推理強度標籤比對（2 到 8 個位置），頁面標示需要升級的鎖定位置不會被選取
 - **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 - **Claude 模型**：`Sonnet`、`Opus`、`Haiku`（實際名稱依 claude.ai 選單與帳號方案而定）
 

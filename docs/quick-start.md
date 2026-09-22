@@ -166,7 +166,7 @@ ask-bridge --provider claude "用幾句話介紹 Rust。" --model Sonnet
 可用名稱（視帳號權限與 provider UI）：
 
 - **ChatGPT 模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
-- **ChatGPT 思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **ChatGPT 思考強度**：`即時`、`中等`、`高`（以頁面公告的標籤比對；升級鎖定的位置不會被選取）
 - **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 - **Claude 模型**：`Sonnet`、`Opus`、`Haiku`（實際名稱依 claude.ai 選單與帳號方案而定）
 

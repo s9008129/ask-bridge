@@ -327,7 +327,8 @@ ask-bridge --provider claude "Prove this math problem." --model Opus
 Available model names (depending on your account entitlements and provider UI):
 
 - **ChatGPT models**: `GPT-5.5`, `GPT-5.4`, `GPT-5.3`, `o3`
-- **ChatGPT thinking levels**: `智慧`, `即時`, `中等`, `高`, `超高`, `專業`
+- **ChatGPT thinking levels**: `即時`, `中等`, `高` (matched against the labels the
+  page announces for its reasoning control; upgrade-locked positions are never selected)
 - **Gemini modes**: `3.5 Flash`, `3.1 Flash-Lite`, `3.1 Pro`
 - **Claude models**: `Sonnet`, `Opus`, `Haiku` (actual names depend on the claude.ai menu and your plan)
 

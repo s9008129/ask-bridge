@@ -6,6 +6,26 @@
 
 ---
 
+## [0.2.10] - 2026-09-22
+
+### 🚀 新增 (Added)
+- 新增 `verified_model_selection_v6` 能力宣告、推理強度契約 `reasoning_labeled_ordered_control_v4` 與證據 `labeled_effort_position_map_v1`；`capabilities --json` 與 `print_capabilities` 同時宣告 v5 與 v6，`verified_model_selection_v1` 至 `verified_model_selection_v5` 全部保留，未被移除。
+- schema-v2 session receipt 新增 nullable 欄位 `model_selection_position_count`（v6 verified 為 `2..8`）；`model_selection_direct_semantic_count` 於 v6 verified 為 `1..position_count`、於 v5 verified 為 `0..3`，其他契約與 failed 路徑皆省略這兩個欄位。
+
+### 🔧 修復 (Fixed)
+- 修正 ChatGPT 推理強度 slider 被硬編成「恰好 3 個位置」的問題：舊版要求 `min=0`、`max=2` 且 ordinal total 固定為 3，遇到真實頁面的 4 位置（0=即時、1=中、2=高、3=升級鎖定）時，會以 `Model switch failed: reasoning slider state profile is invalid` 停止，session receipt 留下 `CHATGPT_MODEL_SELECTION_FAILED`、`failure_stage=model_selection`、`prompt_submission=not_started` 的 failed 狀態。
+- 推理強度 domain 改為接受 2 至 8 個位置，並改以頁面自己公告的語意標籤驅動走訪與選取：每個走訪到的位置都必須有公告；無法辨識標籤的位置可略過但不可被選取；目標位置必須由公告直接對應目標等級。可辨識標籤與 ordinal 矛盾、同一位置標籤改變、重複標籤、semantic conflict 與 lock map 矛盾仍 fail-closed。
+- `data-locked`（例如需要升級的 Pro 位置）不得選取；走訪遇到鎖定邊界即停止，鎖定位置不會出現在選取結果中。
+- 模型選擇失敗時，session 模式會先寫入 failed receipt，再以「最佳努力」關閉 reasoning 選單；清理或關閉失敗只輸出警告，不會改寫已寫入的 receipt、失敗碼或退出結果。
+- 補齊對應測試：Rust 端涵蓋 labeled position ledger、標籤驅動走訪、v6 receipt 欄位與 span／鎖定／漂移拒絕；Node DOM contract fixture 涵蓋 4 位置標籤、lock map、tick count 不一致、unknown label 與 upgrade-gated 目前位置。
+
+### 🔧 變更 (Changed)
+- 版本推進至 `0.2.10`（`Cargo.toml` 為 `0.2.10-preserve.1`），同步更新 `Cargo.toml`、`package.json`、`install.sh`、`install.ps1` 與 `scripts/ask.sh`。
+- 向後相容性保留：v5 verified receipt（`reasoning_ordered_control_v3`／`ordered_bounded_effort_v1`／count `0..3`）仍可讀取與寫入，v1 至 v5 的能力宣告不變。
+- 同步更新 `README.md` 與 `skills/ask-bridge/SKILL.md`：移除文件中的固定三段 profile 敘述，改為 v6 標籤化位置契約、鎖定位置規則與新 receipt 欄位說明。
+
+---
+
 ## [0.2.5] - 2026-07-10
 
 ### 🚀 新增 (Added)

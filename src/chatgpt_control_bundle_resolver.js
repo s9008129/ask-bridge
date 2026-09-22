@@ -149,9 +149,10 @@
         actualOwners.some(isNativeRange) ? 'native_range' :
         ownerRoles.includes('slider') ? 'slider' : 'missing';
 
+    const reasoningContainer = nearestReasoningContainer(marker || stateOwner);
     const linkedNodes = new Set();
     const scopedNodes = new Set();
-    for (const owner of [marker, stateOwner, focusOwner].filter(Boolean)) {
+    for (const owner of [marker, stateOwner, focusOwner, reasoningContainer].filter(Boolean)) {
         for (const attribute of ['aria-labelledby', 'aria-describedby']) {
             for (const id of (owner.getAttribute(attribute) || '').split(/\s+/).filter(Boolean)) {
                 const linked = document.getElementById(id);
@@ -159,7 +160,6 @@
             }
         }
     }
-    const reasoningContainer = nearestReasoningContainer(marker || stateOwner);
     if (reasoningContainer) {
         for (const live of reasoningContainer.querySelectorAll('[aria-live], [role="status"], [role="alert"]')) {
             if (!live.closest('[hidden], [aria-hidden="true"]')) scopedNodes.add(live);
@@ -222,8 +222,34 @@
     const max = numberValue(rawStateValue(stateOwner, 'max'));
     const now = numberValue(rawStateValue(stateOwner, 'now'));
     const target = canonicalEffort(targetEffort);
-    const ordinalConflict = ordinalPresent && (!ordinalConsistent ||
-        firstOrdinal.total !== 3 || firstOrdinal.current !== now + 1);
+    const ordinalPositionMatches = Number.isFinite(min) && Number.isFinite(now) &&
+        firstOrdinal?.current === now - min + 1;
+    const ordinalConflict = ordinalPresent &&
+        (!ordinalConsistent || !ordinalPositionMatches);
+
+    const lockedElements = marker
+        ? Array.from(marker.querySelectorAll('[data-locked]'))
+        : [];
+    const outermostOf = (elements) => elements.find((element) =>
+        !elements.some((other) => other !== element && other.contains(element))) || null;
+    const lockedStateOwners = lockedElements.filter((element) => element.contains(stateOwner));
+    const lockRoot = lockedStateOwners.length > 0
+        ? outermostOf(lockedStateOwners)
+        : outermostOf(lockedElements);
+    const ticks = lockedElements.filter((element) => element !== lockRoot);
+    const lockMapPresent = ticks.length >= 1 && Number.isFinite(min);
+    const tickCount = lockMapPresent ? ticks.length : null;
+    const lockedPositions = lockMapPresent
+        ? ticks.reduce((positions, tick, index) => {
+            if (tick.getAttribute('data-locked') === 'true') positions.push(min + index);
+            return positions;
+        }, [])
+        : null;
+    const upgradePattern = /需要升級|需要升级|upgrade/i;
+    const currentLocked = lockRoot?.getAttribute('data-locked') === 'true' ||
+        Boolean(lockMapPresent && lockedPositions.includes(now)) ||
+        textSources.some((value) => upgradePattern.test(value));
+    const semanticUnknown = textSources.length > 0 && semanticEffortValues.length === 0;
     return {
         found: true,
         marker_present: Boolean(marker),
@@ -244,6 +270,11 @@
         ordinal_conflict: ordinalConflict,
         semantic_effort: semanticEffortValues.length === 1 ? semanticEffortValues[0] : null,
         semantic_conflict: semanticEffortValues.length > 1,
+        tick_count: tickCount,
+        lock_map_present: lockMapPresent,
+        locked_positions: lockedPositions,
+        current_locked: currentLocked,
+        semantic_unknown: semanticUnknown,
         focused: document.activeElement === focusOwner
     };
 })

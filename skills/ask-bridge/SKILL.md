@@ -171,7 +171,7 @@ prompt + "\n\n" + stdin
 | `-i`, `--image-output <IMAGE_PATH>` | 下載 provider 回覆中的生成圖片 | 可指定資料夾或檔案路徑；可搭配一般 prompt、`get` 或 `open <url>` |
 | `--image <IMAGE_FILE>` | 附加圖片檔，可重複指定 | 支援 ChatGPT 與 Claude；搭配 Gemini 會失敗 |
 | `--file <FILE>` | 附加文件檔，可重複指定 | 支援 PDF、Word、Excel、PowerPoint、純文字、Markdown、CSV、JSON、程式碼等；ChatGPT、Gemini 與 Claude 都可用 |
-| `--model <MODEL>` | 送出 prompt 前切換模型 | 比對不分大小寫與標點；模型名稱取決於 provider UI 與帳號權限 |
+| `--model <MODEL>` | 送出 prompt 前切換模型 | 比對不分大小寫與標點；模型名稱取決於 provider UI 與帳號權限；ChatGPT 思考強度會與頁面公告的推理強度標籤比對（2 到 8 個位置），需要升級的鎖定位置不會被選取 |
 | `-h`, `--help` | 顯示 help | 可用 `ask-bridge --help` 或 `ask-bridge help <COMMAND>` |
 | `config` | 設定或顯示全域預設 provider | 使用 `ask-bridge config --provider <chatgpt|gemini|claude>` |
 
@@ -300,7 +300,7 @@ ask-bridge --provider claude '用幾句話介紹 Rust。' --model Sonnet
 ask-bridge --provider claude '證明這個數學問題。' --model Opus
 ```
 
-模型比對不分大小寫與標點符號。若切換失敗，移除 `--model` 或改用 provider 預設模型，不要猜測替代模型名稱。
+模型比對不分大小寫與標點符號。ChatGPT 的思考強度（`即時`、`中等`、`高`）會以頁面自己公告的推理強度標籤選取（2 到 8 個位置）；無法辨識標籤的位置可略過但不可被選取，頁面標示需要升級的鎖定位置不會被選取。若切換失敗，移除 `--model` 或改用 provider 預設模型，不要猜測替代模型名稱。
 
 ## 對話與瀏覽器控制
 
@@ -370,6 +370,6 @@ ask-bridge screenshot --headless=false
 
 Gemini 圖片輸入不支援時，改用 ChatGPT 或 Claude，或改以文字描述圖片內容。不要把同一個失敗命令無限制重試。
 
-模型切換失敗時，移除 `--model` 或改用 provider 預設模型，不要猜測替代模型名稱。
+模型切換失敗時，移除 `--model` 或改用 provider 預設模型，不要猜測替代模型名稱。ChatGPT 回報 `CHATGPT_MODEL_SELECTION_FAILED` 代表頁面契約未通過驗證，命令已在附件上傳與送出 prompt 前停止；重試前先以 `--verbose` 診斷，不要用猜測的等級名稱硬試。
 
 沒有 prompt 且沒有子命令時，`ask-bridge` 會顯示 help。若任務需要非互動輸出，優先搭配 `--output` 或 shell redirect，避免只依賴終端機渲染結果。

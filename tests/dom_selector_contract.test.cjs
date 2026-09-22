@@ -14,6 +14,36 @@ const chromeCandidates = [
 ];
 const chrome = chromeCandidates.find((candidate) => existsSync(candidate));
 
+const renderFixture = (fixture) => {
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    ['--headless=new', '--disable-gpu', '--no-sandbox', '--dump-dom', url],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'headless fixture did not return a result');
+  return JSON.parse(encoded);
+};
+
+const resolveControlBundle = (markup, target) => {
+  const resolverSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_control_bundle_resolver.js'),
+    'utf8',
+  );
+  return renderFixture(`<!doctype html>
+    <main>
+      ${markup}
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const resolveReasoningControlBundle = ${resolverSource};
+      document.querySelector('#result').textContent = JSON.stringify(
+        resolveReasoningControlBundle(${JSON.stringify(target)}),
+      );
+    </script>`);
+};
+
 test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
   assert.match(
@@ -278,6 +308,264 @@ test('ChatGPT reasoning control bundle resolves a roleless marker with a nested 
     ordinal_conflict: false,
     semantic_effort: null,
     semantic_conflict: false,
+    tick_count: null,
+    lock_map_present: false,
+    locked_positions: null,
+    current_locked: false,
+    semantic_unknown: true,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control exposes a labeled lock map for a four segment slider', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement reasoning-hint"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="false">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="3" aria-valuenow="2"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+            <span data-locked="true"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">高，第 3 項，共 4 項。</div>
+        <div id="reasoning-hint">使用左右方向鍵調整。</div>
+      </div>
+    </div>`,
+    '高',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 3,
+    now: 2,
+    matched: true,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 3,
+    ordinal_total: 4,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: 'high',
+    semantic_conflict: false,
+    tick_count: 4,
+    lock_map_present: true,
+    locked_positions: [3],
+    current_locked: false,
+    semantic_unknown: false,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control resolves a three segment lock map from the container announcement', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="false">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="2" aria-valuenow="1"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">中，第 2 項，共 3 項。</div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 2,
+    now: 1,
+    matched: true,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 2,
+    ordinal_total: 3,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: 'medium',
+    semantic_conflict: false,
+    tick_count: 3,
+    lock_map_present: true,
+    locked_positions: [],
+    current_locked: false,
+    semantic_unknown: false,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control reports a root-only lock marker without failing closed', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="true">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="3" aria-valuenow="3"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">Pro，第 4 項，共 4 項。</div>
+      </div>
+    </div>`,
+    '高',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 3,
+    now: 3,
+    matched: false,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 4,
+    ordinal_total: 4,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: null,
+    semantic_conflict: false,
+    tick_count: null,
+    lock_map_present: false,
+    locked_positions: null,
+    current_locked: true,
+    semantic_unknown: true,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control reports the observed tick count when it disagrees with the slider span', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="false">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0"></span>
+            <span data-locked="false"></span>
+            <span data-locked="true"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">即時，第 1 項，共 3 項。</div>
+      </div>
+    </div>`,
+    '即時',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 2,
+    now: 0,
+    matched: true,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 1,
+    ordinal_total: 3,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: 'instant',
+    semantic_conflict: false,
+    tick_count: 2,
+    lock_map_present: true,
+    locked_positions: [1],
+    current_locked: false,
+    semantic_unknown: false,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control flags an unknown label and an upgrade-gated current position', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="3" aria-valuenow="3"></span>
+        </div>
+        <div id="reasoning-announcement">Pro，第 4 個，共 4 個。需要升級。</div>
+      </div>
+    </div>`,
+    '高',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 3,
+    now: 3,
+    matched: false,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 4,
+    ordinal_total: 4,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: null,
+    semantic_conflict: false,
+    tick_count: null,
+    lock_map_present: false,
+    locked_positions: null,
+    current_locked: true,
+    semantic_unknown: true,
     focused: true,
   });
 });
