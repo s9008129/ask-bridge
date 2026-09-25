@@ -4658,7 +4658,7 @@ mod tests {
         assert!(script.contains("unknown: ChatGPT did not render the submitted prompt"));
         assert!(!script.contains("normalize(latestText).includes(expectedText)"));
         assert!(script.contains("initialUserCount + 1"));
-        assert!(script.contains("verification: 'anchored_prompt_echo'"));
+        assert!(script.contains("verification: 'semantic_projection_v2'"));
         assert!(script.contains("data-chatgpt-search-unit-key"));
         assert!(!script.contains("__PROMPT__"));
         assert!(!script.contains("__PROMPT_ECHO_VERIFIER__"));
