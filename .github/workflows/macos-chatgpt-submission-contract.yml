@@ -37,6 +37,7 @@ jobs:
         run: |
           node --check src/chatgpt_prompt_input.js
           node --check src/chatgpt_upload.js
+          node --check src/chatgpt_prompt_echo_verifier.js
 
       - name: DOM contract tests
         run: npm test
