@@ -1775,6 +1775,7 @@ fn capabilities_value() -> Value {
             "safe_before_click_code": PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE,
             "unknown_after_click_code": PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE,
             "unknown_response_code": "prompt_submission_state_unknown",
+            "echo_verification": "semantic_projection_v2",
             "prompt_or_response_text_in_receipt": false
         },
         "verified_image_response_completion_v1": {
@@ -4648,9 +4649,9 @@ mod tests {
 
         assert!(script.contains("workflow prompt begins"));
         assert!(script.contains("normalize(readText(composer)).includes(expectedText)"));
-        assert!(script.contains("latestText.length >= minimumEchoLength"));
-        assert!(script.contains("requiredAnchors.every((anchor) => latestText.includes(anchor))"));
-        assert!(script.contains(r"expectedText.match(/\b[a-f0-9]{64}\b/i)"));
+        assert!(script.contains("verifyPromptEcho(prompt, latestText)"));
+        assert!(script.contains("semantic_projection_v2"));
+        assert!(script.contains("anchor_matches"));
         assert!(script.contains("attempt < 900"));
         assert!(script.contains("let submitClicked = false"));
         assert!(script.contains("safe: ChatGPT send button did not become active"));
@@ -4660,6 +4661,7 @@ mod tests {
         assert!(script.contains("verification: 'anchored_prompt_echo'"));
         assert!(script.contains("data-chatgpt-search-unit-key"));
         assert!(!script.contains("__PROMPT__"));
+        assert!(!script.contains("__PROMPT_ECHO_VERIFIER__"));
         assert!(!script.contains("__USER_SELECTOR__"));
         assert!(!script.contains("__SEND_SELECTORS__"));
         assert!(!script.contains("execCommand('insertText'"));
@@ -11334,12 +11336,14 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
     let user_selector_json = serde_json::to_string(Provider::ChatGpt.user_selector())
         .map_err(|_| "Failed to serialize ChatGPT user message selector".to_string())?;
     let send_selectors_json = Provider::ChatGpt.send_button_selectors_json();
+    let echo_verifier = include_str!("chatgpt_prompt_echo_verifier.js");
 
     Ok(r#"() => {
         const prompt = __PROMPT__;
         const userSelector = __USER_SELECTOR__;
         const sendSelectors = __SEND_SELECTORS__;
         const composerSelectors = __COMPOSER_SELECTORS__;
+        const verifyPromptEcho = __PROMPT_ECHO_VERIFIER__;
         const normalize = (value) => String(value || '')
             .normalize('NFC')
             .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -11395,22 +11399,14 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
                     }
                     const latestMessage = messages[messages.length - 1];
                     const latestText = normalize(latestMessage ? readText(latestMessage) : '');
-                    const anchorLength = Math.min(120, expectedText.length);
-                    const prefixAnchor = expectedText.slice(0, anchorLength);
-                    const middleStart = Math.max(0, Math.floor((expectedText.length - anchorLength) / 2));
-                    const middleAnchor = expectedText.slice(middleStart, middleStart + anchorLength);
-                    const suffixAnchor = expectedText.slice(-anchorLength);
-                    const digestAnchor = expectedText.match(/\b[a-f0-9]{64}\b/i)?.[0] || '';
-                    const requiredAnchors = [prefixAnchor, middleAnchor, suffixAnchor];
-                    if (digestAnchor) requiredAnchors.push(digestAnchor);
-                    const minimumEchoLength = Math.floor(expectedText.length * 0.9);
-                    const promptEchoVerified = latestText.length >= minimumEchoLength
-                        && requiredAnchors.every((anchor) => latestText.includes(anchor));
-                    if (messages.length === initialUserCount + 1 && promptEchoVerified) {
+                    const echo = verifyPromptEcho(prompt, latestText);
+                    if (messages.length === initialUserCount + 1 && echo.verified) {
                         window.__submit_status = 'success:' + JSON.stringify({
                             clicked: true,
                             user_message_verified: true,
-                            verification: 'anchored_prompt_echo'
+                            verification: 'semantic_projection_v2',
+                            anchor_matches: echo.anchor_matches,
+                            anchor_required: echo.anchor_required
                         });
                         return;
                     }
@@ -11425,6 +11421,7 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
         return true;
     }"#
     .replace("__PROMPT__", &prompt_json)
+    .replace("__PROMPT_ECHO_VERIFIER__", echo_verifier.trim())
     .replace("__USER_SELECTOR__", &user_selector_json)
     .replace("__SEND_SELECTORS__", send_selectors_json)
     .replace(
