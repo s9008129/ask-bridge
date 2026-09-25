@@ -73,7 +73,7 @@ struct LoginSignals {
 }
 
 impl LoginSignals {
-    fn state(self, provider: Provider) -> LoginState {
+    fn state(self, _provider: Provider) -> LoginState {
         if self.auth_path {
             LoginState::LoggedOut
         } else if self.account {
@@ -82,8 +82,6 @@ impl LoginSignals {
             LoginState::Unknown
         } else if self.auth_control {
             LoginState::LoggedOut
-        } else if self.composer && provider == Provider::ChatGpt {
-            LoginState::LoggedIn
         } else {
             LoginState::Unknown
         }
@@ -142,7 +140,20 @@ impl Provider {
 
     fn ready_check_js(self) -> &'static str {
         match self {
-            Provider::ChatGpt => r#"() => document.getElementById('prompt-textarea') !== null"#,
+            Provider::ChatGpt => {
+                r#"() => {
+                if (document.readyState !== 'complete' || !document.body) return false;
+                return Boolean(
+                    document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]') ||
+                    document.querySelector('[data-testid="profile-button"], button[aria-label*="個人檔案"]') ||
+                    Array.from(document.querySelectorAll('a, button')).some((el) =>
+                        /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册)$/i.test(
+                            (el.getAttribute('aria-label') || el.textContent || '').trim()
+                        )
+                    )
+                );
+            }"#
+            }
             Provider::Gemini => {
                 r#"() => {
                     return document.querySelector('div[role="textbox"][aria-label*="Gemini"]') !== null ||
@@ -209,6 +220,7 @@ impl Provider {
                             document.querySelector('button[aria-label*="User"]') ||
                             document.querySelector('button[aria-label*="user"]') ||
                             document.querySelector('button[aria-label*="帳戶"]') ||
+                            document.querySelector('button[aria-label*="個人檔案"]') ||
                             document.querySelector('button[aria-label*="使用者"]') ||
                             document.querySelector('button[aria-label*="設定檔"]');
 
@@ -6914,7 +6926,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_without_account_or_auth_controls_has_logged_in_state() {
+    fn composer_without_account_or_auth_controls_is_unknown() {
         let signals = LoginSignals {
             account: false,
             auth_control: false,
@@ -6923,7 +6935,7 @@ mod tests {
             stable: true,
         };
 
-        assert_eq!(signals.state(Provider::ChatGpt), LoginState::LoggedIn);
+        assert_eq!(signals.state(Provider::ChatGpt), LoginState::Unknown);
     }
 
     #[test]
