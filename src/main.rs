@@ -327,13 +327,12 @@ impl Provider {
 
     fn assistant_selector(self) -> &'static str {
         match self {
-            // ChatGPT currently renders a semantic assistant node inside an
-            // `.agent-turn` wrapper.  Selecting both naively counts the same
-            // turn twice and makes the response identity gate fail closed.
-            // Keep the wrapper as the canonical turn and only use the role
-            // marker when it is not nested in one.
+            // The current ChatGPT transcript exposes a keyed assistant unit.
+            // Keep the older turn/role markers as fallbacks, excluding a
+            // legacy wrapper when it contains the current keyed unit so one
+            // response is never counted twice.
             Provider::ChatGpt => {
-                ".agent-turn, [data-message-author-role=\"assistant\"]:not(.agent-turn *)"
+                r##"[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)"##
             }
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
@@ -342,7 +341,9 @@ impl Provider {
 
     fn user_selector(self) -> &'static str {
         match self {
-            Provider::ChatGpt => "[data-message-author-role=\"user\"]",
+            Provider::ChatGpt => {
+                r##"[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)"##
+            }
             Provider::Gemini => "user-query",
             Provider::Claude => "[data-testid=\"user-message\"], .font-user-message",
         }
@@ -350,9 +351,7 @@ impl Provider {
 
     fn latest_response_selector(self) -> &'static str {
         match self {
-            Provider::ChatGpt => {
-                "[data-message-author-role=\"assistant\"], .agent-turn, model-response, .model-response, [data-test-id*=\"response\"], [data-testid*=\"response\"]"
-            }
+            Provider::ChatGpt => Provider::ChatGpt.assistant_selector(),
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
         }
@@ -370,7 +369,9 @@ impl Provider {
 
     fn composer_selectors_json(self) -> &'static str {
         match self {
-            Provider::ChatGpt => r##"["#prompt-textarea"]"##,
+            Provider::ChatGpt => {
+                r##"["#prompt-textarea", "[data-testid=\"composer-text-input\"]", "[role=\"textbox\"][contenteditable=\"true\"]"]"##
+            }
             Provider::Gemini => {
                 r#"[
                     "div[role=\"textbox\"][aria-label*=\"Gemini\"]",
@@ -4058,10 +4059,11 @@ mod tests {
 
     #[test]
     fn chatgpt_assistant_selector_deduplicates_nested_role_nodes() {
-        assert_eq!(
-            Provider::ChatGpt.assistant_selector(),
-            ".agent-turn, [data-message-author-role=\"assistant\"]:not(.agent-turn *)"
-        );
+        let selector = Provider::ChatGpt.assistant_selector();
+        assert!(selector.starts_with("[data-chatgpt-search-unit-key$=\":assistant\"]"));
+        assert!(selector.contains(".agent-turn:not(:has("));
+        assert!(selector.contains("[data-message-author-role=\"assistant\"]"));
+        assert!(selector.contains(":not(.agent-turn *)"));
     }
 
     #[test]
@@ -4529,11 +4531,55 @@ mod tests {
         assert!(script.contains("provider_failure_visible"));
         assert!(script.contains("conversation_id"));
         assert!(script.contains("turn_id"));
+        assert!(script.contains("[data-turn-key]"));
         assert!(script.contains("artifact_ids"));
+        assert!(script.contains("data-chatgpt-selection-message-id"));
         assert!(script.contains("window.location.origin"));
         assert!(!script.contains("__TOKEN__"));
         assert!(!script.contains("__ASSISTANT_SELECTOR__"));
         assert!(!script.contains("__USER_SELECTOR__"));
+    }
+
+    #[test]
+    fn chatgpt_response_selectors_cover_current_and_legacy_transcripts() {
+        let assistant = Provider::ChatGpt.assistant_selector();
+        let user = Provider::ChatGpt.user_selector();
+
+        assert!(assistant.contains("[data-chatgpt-search-unit-key$=\":assistant\"]"));
+        assert!(assistant.contains(".agent-turn"));
+        assert!(assistant.contains("[data-message-author-role=\"assistant\"]"));
+        assert!(user.contains("[data-chatgpt-search-unit-key$=\":user\"]"));
+        assert!(user.contains("[data-message-author-role=\"user\"]"));
+        assert_eq!(Provider::ChatGpt.latest_response_selector(), assistant);
+    }
+
+    #[test]
+    fn chatgpt_submission_verifies_prompt_before_and_after_send() {
+        let prompt = format!(
+            "workflow prompt begins\n{}\nsource.sha256: {}\nworkflow prompt ends",
+            "required slide instructions ".repeat(40),
+            "a".repeat(64)
+        );
+        let script = build_chatgpt_prompt_submission_script(&prompt).unwrap();
+        let input_helper = include_str!("chatgpt_prompt_input.js");
+
+        assert!(script.contains("workflow prompt begins"));
+        assert!(script.contains("normalize(readText(composer)).includes(expectedText)"));
+        assert!(script.contains("latestText.length >= minimumEchoLength"));
+        assert!(script.contains("requiredAnchors.every((anchor) => latestText.includes(anchor))"));
+        assert!(script.contains(r"expectedText.match(/\b[a-f0-9]{64}\b/i)"));
+        assert!(script.contains("attempt < 900"));
+        assert!(!script.contains("normalize(latestText).includes(expectedText)"));
+        assert!(script.contains("initialUserCount + 1"));
+        assert!(script.contains("verification: 'anchored_prompt_echo'"));
+        assert!(script.contains("data-chatgpt-search-unit-key"));
+        assert!(!script.contains("__PROMPT__"));
+        assert!(!script.contains("__USER_SELECTOR__"));
+        assert!(!script.contains("__SEND_SELECTORS__"));
+        assert!(!script.contains("execCommand('insertText'"));
+        assert!(input_helper.contains("'Input.insertText'"));
+        assert!(input_helper.contains("process.stdin"));
+        assert!(input_helper.contains("__ask_bridge_prompt_input_token"));
     }
 
     #[test]
@@ -5810,10 +5856,10 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_document_policy_is_native_first_with_data_transfer_only_as_fallback() {
+    fn chatgpt_document_policy_does_not_retry_after_ambiguous_upload() {
         assert_eq!(
             document_upload_policy(Provider::ChatGpt),
-            DocumentUploadPolicy::NativeThenDataTransferFallback
+            DocumentUploadPolicy::NativeOnly
         );
     }
 
@@ -7373,7 +7419,7 @@ fn click_latest_copy_button(config_path: &str, provider: Provider) -> Result<(),
                     if (el.closest('pre, code, [class*="code"], [data-testid*="code"]')) return -1;
                     if (/copy-turn-action-button/i.test(label)) return 100;
                     if (/response|回應|回答|reply/i.test(label)) return 90;
-                    if (el.closest('model-response, response-container, [data-message-author-role="assistant"], .agent-turn, [data-is-streaming], .font-claude-response')) return 50;
+                    if (el.closest('[data-turn-key], [data-chatgpt-search-unit-key$=":assistant"], model-response, response-container, [data-message-author-role="assistant"], .agent-turn, [data-is-streaming], .font-claude-response')) return 50;
                     return 10;
                 };
                 const messages = Array.from(document.querySelectorAll(__RESPONSE_SELECTOR__));
@@ -7853,9 +7899,12 @@ fn download_images_from_latest_message(
                         const semanticIdentity = (element) => {
                             const turn = element
                                 ? (element.closest('section[data-turn="assistant"][data-turn-id]') ||
-                                    element.closest('[data-turn="assistant"][data-turn-id]') || element)
+                                    element.closest('[data-turn="assistant"][data-turn-id]') ||
+                                    element.closest('[data-turn-key]') || element)
                                 : null;
-                            const turnId = turn?.getAttribute('data-turn-id') || '';
+                            const turnId = turn?.getAttribute('data-turn-id') ||
+                                turn?.getAttribute('data-turn-key') ||
+                                element?.getAttribute('data-chatgpt-selection-message-id') || '';
                             const artifactIds = turn
                                 ? Array.from(turn.querySelectorAll('[id^="image-"]'))
                                     .map((candidate) => candidate.id)
@@ -8358,6 +8407,12 @@ fn build_attachment_probe_script(
 ) -> Result<String, String> {
     let expected_names = serde_json::to_string(expected_file_names)
         .map_err(|_| "無法建立附件驗證 probe".to_string())?;
+    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
+        "[class*=\"group/composer-attachment\"]"
+    } else {
+        "[class*=\"attachment\"]"
+    })
+    .map_err(|_| "無法建立附件 class probe".to_string())?;
     let script = r#"() => {
         const expectedNames = __EXPECTED_NAMES__;
         const composerSelectors = __COMPOSER_SELECTORS__;
@@ -8394,7 +8449,7 @@ fn build_attachment_probe_script(
             '[data-testid*="file-pill"]',
             '[data-testid*="file-preview"]',
             '[data-testid*="file-thumbnail"]',
-            '[class*="attachment"]',
+            __ATTACHMENT_CLASS_SELECTOR__,
             '[class*="file-tile"]',
             '[class*="file-chip"]',
             '[class*="file-pill"]',
@@ -8420,12 +8475,19 @@ fn build_attachment_probe_script(
         for (const name of expectedNames) {
             expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
         }
+        const matchesExpected = (text, name) => {
+            if (text.includes(name)) return true;
+            const dot = name.lastIndexOf('.');
+            if (dot < 0) return false;
+            const escape = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
+        };
         const observedCounts = new Map();
         let unmatchedVisibleCandidates = 0;
         for (const candidate of filteredLeaves) {
             const text = textFor(candidate);
             const matches = Array.from(expectedCounts.keys())
-                .filter((name) => text.includes(name))
+                .filter((name) => matchesExpected(text, name))
                 .sort((left, right) => right.length - left.length);
             if (matches.length > 0) {
                 const name = matches[0];
@@ -8486,6 +8548,7 @@ fn build_attachment_probe_script(
         };
     }"#
     .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
     .replace(
         "__COMPOSER_SELECTORS__",
         provider.composer_selectors_json(),
@@ -8507,6 +8570,7 @@ fn verify_attachment_completion(
     let deadline = McpOperationDeadline::from_timeout(verify_timeout)
         .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
     let mut tracker = AttachmentVerificationTracker::new(expected_file_names.len());
+    let mut last_probe = None;
     loop {
         let response = call_mcp_tool_with_deadline(
             config_path,
@@ -8519,6 +8583,10 @@ fn verify_attachment_completion(
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
         let probe: AttachmentProbe = serde_json::from_value(value)
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if verbose && last_probe.as_ref() != Some(&probe) {
+            println!("Attachment probe: {:?}", probe);
+            last_probe = Some(probe.clone());
+        }
         if tracker.observe(probe)? {
             if verbose {
                 println!(
@@ -8549,6 +8617,12 @@ fn build_typed_attachment_probe_script(
 ) -> Result<String, String> {
     let expected_names = serde_json::to_string(expected_document_names)
         .map_err(|_| "無法建立 typed 附件驗證 probe".to_string())?;
+    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
+        "[class*=\"group/composer-attachment\"]"
+    } else {
+        "[class*=\"attachment\"]"
+    })
+    .map_err(|_| "無法建立附件 class probe".to_string())?;
     let script = r#"() => {
         const expectedNames = __EXPECTED_NAMES__;
         const composerSelectors = __COMPOSER_SELECTORS__;
@@ -8584,7 +8658,8 @@ fn build_typed_attachment_probe_script(
             '[class*="file-chip"]',
             '[class*="file-pill"]',
             '[class*="file-preview"]',
-            '[class*="file-thumbnail"]'
+            '[class*="file-thumbnail"]',
+            __ATTACHMENT_CLASS_SELECTOR__
         ].join(',');
         const allTiles = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
         // Only keep tiles that are leaf-level (no child tile inside them).
@@ -8602,6 +8677,13 @@ fn build_typed_attachment_probe_script(
         for (const name of expectedNames) {
             expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
         }
+        const matchesExpected = (text, name) => {
+            if (text.includes(name)) return true;
+            const dot = name.lastIndexOf('.');
+            if (dot < 0) return false;
+            const escape = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
+        };
         const observedCounts = new Map();
         let documentCount = 0;
         // A tile counts as a document if its text contains one of the
@@ -8609,7 +8691,7 @@ fn build_typed_attachment_probe_script(
         for (const candidate of docCandidates) {
             const text = textFor(candidate);
             const matches = Array.from(expectedCounts.keys())
-                .filter((name) => text.includes(name))
+                .filter((name) => matchesExpected(text, name))
                 .sort((a, b) => b.length - a.length);
             if (matches.length > 0) {
                 const name = matches[0];
@@ -8651,6 +8733,7 @@ fn build_typed_attachment_probe_script(
         };
     }"#
     .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
     .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json());
     Ok(script)
 }
@@ -8745,6 +8828,40 @@ fn upload_attachments_via_file_chooser(
             .map_err(|_| "Failed to resolve an attachment for native upload".to_string())?;
         let file_path = canonical_path.to_string_lossy().to_string();
 
+        if provider == Provider::ChatGpt {
+            let is_image = index < image_paths.len();
+            let token = uuid::Uuid::new_v4().to_string();
+            let token_json =
+                serde_json::to_string(&token).map_err(|_| "Upload token failed".to_string())?;
+            let marker = format!(
+                "() => {{ window.__ask_bridge_upload_token = {}; return true; }}",
+                token_json
+            );
+            call_mcp_tool(
+                config_path,
+                "evaluate_script",
+                serde_json::json!({ "function": marker }),
+            )?;
+            let output = Command::new("node")
+                .arg("-e")
+                .arg(include_str!("chatgpt_upload.js"))
+                .arg(&token)
+                .arg(&file_path)
+                .arg(if is_image { "image" } else { "document" })
+                .output()
+                .map_err(|_| "ChatGPT native upload helper unavailable".to_string())?;
+            if !output.status.success() {
+                if verbose {
+                    eprintln!(
+                        "ChatGPT upload diagnostic: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                return Err("ChatGPT native file upload failed".to_string());
+            }
+            continue;
+        }
+
         let snapshot = take_snapshot_text(config_path)
             .map_err(|_| "Native attachment upload menu was unavailable".to_string())?;
         let menu_uid = match provider {
@@ -8752,7 +8869,8 @@ fn upload_attachments_via_file_chooser(
                 find_snapshot_uid(&snapshot, &["上傳與工具"], &["更多", "雲端", "drive"])
                     .or_else(|| find_snapshot_uid(&snapshot, &["upload"], &["drive"]))
             }
-            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"]),
+            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["新增檔案和更多內容"], &[])
+                .or_else(|| find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"])),
             Provider::Claude => find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"])
                 .or_else(|| find_snapshot_uid(&snapshot, &["upload"], &["drive"])),
         }
@@ -8779,7 +8897,9 @@ fn upload_attachments_via_file_chooser(
         let upload_uid = match provider {
             Provider::Gemini => find_snapshot_uid(&snapshot, &["上傳檔案"], &["雲端", "drive"])
                 .or_else(|| find_snapshot_uid(&snapshot, &["upload", "file"], &["drive"])),
-            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"]),
+            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["新增相片與檔案"], &[])
+                .or_else(|| find_snapshot_uid(&snapshot, &["上傳檔案"], &["雲端"]))
+                .or_else(|| find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"])),
             Provider::Claude => {
                 find_snapshot_uid(&snapshot, &["upload", "file"], &["drive", "connect"])
                     .or_else(|| find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"]))
@@ -8829,15 +8949,15 @@ where
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DocumentUploadPolicy {
+    NativeOnly,
     NativeThenDataTransferFallback,
     DataTransferOnly,
 }
 
 fn document_upload_policy(provider: Provider) -> DocumentUploadPolicy {
     match provider {
-        Provider::ChatGpt | Provider::Claude => {
-            DocumentUploadPolicy::NativeThenDataTransferFallback
-        }
+        Provider::ChatGpt => DocumentUploadPolicy::NativeOnly,
+        Provider::Claude => DocumentUploadPolicy::NativeThenDataTransferFallback,
         Provider::Gemini => DocumentUploadPolicy::DataTransferOnly,
     }
 }
@@ -9123,6 +9243,17 @@ fn upload_attachments_to_provider(
 
     // 1. Documents first.
     match document_upload_policy(provider) {
+        DocumentUploadPolicy::NativeOnly => {
+            for path in file_paths {
+                upload_attachments_via_file_chooser(
+                    config_path,
+                    provider,
+                    &[],
+                    std::slice::from_ref(path),
+                    verbose,
+                )?;
+            }
+        }
         DocumentUploadPolicy::NativeThenDataTransferFallback => {
             for path in file_paths {
                 run_native_then_fallback(
@@ -9177,7 +9308,16 @@ fn upload_attachments_to_provider(
                     },
                 )?;
             }
-            Provider::ChatGpt | Provider::Claude => {
+            Provider::ChatGpt => {
+                upload_attachments_via_file_chooser(
+                    config_path,
+                    provider,
+                    image_paths,
+                    &[],
+                    verbose,
+                )?;
+            }
+            Provider::Claude => {
                 upload_attachments_via_data_transfer(
                     config_path,
                     provider,
@@ -9541,7 +9681,7 @@ fn build_chatgpt_model_selection_script(target_json: &str) -> String {
             await closeMenus();
             let pill = null;
             for (let attempt = 0; attempt < 20; attempt++) {
-                pill = document.querySelector('button.__composer-pill');
+                pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
                 if (pill && isVisible(pill)) break;
                 await sleep(250);
             }
@@ -9888,7 +10028,7 @@ fn build_chatgpt_reopen_slider_script() -> String {
                     style.opacity !== '0' && rect.width > 0 && rect.height > 0;
             };
             const resolveReasoningControlBundle = __CONTROL_BUNDLE_RESOLVER__;
-            const pill = document.querySelector('button.__composer-pill');
+            const pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
             if (!pill || !isVisible(pill)) {
                 window.__reopen_model_status = 'error: composer pill not found';
                 return;
@@ -10561,6 +10701,41 @@ fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
     Ok(status)
 }
 
+fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, String> {
+    let mut status = String::from("pending");
+    let deadline = McpOperationDeadline::from_timeout(Duration::from_secs(100))?;
+
+    // The page verifier allows 90 seconds for ChatGPT to materialize a large
+    // prompt with attachments. Leave a small margin for the final status poll.
+    while status == "pending" && Instant::now() < deadline.expires_at {
+        thread::sleep(Duration::from_millis(500));
+        let check_res = call_mcp_tool_with_deadline(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({
+                "function": "() => window.__submit_status || 'pending'"
+            }),
+            Some(deadline),
+        )?;
+        if let Some(next_status) = parse_script_result(&check_res)
+            .ok()
+            .and_then(|parsed| parsed.as_str().map(str::to_string))
+        {
+            status = next_status;
+        }
+    }
+
+    if status.starts_with("error:") {
+        return Err(status);
+    }
+
+    if status == "pending" {
+        return Err("Timed out waiting for ChatGPT to render the submitted prompt".to_string());
+    }
+
+    Ok(status)
+}
+
 fn focus_and_clear_composer(config_path: &str, provider: Provider) -> Result<(), String> {
     let js = r#"() => {
             const composerSelectors = __COMPOSER_SELECTORS__;
@@ -10628,7 +10803,7 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             };
-            const composer = document.querySelector('#prompt-textarea');
+            const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
             const composerRect = composer ? composer.getBoundingClientRect() : null;
             const isNearComposer = (el) => {
                 if (!composerRect) return true;
@@ -10676,7 +10851,7 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
 
 fn wait_for_chatgpt_agent_selection(config_path: &str) -> Result<(), String> {
     let js = r#"() => {
-            const composer = document.querySelector('#prompt-textarea');
+            const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
             if (!composer) {
                 return { ok: false, error: 'composer not found' };
             }
@@ -10719,7 +10894,12 @@ fn submit_regular_prompt(
     config_path: &str,
     provider: Provider,
     prompt: &str,
+    verbose: bool,
 ) -> Result<String, String> {
+    if provider == Provider::ChatGpt {
+        return submit_chatgpt_regular_prompt(config_path, prompt, verbose);
+    }
+
     let prompt_json = serde_json::to_string(prompt)
         .map_err(|e| format!("Failed to serialize prompt text: {}", e))?;
     let set_and_submit_js = r#"() => {
@@ -10884,7 +11064,7 @@ fn submit_chatgpt_agent_prompt(
             (async () => {
                 try {
                     const sendSelectors = __SEND_SELECTORS__;
-                    const el = document.querySelector('#prompt-textarea');
+                    const el = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
                     if (!el) {
                         window.__submit_status = 'error: composer not found';
                         return;
@@ -11007,6 +11187,182 @@ fn submit_chatgpt_agent_prompt(
     wait_for_submit_status(config_path)
 }
 
+fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String> {
+    let prompt_json =
+        serde_json::to_string(prompt).map_err(|_| "Failed to serialize prompt text".to_string())?;
+    let user_selector_json = serde_json::to_string(Provider::ChatGpt.user_selector())
+        .map_err(|_| "Failed to serialize ChatGPT user message selector".to_string())?;
+    let send_selectors_json = Provider::ChatGpt.send_button_selectors_json();
+
+    Ok(r#"() => {
+        const prompt = __PROMPT__;
+        const userSelector = __USER_SELECTOR__;
+        const sendSelectors = __SEND_SELECTORS__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const normalize = (value) => String(value || '')
+            .normalize('NFC')
+            .replace(/[\u200B-\u200D\uFEFF]/g, '')
+            .replace(/\s+/gu, ' ')
+            .trim();
+        const readText = (element) => typeof element.value === 'string'
+            ? element.value
+            : (element.innerText || element.textContent || '');
+        const isVisibleAndEnabled = (element) => {
+            if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const expectedText = normalize(prompt);
+        const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(isVisibleAndEnabled);
+        const initialUserCount = document.querySelectorAll(userSelector).length;
+
+        window.__submit_status = 'pending';
+        (async () => {
+            try {
+                if (!composer || !expectedText) {
+                    window.__submit_status = 'error: ChatGPT composer or prompt was empty';
+                    return;
+                }
+                if (!normalize(readText(composer)).includes(expectedText)) {
+                    window.__submit_status = 'error: prompt text was not present in the ChatGPT composer';
+                    return;
+                }
+
+                let button = null;
+                for (let attempt = 0; attempt < 150; attempt += 1) {
+                    button = sendSelectors
+                        .map((selector) => document.querySelector(selector))
+                        .find(isVisibleAndEnabled);
+                    if (button) break;
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                if (!button) {
+                    window.__submit_status = 'error: ChatGPT send button did not become active';
+                    return;
+                }
+                button.click();
+
+                for (let attempt = 0; attempt < 900; attempt += 1) {
+                    const messages = Array.from(document.querySelectorAll(userSelector));
+                    if (messages.length > initialUserCount + 1) {
+                        window.__submit_status = 'error: unexpected ChatGPT user message count after submit';
+                        return;
+                    }
+                    const latestMessage = messages[messages.length - 1];
+                    const latestText = normalize(latestMessage ? readText(latestMessage) : '');
+                    const anchorLength = Math.min(120, expectedText.length);
+                    const prefixAnchor = expectedText.slice(0, anchorLength);
+                    const middleStart = Math.max(0, Math.floor((expectedText.length - anchorLength) / 2));
+                    const middleAnchor = expectedText.slice(middleStart, middleStart + anchorLength);
+                    const suffixAnchor = expectedText.slice(-anchorLength);
+                    const digestAnchor = expectedText.match(/\b[a-f0-9]{64}\b/i)?.[0] || '';
+                    const requiredAnchors = [prefixAnchor, middleAnchor, suffixAnchor];
+                    if (digestAnchor) requiredAnchors.push(digestAnchor);
+                    const minimumEchoLength = Math.floor(expectedText.length * 0.9);
+                    const promptEchoVerified = latestText.length >= minimumEchoLength
+                        && requiredAnchors.every((anchor) => latestText.includes(anchor));
+                    if (messages.length === initialUserCount + 1 && promptEchoVerified) {
+                        window.__submit_status = 'success:' + JSON.stringify({
+                            clicked: true,
+                            user_message_verified: true,
+                            verification: 'anchored_prompt_echo'
+                        });
+                        return;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                window.__submit_status = 'error: ChatGPT did not render the submitted prompt in the conversation';
+            } catch (error) {
+                window.__submit_status = 'error: ChatGPT submission verification failed';
+            }
+        })();
+        return true;
+    }"#
+    .replace("__PROMPT__", &prompt_json)
+    .replace("__USER_SELECTOR__", &user_selector_json)
+    .replace("__SEND_SELECTORS__", send_selectors_json)
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        Provider::ChatGpt.composer_selectors_json(),
+    ))
+}
+
+fn insert_chatgpt_prompt_text(
+    config_path: &str,
+    prompt: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    let token = Uuid::new_v4().to_string();
+    let token_json = serde_json::to_string(&token)
+        .map_err(|_| "Failed to serialize prompt token".to_string())?;
+    let marker_js = format!(
+        "() => {{ window.__ask_bridge_prompt_input_token = {}; return true; }}",
+        token_json
+    );
+    let marked = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": marker_js }),
+    )?;
+    if !parse_script_result(&marked)?.as_bool().unwrap_or(false) {
+        return Err("Failed to mark the owned ChatGPT page for prompt input".to_string());
+    }
+
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(include_str!("chatgpt_prompt_input.js"))
+        .arg(&token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "ChatGPT native prompt input helper unavailable".to_string())?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ChatGPT prompt input pipe unavailable".to_string())?
+        .write_all(prompt.as_bytes());
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("ChatGPT prompt input could not be sent: {}", error));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "ChatGPT native prompt input did not finish".to_string())?;
+    if !output.status.success() || output.stdout.as_slice() != b"prompt-inserted\n" {
+        if verbose {
+            let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !diagnostic.is_empty() {
+                eprintln!("ChatGPT prompt input diagnostic: {}", diagnostic);
+            }
+        }
+        return Err("ChatGPT native prompt input failed".to_string());
+    }
+    Ok(())
+}
+
+fn submit_chatgpt_regular_prompt(
+    config_path: &str,
+    prompt: &str,
+    verbose: bool,
+) -> Result<String, String> {
+    insert_chatgpt_prompt_text(config_path, prompt, verbose)?;
+    let submit_js = build_chatgpt_prompt_submission_script(prompt)?;
+    let started = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": submit_js }),
+    )?;
+    if !parse_script_result(&started)?.as_bool().unwrap_or(false) {
+        return Err("Failed to start verified ChatGPT prompt submission".to_string());
+    }
+
+    wait_for_chatgpt_submit_status(config_path)
+}
+
 fn submit_prompt_to_provider(
     config_path: &str,
     provider: Provider,
@@ -11019,7 +11375,7 @@ fn submit_prompt_to_provider(
         return submit_chatgpt_agent_prompt(config_path, &parts, verbose);
     }
 
-    submit_regular_prompt(config_path, provider, prompt)
+    submit_regular_prompt(config_path, provider, prompt, verbose)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11149,9 +11505,12 @@ fn build_response_probe_script(
             const latest = messages[messages.length - 1] || null;
             const turn = latest
                 ? (latest.closest('section[data-turn="assistant"][data-turn-id]') ||
-                    latest.closest('[data-turn="assistant"][data-turn-id]') || latest)
+                    latest.closest('[data-turn="assistant"][data-turn-id]') ||
+                    latest.closest('[data-turn-key]') || latest)
                 : null;
-            const turnId = turn?.getAttribute('data-turn-id') || '';
+            const turnId = turn?.getAttribute('data-turn-id') ||
+                turn?.getAttribute('data-turn-key') ||
+                latest?.getAttribute('data-chatgpt-selection-message-id') || '';
             const artifactIds = turn
                 ? Array.from(turn.querySelectorAll('[id^="image-"]'))
                     .map((element) => element.id)
@@ -11643,6 +12002,35 @@ fn check_login_status(
         );
     }
     Ok(signals.state(provider))
+}
+
+fn wait_for_chatgpt_composer(config_path: &str) -> Result<(), String> {
+    let script = format!(
+        "() => {{ const selectors = {}; const visible = (el) => {{ if (!el) return false; const rect = el.getBoundingClientRect(); const style = getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'; }}; return selectors.some((selector) => visible(document.querySelector(selector))); }}",
+        Provider::ChatGpt.composer_selectors_json()
+    );
+    let mut consecutive_ready = 0;
+    for _ in 0..60 {
+        let ready = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": script }),
+        )
+        .ok()
+        .and_then(|response| parse_script_result(&response).ok())
+        .and_then(|value| value.as_bool())
+            == Some(true);
+        if ready {
+            consecutive_ready += 1;
+            if consecutive_ready >= 6 {
+                return Ok(());
+            }
+        } else {
+            consecutive_ready = 0;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err("ChatGPT composer did not become ready".to_string())
 }
 
 fn wait_for_login_completion(
@@ -12337,6 +12725,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Err(_) => {}
+    }
+
+    if provider == Provider::ChatGpt {
+        wait_for_chatgpt_composer(&config_path)?;
     }
 
     // Switch model if requested (before uploading attachments / typing the prompt).
