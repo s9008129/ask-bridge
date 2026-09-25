@@ -28,11 +28,15 @@ const VERIFIED_MODEL_SELECTION_V3_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v4";
 const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v5";
 const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
+const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
 const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
+const PROMPT_SUBMISSION_FAILURE_STAGE: &str = "prompt_submission";
+const PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE: &str = "PROMPT_SUBMISSION_PRECLICK_FAILED";
+const PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE: &str = "PROMPT_SUBMISSION_STATE_UNKNOWN";
 
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dynamic attachment verification timeout scaled by the number of files.
@@ -791,6 +795,7 @@ enum ResponseFailureCode {
     ProviderRejected,
     ResponseProbeFailed,
     ResponseTimeout,
+    PromptSubmissionStateUnknown,
     ImageDownloadEmpty,
     ImageDownloadFailed,
 }
@@ -805,6 +810,7 @@ impl fmt::Display for ResponseFailureCode {
             ResponseFailureCode::ProviderRejected => "provider_rejected",
             ResponseFailureCode::ResponseProbeFailed => "response_probe_failed",
             ResponseFailureCode::ResponseTimeout => "response_timeout",
+            ResponseFailureCode::PromptSubmissionStateUnknown => "prompt_submission_state_unknown",
             ResponseFailureCode::ImageDownloadEmpty => "image_download_empty",
             ResponseFailureCode::ImageDownloadFailed => "image_download_failed",
         })
@@ -1202,6 +1208,7 @@ impl SessionReceipt {
                 VERIFIED_MODEL_SELECTION_V4_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V5_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V6_CAPABILITY.to_string(),
+                VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
@@ -1228,6 +1235,39 @@ enum SessionReceiptEvent {
     AttachmentsFailed,
     PromptIntentRecorded,
     PromptSubmitted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptSubmissionFailureDisposition {
+    SafeBeforeClick,
+    UnknownAfterClick,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptSubmissionFailure {
+    disposition: PromptSubmissionFailureDisposition,
+    message: String,
+}
+
+impl PromptSubmissionFailure {
+    fn safe(message: impl Into<String>) -> Self {
+        Self {
+            disposition: PromptSubmissionFailureDisposition::SafeBeforeClick,
+            message: message.into(),
+        }
+    }
+
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            disposition: PromptSubmissionFailureDisposition::UnknownAfterClick,
+            message: message.into(),
+        }
+    }
+
+    fn with_context(mut self, context: &str) -> Self {
+        self.message = format!("{}: {}", context, self.message);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1574,6 +1614,41 @@ fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Resu
     Ok(())
 }
 
+fn record_prompt_submission_failure(
+    path: &Path,
+    disposition: PromptSubmissionFailureDisposition,
+) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.attachment_verification != AttachmentVerification::Verified
+        || receipt.prompt_submission != PromptSubmission::IntentRecorded
+    {
+        return Err("prompt submission failure receipt 狀態不合法".to_string());
+    }
+    if receipt.response_completion != ResponseCompletion::Pending {
+        return Err("prompt submission failure 不得覆寫既有 response 終態".to_string());
+    }
+
+    receipt.failure_stage = Some(PROMPT_SUBMISSION_FAILURE_STAGE.to_string());
+    match disposition {
+        PromptSubmissionFailureDisposition::SafeBeforeClick => {
+            receipt.failure_code = Some(PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE.to_string());
+            receipt.response_failure_code = None;
+        }
+        PromptSubmissionFailureDisposition::UnknownAfterClick => {
+            receipt.failure_code = Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE.to_string());
+            receipt.response_completion = ResponseCompletion::Unknown;
+            receipt.response_failure_code = Some(ResponseFailureCode::PromptSubmissionStateUnknown);
+        }
+    }
+
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("prompt submission failure receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
 fn record_session_response_outcome(
     path: &Path,
     completion: ResponseCompletion,
@@ -1660,7 +1735,8 @@ fn capabilities_value() -> Value {
             VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V6_CAPABILITY
+            VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
+            VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1693,6 +1769,14 @@ fn capabilities_value() -> Value {
             "timeout_per_file_seconds": 15,
             "submit_before_verified": false,
             "receipt_fields": ["attachment_probe"]
+        },
+        "verified_prompt_submission_outcome_v1": {
+            "failure_stage": PROMPT_SUBMISSION_FAILURE_STAGE,
+            "safe_before_click_code": PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE,
+            "unknown_after_click_code": PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE,
+            "unknown_response_code": "prompt_submission_state_unknown",
+            "echo_verification": "semantic_projection_v2",
+            "prompt_or_response_text_in_receipt": false
         },
         "verified_image_response_completion_v1": {
             "expected_output_flag": "--image-output",
@@ -4565,15 +4649,19 @@ mod tests {
 
         assert!(script.contains("workflow prompt begins"));
         assert!(script.contains("normalize(readText(composer)).includes(expectedText)"));
-        assert!(script.contains("latestText.length >= minimumEchoLength"));
-        assert!(script.contains("requiredAnchors.every((anchor) => latestText.includes(anchor))"));
-        assert!(script.contains(r"expectedText.match(/\b[a-f0-9]{64}\b/i)"));
+        assert!(script.contains("verifyPromptEcho(prompt, latestText)"));
+        assert!(script.contains("semantic_projection_v2"));
+        assert!(script.contains("anchor_matches"));
         assert!(script.contains("attempt < 900"));
+        assert!(script.contains("let submitClicked = false"));
+        assert!(script.contains("safe: ChatGPT send button did not become active"));
+        assert!(script.contains("unknown: ChatGPT did not render the submitted prompt"));
         assert!(!script.contains("normalize(latestText).includes(expectedText)"));
         assert!(script.contains("initialUserCount + 1"));
-        assert!(script.contains("verification: 'anchored_prompt_echo'"));
+        assert!(script.contains("verification: 'semantic_projection_v2'"));
         assert!(script.contains("data-chatgpt-search-unit-key"));
         assert!(!script.contains("__PROMPT__"));
+        assert!(!script.contains("__PROMPT_ECHO_VERIFIER__"));
         assert!(!script.contains("__USER_SELECTOR__"));
         assert!(!script.contains("__SEND_SELECTORS__"));
         assert!(!script.contains("execCommand('insertText'"));
@@ -6151,24 +6239,71 @@ mod tests {
     }
 
     #[test]
-    fn submit_failure_after_durable_intent_remains_unknown() {
-        let root = make_test_dir("submit_intent_gate");
-        let path = root.join("receipt.json");
-        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
-        let result = execute_verified_prompt_submission(
-            Some(&path),
+    fn submit_failure_after_durable_intent_records_safe_and_unknown_outcomes() {
+        let safe_root = make_test_dir("submit_intent_safe_gate");
+        let safe_path = safe_root.join("receipt.json");
+        write_private_json(&safe_path, &SessionReceipt::new(0, 0)).unwrap();
+        let safe_result = execute_verified_prompt_submission(
+            Some(&safe_path),
             || Ok(()),
             || Ok(0usize),
-            || Err("browser submit state unknown".to_string()),
+            || Err(PromptSubmissionFailure::safe("send button unavailable")),
         );
-        assert!(result.is_err());
-        let receipt = read_session_receipt(&path).unwrap();
+        assert!(safe_result.is_err());
+        let safe = read_session_receipt(&safe_path).unwrap();
         assert_eq!(
-            receipt.attachment_verification,
+            safe.attachment_verification,
             AttachmentVerification::Verified
         );
-        assert_eq!(receipt.prompt_submission, PromptSubmission::IntentRecorded);
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(safe.prompt_submission, PromptSubmission::IntentRecorded);
+        assert_eq!(
+            safe.failure_stage.as_deref(),
+            Some(PROMPT_SUBMISSION_FAILURE_STAGE)
+        );
+        assert_eq!(
+            safe.failure_code.as_deref(),
+            Some(PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE)
+        );
+        assert_eq!(safe.response_completion, ResponseCompletion::Pending);
+        assert_eq!(safe.response_failure_code, None);
+
+        let unknown_root = make_test_dir("submit_intent_unknown_gate");
+        let unknown_path = unknown_root.join("receipt.json");
+        write_private_json(&unknown_path, &SessionReceipt::new(0, 0)).unwrap();
+        let unknown_result = execute_verified_prompt_submission(
+            Some(&unknown_path),
+            || Ok(()),
+            || Ok(0usize),
+            || Err(PromptSubmissionFailure::unknown("user turn echo missing")),
+        );
+        assert!(unknown_result.is_err());
+        let unknown = read_session_receipt(&unknown_path).unwrap();
+        assert_eq!(
+            unknown.attachment_verification,
+            AttachmentVerification::Verified
+        );
+        assert_eq!(unknown.prompt_submission, PromptSubmission::IntentRecorded);
+        assert_eq!(
+            unknown.failure_stage.as_deref(),
+            Some(PROMPT_SUBMISSION_FAILURE_STAGE)
+        );
+        assert_eq!(
+            unknown.failure_code.as_deref(),
+            Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE)
+        );
+        assert_eq!(unknown.response_completion, ResponseCompletion::Unknown);
+        assert_eq!(
+            unknown.response_failure_code,
+            Some(ResponseFailureCode::PromptSubmissionStateUnknown)
+        );
+
+        let safe_json = std::fs::read_to_string(&safe_path).unwrap();
+        let unknown_json = std::fs::read_to_string(&unknown_path).unwrap();
+        assert!(!safe_json.contains("send button unavailable"));
+        assert!(!unknown_json.contains("user turn echo missing"));
+
+        std::fs::remove_dir_all(safe_root).unwrap();
+        std::fs::remove_dir_all(unknown_root).unwrap();
     }
 
     #[test]
@@ -10701,9 +10836,10 @@ fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
     Ok(status)
 }
 
-fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, String> {
+fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, PromptSubmissionFailure> {
     let mut status = String::from("pending");
-    let deadline = McpOperationDeadline::from_timeout(Duration::from_secs(100))?;
+    let deadline = McpOperationDeadline::from_timeout(Duration::from_secs(100))
+        .map_err(PromptSubmissionFailure::unknown)?;
 
     // The page verifier allows 90 seconds for ChatGPT to materialize a large
     // prompt with attachments. Leave a small margin for the final status poll.
@@ -10716,7 +10852,8 @@ fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, String> {
                 "function": "() => window.__submit_status || 'pending'"
             }),
             Some(deadline),
-        )?;
+        )
+        .map_err(PromptSubmissionFailure::unknown)?;
         if let Some(next_status) = parse_script_result(&check_res)
             .ok()
             .and_then(|parsed| parsed.as_str().map(str::to_string))
@@ -10725,12 +10862,22 @@ fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, String> {
         }
     }
 
-    if status.starts_with("error:") {
-        return Err(status);
+    if let Some(message) = status.strip_prefix("safe:") {
+        return Err(PromptSubmissionFailure::safe(message.trim()));
+    }
+    if let Some(message) = status.strip_prefix("unknown:") {
+        return Err(PromptSubmissionFailure::unknown(message.trim()));
+    }
+    if let Some(message) = status.strip_prefix("error:") {
+        // Legacy/unclassified page status is fail-closed because the click
+        // may already have happened.
+        return Err(PromptSubmissionFailure::unknown(message.trim()));
     }
 
     if status == "pending" {
-        return Err("Timed out waiting for ChatGPT to render the submitted prompt".to_string());
+        return Err(PromptSubmissionFailure::unknown(
+            "Timed out waiting for ChatGPT to render the submitted prompt",
+        ));
     }
 
     Ok(status)
@@ -10894,12 +11041,8 @@ fn submit_regular_prompt(
     config_path: &str,
     provider: Provider,
     prompt: &str,
-    verbose: bool,
+    _verbose: bool,
 ) -> Result<String, String> {
-    if provider == Provider::ChatGpt {
-        return submit_chatgpt_regular_prompt(config_path, prompt, verbose);
-    }
-
     let prompt_json = serde_json::to_string(prompt)
         .map_err(|e| format!("Failed to serialize prompt text: {}", e))?;
     let set_and_submit_js = r#"() => {
@@ -11193,12 +11336,14 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
     let user_selector_json = serde_json::to_string(Provider::ChatGpt.user_selector())
         .map_err(|_| "Failed to serialize ChatGPT user message selector".to_string())?;
     let send_selectors_json = Provider::ChatGpt.send_button_selectors_json();
+    let echo_verifier = include_str!("chatgpt_prompt_echo_verifier.js");
 
     Ok(r#"() => {
         const prompt = __PROMPT__;
         const userSelector = __USER_SELECTOR__;
         const sendSelectors = __SEND_SELECTORS__;
         const composerSelectors = __COMPOSER_SELECTORS__;
+        const verifyPromptEcho = __PROMPT_ECHO_VERIFIER__;
         const normalize = (value) => String(value || '')
             .normalize('NFC')
             .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -11220,13 +11365,14 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
 
         window.__submit_status = 'pending';
         (async () => {
+            let submitClicked = false;
             try {
                 if (!composer || !expectedText) {
-                    window.__submit_status = 'error: ChatGPT composer or prompt was empty';
+                    window.__submit_status = 'safe: ChatGPT composer or prompt was empty';
                     return;
                 }
                 if (!normalize(readText(composer)).includes(expectedText)) {
-                    window.__submit_status = 'error: prompt text was not present in the ChatGPT composer';
+                    window.__submit_status = 'safe: prompt text was not present in the ChatGPT composer';
                     return;
                 }
 
@@ -11239,48 +11385,43 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
                     await new Promise((resolve) => setTimeout(resolve, 100));
                 }
                 if (!button) {
-                    window.__submit_status = 'error: ChatGPT send button did not become active';
+                    window.__submit_status = 'safe: ChatGPT send button did not become active';
                     return;
                 }
                 button.click();
+                submitClicked = true;
 
                 for (let attempt = 0; attempt < 900; attempt += 1) {
                     const messages = Array.from(document.querySelectorAll(userSelector));
                     if (messages.length > initialUserCount + 1) {
-                        window.__submit_status = 'error: unexpected ChatGPT user message count after submit';
+                        window.__submit_status = 'unknown: unexpected ChatGPT user message count after submit';
                         return;
                     }
                     const latestMessage = messages[messages.length - 1];
                     const latestText = normalize(latestMessage ? readText(latestMessage) : '');
-                    const anchorLength = Math.min(120, expectedText.length);
-                    const prefixAnchor = expectedText.slice(0, anchorLength);
-                    const middleStart = Math.max(0, Math.floor((expectedText.length - anchorLength) / 2));
-                    const middleAnchor = expectedText.slice(middleStart, middleStart + anchorLength);
-                    const suffixAnchor = expectedText.slice(-anchorLength);
-                    const digestAnchor = expectedText.match(/\b[a-f0-9]{64}\b/i)?.[0] || '';
-                    const requiredAnchors = [prefixAnchor, middleAnchor, suffixAnchor];
-                    if (digestAnchor) requiredAnchors.push(digestAnchor);
-                    const minimumEchoLength = Math.floor(expectedText.length * 0.9);
-                    const promptEchoVerified = latestText.length >= minimumEchoLength
-                        && requiredAnchors.every((anchor) => latestText.includes(anchor));
-                    if (messages.length === initialUserCount + 1 && promptEchoVerified) {
+                    const echo = verifyPromptEcho(prompt, latestText);
+                    if (messages.length === initialUserCount + 1 && echo.verified) {
                         window.__submit_status = 'success:' + JSON.stringify({
                             clicked: true,
                             user_message_verified: true,
-                            verification: 'anchored_prompt_echo'
+                            verification: 'semantic_projection_v2',
+                            anchor_matches: echo.anchor_matches,
+                            anchor_required: echo.anchor_required
                         });
                         return;
                     }
                     await new Promise((resolve) => setTimeout(resolve, 100));
                 }
-                window.__submit_status = 'error: ChatGPT did not render the submitted prompt in the conversation';
+                window.__submit_status = 'unknown: ChatGPT did not render the submitted prompt in the conversation';
             } catch (error) {
-                window.__submit_status = 'error: ChatGPT submission verification failed';
+                window.__submit_status = (submitClicked ? 'unknown: ' : 'safe: ') +
+                    'ChatGPT submission verification failed';
             }
         })();
         return true;
     }"#
     .replace("__PROMPT__", &prompt_json)
+    .replace("__PROMPT_ECHO_VERIFIER__", echo_verifier.trim())
     .replace("__USER_SELECTOR__", &user_selector_json)
     .replace("__SEND_SELECTORS__", send_selectors_json)
     .replace(
@@ -11348,16 +11489,25 @@ fn submit_chatgpt_regular_prompt(
     config_path: &str,
     prompt: &str,
     verbose: bool,
-) -> Result<String, String> {
-    insert_chatgpt_prompt_text(config_path, prompt, verbose)?;
-    let submit_js = build_chatgpt_prompt_submission_script(prompt)?;
+) -> Result<String, PromptSubmissionFailure> {
+    insert_chatgpt_prompt_text(config_path, prompt, verbose)
+        .map_err(PromptSubmissionFailure::safe)?;
+    let submit_js =
+        build_chatgpt_prompt_submission_script(prompt).map_err(PromptSubmissionFailure::safe)?;
     let started = call_mcp_tool(
         config_path,
         "evaluate_script",
         serde_json::json!({ "function": submit_js }),
-    )?;
-    if !parse_script_result(&started)?.as_bool().unwrap_or(false) {
-        return Err("Failed to start verified ChatGPT prompt submission".to_string());
+    )
+    .map_err(PromptSubmissionFailure::unknown)?;
+    if !parse_script_result(&started)
+        .map_err(PromptSubmissionFailure::unknown)?
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(PromptSubmissionFailure::unknown(
+            "Failed to start verified ChatGPT prompt submission",
+        ));
     }
 
     wait_for_chatgpt_submit_status(config_path)
@@ -11368,14 +11518,22 @@ fn submit_prompt_to_provider(
     provider: Provider,
     prompt: &str,
     verbose: bool,
-) -> Result<String, String> {
+) -> Result<String, PromptSubmissionFailure> {
     if provider == Provider::ChatGpt
         && let Some(parts) = parse_chatgpt_agent_prompt(prompt)
     {
-        return submit_chatgpt_agent_prompt(config_path, &parts, verbose);
+        // Agent-mention mode predates the click-aware verifier.  Until it is
+        // migrated to the same page-side contract, any failure after durable
+        // intent stays conservatively unknown.
+        return submit_chatgpt_agent_prompt(config_path, &parts, verbose)
+            .map_err(PromptSubmissionFailure::unknown);
+    }
+    if provider == Provider::ChatGpt {
+        return submit_chatgpt_regular_prompt(config_path, prompt, verbose);
     }
 
     submit_regular_prompt(config_path, provider, prompt, verbose)
+        .map_err(PromptSubmissionFailure::unknown)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11569,7 +11727,7 @@ fn execute_verified_prompt_submission<Baseline, Upload, BeforeSubmit, Submit>(
 where
     Upload: FnOnce() -> Result<(), String>,
     BeforeSubmit: FnOnce() -> Result<Baseline, String>,
-    Submit: FnOnce() -> Result<String, String>,
+    Submit: FnOnce() -> Result<String, PromptSubmissionFailure>,
 {
     if upload_and_verify().is_err() {
         if let Some(path) = receipt_path {
@@ -11588,7 +11746,18 @@ where
         record_session_receipt_event(path, SessionReceiptEvent::PromptIntentRecorded)
             .map_err(|_| "無法保存 prompt submit intent；prompt 未送出".to_string())?;
     }
-    let status = submit()?;
+    let status = match submit() {
+        Ok(status) => status,
+        Err(error) => {
+            if let Some(path) = receipt_path {
+                record_prompt_submission_failure(path, error.disposition).map_err(|_| {
+                    "prompt submission 失敗，且無法安全保存 failure receipt；遠端狀態未知"
+                        .to_string()
+                })?;
+            }
+            return Err(error.message);
+        }
+    };
     if let Some(path) = receipt_path {
         record_session_receipt_event(path, SessionReceiptEvent::PromptSubmitted).map_err(|_| {
             "prompt 已可能送出，但無法保存 submitted receipt；遠端狀態未知".to_string()
@@ -12852,23 +13021,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Setting prompt text and submitting...");
             }
             submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
-                .map_err(|error| format!("Text entry or submission failed: {}", error))
+                .map_err(|error| error.with_context("Text entry or submission failed"))
         },
     );
     let (response_baseline, status) = match submission_result {
         Ok(result) => result,
         Err(error) => {
-            if let Some(path) = receipt_path.as_deref()
-                && read_session_receipt(path)
-                    .is_ok_and(|receipt| receipt.prompt_submission != PromptSubmission::NotStarted)
-            {
-                let _ = record_session_response_outcome(
-                    path,
-                    ResponseCompletion::Unknown,
-                    0,
-                    Some(ResponseFailureCode::ResponseProbeFailed),
-                );
-            }
             return Err(format!("Verified prompt submission failed: {}", error).into());
         }
     };

@@ -44,35 +44,38 @@ const resolveControlBundle = (markup, target) => {
     </script>`);
 };
 
-test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome }, () => {
+test('ChatGPT assistant selector counts current and legacy semantic turns once', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
   assert.match(
     source,
-    /\.agent-turn, \[data-message-author-role=\\"assistant\\"\]:not\(\.agent-turn \*\)/,
-    'the provider boundary must use the canonical containment selector',
+    /\[data-chatgpt-search-unit-key\$=":assistant"\], \.agent-turn:not\(:has\(\[data-chatgpt-search-unit-key\$=":assistant"\]\)\)/,
+    'the provider boundary must prefer the current keyed assistant unit',
+  );
+  assert.match(
+    source,
+    /\[data-message-author-role=\\?"assistant\\?"\]:not\(\.agent-turn \*\)/,
+    'the provider boundary must retain the legacy role fallback',
   );
 
   const fixture = `<!doctype html>
     <main id="fixture"></main>
     <pre id="result"></pre>
     <script>
-      const oldSelector = '[data-message-author-role="assistant"], .agent-turn';
-      const canonicalSelector = '.agent-turn, [data-message-author-role="assistant"]:not(.agent-turn *)';
+      const canonicalSelector = '[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)';
       const cases = [
-        ['nested', '<div class="agent-turn"><div data-message-author-role="assistant">nested</div></div>'],
+        ['current-nested', '<div class="agent-turn"><section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">nested</div></section></div>'],
+        ['current-only', '<section data-chatgpt-search-unit-key="turn:assistant">current</section>'],
+        ['current-role-child', '<section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">child</div></section>'],
         ['agent-only', '<div class="agent-turn">agent</div>'],
         ['role-only', '<div data-message-author-role="assistant">role</div>'],
         ['siblings', '<div class="agent-turn">one</div><div class="agent-turn">two</div>'],
-        ['mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
+        ['legacy-mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
       ];
       const result = {};
       for (const [name, html] of cases) {
         const host = document.createElement('section');
         host.innerHTML = html;
-        result[name] = {
-          old: host.querySelectorAll(oldSelector).length,
-          canonical: host.querySelectorAll(canonicalSelector).length,
-        };
+        result[name] = host.querySelectorAll(canonicalSelector).length;
       }
       document.querySelector('#result').textContent = JSON.stringify(result);
     </script>`;
@@ -84,14 +87,74 @@ test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome },
   );
   const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
   assert.ok(encoded, 'headless DOM fixture did not return a result');
-  const counts = JSON.parse(encoded);
-  assert.deepEqual(counts, {
-    nested: { old: 2, canonical: 1 },
-    'agent-only': { old: 1, canonical: 1 },
-    'role-only': { old: 1, canonical: 1 },
-    siblings: { old: 2, canonical: 2 },
-    mixed: { old: 3, canonical: 2 },
+  assert.deepEqual(JSON.parse(encoded), {
+    'current-nested': 1,
+    'current-only': 1,
+    'current-role-child': 1,
+    'agent-only': 1,
+    'role-only': 1,
+    siblings: 2,
+    'legacy-mixed': 2,
   });
+});
+
+
+test('ChatGPT prompt echo verifier tolerates rendered Markdown but rejects wrong or truncated turns', () => {
+  const verifierSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_prompt_echo_verifier.js'),
+    'utf8',
+  );
+  const verifyPromptEcho = Function(`return (${verifierSource});`)();
+  const digest = 'a'.repeat(64);
+  const body = Array.from(
+    { length: 72 },
+    (_, index) =>
+      `## 區段 ${index}\n- **關鍵資料 ${index}**：請保留 \`欄位_${index}\` 與原始數字 ${1000 + index}。\n`,
+  ).join('');
+  const expected =
+    `workflow prompt begins\n${body}\nsource.sha256: ${digest}\nworkflow prompt ends`;
+
+  // ChatGPT conversation rendering removes Markdown punctuation and list
+  // markers. The semantic content, source digest and overall message remain
+  // the same even though the DOM text is shorter than the composer source.
+  const rendered = expected
+    .replace(/^## /gm, '')
+    .replace(/^- /gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/\`/g, '')
+    .replace(/：/g, ' ');
+  const accepted = verifyPromptEcho(expected, rendered);
+  assert.equal(accepted.verified, true);
+  assert.equal(accepted.digest_ok, true);
+  assert.ok(accepted.anchor_matches >= accepted.anchor_required);
+
+  const wrongDigest = verifyPromptEcho(
+    expected,
+    rendered.replace(digest, 'b'.repeat(64)),
+  );
+  assert.equal(wrongDigest.verified, false);
+  assert.equal(wrongDigest.digest_ok, false);
+
+  const project = (value) => String(value || '')
+    .normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase('en-US')
+    .replace(/[\p{P}\p{S}\s]/gu, '');
+  const semantic = project(expected);
+  const left = semantic.slice(0, Math.floor(semantic.length * 0.2));
+  const right = semantic.slice(Math.floor(semantic.length * 0.8));
+  const corruptedMiddle = left +
+    'x'.repeat(semantic.length - left.length - right.length) +
+    right;
+  const corrupted = verifyPromptEcho(expected, corruptedMiddle);
+  assert.equal(corrupted.verified, false);
+  assert.ok(corrupted.anchor_matches < corrupted.anchor_required);
+
+  const truncated = verifyPromptEcho(expected, rendered.slice(0, Math.floor(rendered.length * 0.6)));
+  assert.equal(truncated.verified, false);
+  assert.equal(truncated.length_ratio_ok, false);
 });
 
 test('ChatGPT reasoning slider is selectable before prompt submission', { skip: !chrome }, () => {
