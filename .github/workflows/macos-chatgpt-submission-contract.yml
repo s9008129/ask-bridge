@@ -38,5 +38,8 @@ jobs:
           node --check src/chatgpt_prompt_input.js
           node --check src/chatgpt_upload.js
 
+      - name: DOM contract tests
+        run: npm test
+
       - name: Release build
         run: cargo build --release -q
