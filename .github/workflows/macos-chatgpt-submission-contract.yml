@@ -1,0 +1,42 @@
+name: macOS ChatGPT submission contract
+
+on:
+  push:
+    branches:
+      - fix/chatgpt-prompt-submission-receipt
+  pull_request:
+    branches:
+      - feat/preserve-existing-tabs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use latest stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Rust formatting gate
+        run: cargo fmt --all -- --check
+
+      - name: Rust tests
+        run: cargo test -q
+
+      - name: JavaScript syntax gates
+        run: |
+          node --check src/chatgpt_prompt_input.js
+          node --check src/chatgpt_upload.js
+
+      - name: Release build
+        run: cargo build --release -q
