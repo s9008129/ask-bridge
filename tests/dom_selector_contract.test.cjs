@@ -44,35 +44,38 @@ const resolveControlBundle = (markup, target) => {
     </script>`);
 };
 
-test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome }, () => {
+test('ChatGPT assistant selector counts current and legacy semantic turns once', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
   assert.match(
     source,
-    /\.agent-turn, \[data-message-author-role=\\"assistant\\"\]:not\(\.agent-turn \*\)/,
-    'the provider boundary must use the canonical containment selector',
+    /\[data-chatgpt-search-unit-key\$=":assistant"\], \.agent-turn:not\(:has\(\[data-chatgpt-search-unit-key\$=":assistant"\]\)\)/,
+    'the provider boundary must prefer the current keyed assistant unit',
+  );
+  assert.match(
+    source,
+    /\[data-message-author-role=\\?"assistant\\?"\]:not\(\.agent-turn \*\)/,
+    'the provider boundary must retain the legacy role fallback',
   );
 
   const fixture = `<!doctype html>
     <main id="fixture"></main>
     <pre id="result"></pre>
     <script>
-      const oldSelector = '[data-message-author-role="assistant"], .agent-turn';
-      const canonicalSelector = '.agent-turn, [data-message-author-role="assistant"]:not(.agent-turn *)';
+      const canonicalSelector = '[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)';
       const cases = [
-        ['nested', '<div class="agent-turn"><div data-message-author-role="assistant">nested</div></div>'],
+        ['current-nested', '<div class="agent-turn"><section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">nested</div></section></div>'],
+        ['current-only', '<section data-chatgpt-search-unit-key="turn:assistant">current</section>'],
+        ['current-role-child', '<section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">child</div></section>'],
         ['agent-only', '<div class="agent-turn">agent</div>'],
         ['role-only', '<div data-message-author-role="assistant">role</div>'],
         ['siblings', '<div class="agent-turn">one</div><div class="agent-turn">two</div>'],
-        ['mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
+        ['legacy-mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
       ];
       const result = {};
       for (const [name, html] of cases) {
         const host = document.createElement('section');
         host.innerHTML = html;
-        result[name] = {
-          old: host.querySelectorAll(oldSelector).length,
-          canonical: host.querySelectorAll(canonicalSelector).length,
-        };
+        result[name] = host.querySelectorAll(canonicalSelector).length;
       }
       document.querySelector('#result').textContent = JSON.stringify(result);
     </script>`;
@@ -84,13 +87,14 @@ test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome },
   );
   const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
   assert.ok(encoded, 'headless DOM fixture did not return a result');
-  const counts = JSON.parse(encoded);
-  assert.deepEqual(counts, {
-    nested: { old: 2, canonical: 1 },
-    'agent-only': { old: 1, canonical: 1 },
-    'role-only': { old: 1, canonical: 1 },
-    siblings: { old: 2, canonical: 2 },
-    mixed: { old: 3, canonical: 2 },
+  assert.deepEqual(JSON.parse(encoded), {
+    'current-nested': 1,
+    'current-only': 1,
+    'current-role-child': 1,
+    'agent-only': 1,
+    'role-only': 1,
+    siblings: 2,
+    'legacy-mixed': 2,
   });
 });
 
