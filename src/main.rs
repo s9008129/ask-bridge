@@ -28,18 +28,15 @@ const VERIFIED_MODEL_SELECTION_V3_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v4";
 const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v5";
 const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
-const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str =
-    "verified_prompt_submission_outcome_v1";
+const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
 const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
 const PROMPT_SUBMISSION_FAILURE_STAGE: &str = "prompt_submission";
-const PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE: &str =
-    "PROMPT_SUBMISSION_PRECLICK_FAILED";
-const PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE: &str =
-    "PROMPT_SUBMISSION_STATE_UNKNOWN";
+const PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE: &str = "PROMPT_SUBMISSION_PRECLICK_FAILED";
+const PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE: &str = "PROMPT_SUBMISSION_STATE_UNKNOWN";
 
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dynamic attachment verification timeout scaled by the number of files.
@@ -813,9 +810,7 @@ impl fmt::Display for ResponseFailureCode {
             ResponseFailureCode::ProviderRejected => "provider_rejected",
             ResponseFailureCode::ResponseProbeFailed => "response_probe_failed",
             ResponseFailureCode::ResponseTimeout => "response_timeout",
-            ResponseFailureCode::PromptSubmissionStateUnknown => {
-                "prompt_submission_state_unknown"
-            }
+            ResponseFailureCode::PromptSubmissionStateUnknown => "prompt_submission_state_unknown",
             ResponseFailureCode::ImageDownloadEmpty => "image_download_empty",
             ResponseFailureCode::ImageDownloadFailed => "image_download_failed",
         })
@@ -1642,8 +1637,7 @@ fn record_prompt_submission_failure(
         PromptSubmissionFailureDisposition::UnknownAfterClick => {
             receipt.failure_code = Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE.to_string());
             receipt.response_completion = ResponseCompletion::Unknown;
-            receipt.response_failure_code =
-                Some(ResponseFailureCode::PromptSubmissionStateUnknown);
+            receipt.response_failure_code = Some(ResponseFailureCode::PromptSubmissionStateUnknown);
         }
     }
 
@@ -6255,7 +6249,10 @@ mod tests {
         );
         assert!(safe_result.is_err());
         let safe = read_session_receipt(&safe_path).unwrap();
-        assert_eq!(safe.attachment_verification, AttachmentVerification::Verified);
+        assert_eq!(
+            safe.attachment_verification,
+            AttachmentVerification::Verified
+        );
         assert_eq!(safe.prompt_submission, PromptSubmission::IntentRecorded);
         assert_eq!(
             safe.failure_stage.as_deref(),
@@ -6279,7 +6276,10 @@ mod tests {
         );
         assert!(unknown_result.is_err());
         let unknown = read_session_receipt(&unknown_path).unwrap();
-        assert_eq!(unknown.attachment_verification, AttachmentVerification::Verified);
+        assert_eq!(
+            unknown.attachment_verification,
+            AttachmentVerification::Verified
+        );
         assert_eq!(unknown.prompt_submission, PromptSubmission::IntentRecorded);
         assert_eq!(
             unknown.failure_stage.as_deref(),
@@ -10834,9 +10834,7 @@ fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
     Ok(status)
 }
 
-fn wait_for_chatgpt_submit_status(
-    config_path: &str,
-) -> Result<String, PromptSubmissionFailure> {
+fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, PromptSubmissionFailure> {
     let mut status = String::from("pending");
     let deadline = McpOperationDeadline::from_timeout(Duration::from_secs(100))
         .map_err(PromptSubmissionFailure::unknown)?;
