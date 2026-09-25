@@ -98,6 +98,65 @@ test('ChatGPT assistant selector counts current and legacy semantic turns once',
   });
 });
 
+
+test('ChatGPT prompt echo verifier tolerates rendered Markdown but rejects wrong or truncated turns', () => {
+  const verifierSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_prompt_echo_verifier.js'),
+    'utf8',
+  );
+  const verifyPromptEcho = Function(`return (${verifierSource});`)();
+  const digest = 'a'.repeat(64);
+  const body = Array.from(
+    { length: 72 },
+    (_, index) =>
+      `## 區段 ${index}\n- **關鍵資料 ${index}**：請保留 \`欄位_${index}\` 與原始數字 ${1000 + index}。\n`,
+  ).join('');
+  const expected =
+    `workflow prompt begins\n${body}\nsource.sha256: ${digest}\nworkflow prompt ends`;
+
+  // ChatGPT conversation rendering removes Markdown punctuation and list
+  // markers. The semantic content, source digest and overall message remain
+  // the same even though the DOM text is shorter than the composer source.
+  const rendered = expected
+    .replace(/^## /gm, '')
+    .replace(/^- /gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/\`/g, '')
+    .replace(/：/g, ' ');
+  const accepted = verifyPromptEcho(expected, rendered);
+  assert.equal(accepted.verified, true);
+  assert.equal(accepted.digest_ok, true);
+  assert.ok(accepted.anchor_matches >= accepted.anchor_required);
+
+  const wrongDigest = verifyPromptEcho(
+    expected,
+    rendered.replace(digest, 'b'.repeat(64)),
+  );
+  assert.equal(wrongDigest.verified, false);
+  assert.equal(wrongDigest.digest_ok, false);
+
+  const project = (value) => String(value || '')
+    .normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase('en-US')
+    .replace(/[\p{P}\p{S}\s]/gu, '');
+  const semantic = project(expected);
+  const left = semantic.slice(0, Math.floor(semantic.length * 0.2));
+  const right = semantic.slice(Math.floor(semantic.length * 0.8));
+  const corruptedMiddle = left +
+    'x'.repeat(semantic.length - left.length - right.length) +
+    right;
+  const corrupted = verifyPromptEcho(expected, corruptedMiddle);
+  assert.equal(corrupted.verified, false);
+  assert.ok(corrupted.anchor_matches < corrupted.anchor_required);
+
+  const truncated = verifyPromptEcho(expected, rendered.slice(0, Math.floor(rendered.length * 0.6)));
+  assert.equal(truncated.verified, false);
+  assert.equal(truncated.length_ratio_ok, false);
+});
+
 test('ChatGPT reasoning slider is selectable before prompt submission', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
   const resolverSource = readFileSync(
