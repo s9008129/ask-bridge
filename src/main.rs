@@ -334,9 +334,12 @@ impl Provider {
             // The current ChatGPT transcript exposes a keyed assistant unit.
             // Keep the older turn/role markers as fallbacks, excluding a
             // legacy wrapper when it contains the current keyed unit so one
-            // response is never counted twice.
+            // response is never counted twice.  Image answers are rendered as
+            // a generated-image canvas message that never receives a keyed
+            // assistant unit, so the generated-image message wrapper counts as
+            // the assistant turn while staying out of keyed and user scopes.
             Provider::ChatGpt => {
-                r##"[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)"##
+                r##"[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *), [data-chatgpt-search-message-ids]:has([data-testid="generated-image-gallery"]):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *):not([data-content-search-unit-key$=":assistant"]):not([data-content-search-unit-key$=":assistant"] *):not([data-chatgpt-search-unit-key$=":user"] *):not([data-content-search-unit-key$=":user"] *)"##
             }
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
@@ -4150,6 +4153,10 @@ mod tests {
         assert!(selector.contains(".agent-turn:not(:has("));
         assert!(selector.contains("[data-message-author-role=\"assistant\"]"));
         assert!(selector.contains(":not(.agent-turn *)"));
+        assert!(selector.contains(
+            "[data-chatgpt-search-message-ids]:has([data-testid=\"generated-image-gallery\"])"
+        ));
+        assert!(selector.contains(":not([data-chatgpt-search-unit-key$=\":user\"] *)"));
     }
 
     #[test]

@@ -538,8 +538,18 @@ test('ChatGPT reasoning control reports a root-only lock marker without failing 
 const chatGptCopySelectorSource = () =>
   readFileSync(join(repoRoot, 'src', 'chatgpt_copy_button_selector.js'), 'utf8');
 
-const chatGptAssistantSelector =
-  '[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)';
+const chatGptAssistantSelector = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const fnStart = source.indexOf('fn assistant_selector');
+  assert.ok(fnStart > 0, 'assistant_selector must exist');
+  const providerStart = source.indexOf('Provider::ChatGpt =>', fnStart);
+  assert.ok(providerStart > fnStart, 'the ChatGPT assistant selector arm must exist');
+  const literal = source
+    .slice(providerStart, providerStart + 3000)
+    .match(/r##"([\s\S]*?)"##/);
+  assert.ok(literal, 'the ChatGPT assistant selector arm must be a raw string');
+  return literal[1];
+};
 const chatGptUserSelector =
   '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)';
 
@@ -600,7 +610,7 @@ const chatGptCopyFixture = ({ userCopyButtons, assistantActionBar = '', previous
       });
       const selectLatestAssistantCopyButton = ${chatGptCopySelectorSource()};
       const outcome = selectLatestAssistantCopyButton({
-        assistantSelector: ${JSON.stringify(chatGptAssistantSelector)},
+        assistantSelector: ${JSON.stringify(chatGptAssistantSelector())},
         userSelector: ${JSON.stringify(chatGptUserSelector)},
       });
       document.querySelector('#result').textContent = JSON.stringify({ outcome, clicks });
@@ -656,6 +666,71 @@ const chatGptStopSelectors = () => {
   assert.ok(literal, 'the ChatGPT stop selector arm must be a raw string array');
   return JSON.parse(literal[1]);
 };
+
+const assistantTurnFixture = (inner) => `<!doctype html>
+    <main>
+      <div class="flex flex-col gap-1.5" data-content-search-turn-key="fallback-turn-0" data-turn-key="turn-1">
+        ${inner}
+      </div>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const selector = ${JSON.stringify('__SELECTOR__')};
+      const nodes = Array.from(document.querySelectorAll(selector));
+      const ids = nodes.map((node) => node.id).filter(Boolean).sort();
+      document.querySelector('#result').textContent = JSON.stringify({
+        count: nodes.length,
+        ids,
+        matchedGeneratedImage: nodes.some((node) => Boolean(node.querySelector('[data-testid="generated-image-gallery"]'))),
+      });
+    </script>`;
+
+const runAssistantTurnFixture = (inner) => {
+  const fixture = assistantTurnFixture(inner).replace(
+    JSON.stringify('__SELECTOR__'),
+    JSON.stringify(chatGptAssistantSelector()),
+  );
+  return renderFixture(fixture);
+};
+
+test('ChatGPT assistant selector recognises the generated image turn once', { skip: !chrome }, () => {
+  const userUnit =
+    '<div id="user-unit" class="group/user-message" data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="turn-1">' +
+    '<div class="flex flex-wrap"><img id="user-attachment" alt="\u4f7f\u7528\u8005\u9644\u4ef6" src="data:image/png;base64,iVBORw0KGgo="></div>' +
+    '</div>';
+  const imageTurn =
+    '<div id="image-message" data-chatgpt-search-message-ids="assistant-1">' +
+    '<div data-testid="generated-image-gallery">' +
+    '<button data-testid="generated-image-preview" aria-label="\u7522\u751f\u7684\u5716\u7247 1">' +
+    '<img alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></button>' +
+    '</div></div>';
+
+  const result = runAssistantTurnFixture(userUnit + imageTurn);
+
+  assert.equal(
+    result.matchedGeneratedImage,
+    true,
+    'the generated image message must count as the assistant response',
+  );
+  assert.deepEqual(result.ids, ['image-message'], 'only the generated image message may match');
+});
+
+test('ChatGPT assistant selector keeps one count when a keyed unit hosts the gallery', { skip: !chrome }, () => {
+  const unitWithGallery =
+    '<section id="assistant-unit" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant">' +
+    '<div data-testid="generated-image-gallery">' +
+    '<button data-testid="generated-image-preview"><img alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></button>' +
+    '</div>' +
+    '<div data-chatgpt-search-message-ids="assistant-1"></div>' +
+    '</section>';
+  const userUnit =
+    '<div id="user-unit" data-chatgpt-search-unit-key="fallback-turn-0:0:user"><p>prompt</p></div>';
+
+  const result = runAssistantTurnFixture(userUnit + unitWithGallery);
+
+  assert.equal(result.count, 1, 'a keyed assistant unit must not be double counted');
+  assert.deepEqual(result.ids, ['assistant-unit']);
+});
 
 test('ChatGPT stop control selectors cover the localized stop button', { skip: !chrome }, () => {
   const selectors = chatGptStopSelectors();
