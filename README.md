@@ -203,6 +203,67 @@ ask-bridge "誰是保哥？" --new
 
 此模式會開啟新的所選 provider 分頁，並清理先前同一 provider 的分頁。
 
+`--new` 是為了相容舊版而保留的 destructive 行為。若要建立新分頁並保留
+所有 invocation 開始前已存在的分頁，請使用安全模式：
+
+```bash
+SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+ask-bridge --provider chatgpt \
+  --new-tab-preserve-existing --session-id "$SESSION_ID" \
+  "請整理這份附件。" --file transcript.md
+```
+
+安全模式會以精確 page ID 綁定本次新分頁，並在
+`~/.config/ask-bridge/sessions/<session-id>.json` 寫入權限為 `0600` 的
+schema-v2 session receipt。附件檔名 multiset、數量與無 uploading/error 狀態
+必須連續兩次穩定，工具才會記錄 submit intent 並輸入 prompt；逾時或錯誤會
+fail-closed。圖片工作則必須等到本次唯一新增的 assistant 回應已停止生成、至少
+一張大尺寸圖片載入完成，且 DOM 簽章連續穩定後才算完成。receipt 只保存計數、
+預期輸出種類、completion enum 與固定 failure code，不保存 prompt、回覆、URL、
+DOM、檔名或路徑。
+它不會關閉 ChatGPT、Gemini 或其他既有分頁；同一 provider
+的另一個安全模式程序若正在執行，會因跨程序 lease 而 fail-closed。此模式
+要求有效 UUID，且只支援直接送出 prompt，不會套用到 debug subcommand。
+
+整合工具應先檢查機器可讀能力宣告：
+
+```bash
+ask-bridge capabilities --json
+```
+
+安全附件工作至少需要 `isolated_new_tab_v1` 與 `verified_file_upload_v1`；要求
+生成圖片並下載的整合工具還必須檢查
+`verified_image_response_completion_v1`。登入後可用唯讀
+session probe 驗證目前登入狀態，不會送出 prompt：
+
+```bash
+ask-bridge session-probe --provider chatgpt --json
+```
+
+若指定 `--model`，新的模型選擇工作應檢查 `verified_model_selection_v6`；同時保留
+`verified_model_selection_v1`、`verified_model_selection_v2`、
+`verified_model_selection_v3`、`verified_model_selection_v4` 與
+`verified_model_selection_v5` 以辨識舊 consumer 與讀取既有 receipt。ChatGPT 會先驗證
+模型 radio 或舊式選單；遇到推理強度 slider 時，v6 會由 Rust runtime 與 Node DOM tests
+共用同一個純 `data-model-reasoning-effort-slider` control-bundle resolver。唯一 bundle
+必須具備整數 `aria-valuemin`／`aria-valuemax`／`aria-valuenow`（或 native range 的
+min／max／value）、唯一 focus/state owner，且位置數量（`max - min + 1`）必須落在 2 到 8
+之間；owner 可使用 `role=slider`、native range，或在行為證據完整時缺少
+role，但明確衝突的互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵
+逐格走訪，並以頁面公告的語意標籤驅動選取：每個走訪到的位置都必須有公告，無法辨識標籤
+的位置可略過但不可被選取，目標位置則必須由公告直接對應到目標推理等級；頁面標示
+`data-locked`（例如需要升級的 Pro 位置）不得選取，但可作為走訪的停止邊界。ordinal
+announcement 只作一致性檢查（存在時必須與位置數量及目前位置相符），缺失不阻擋、矛盾
+則停止。工具會確認目標讀值穩定，並關閉後重新開啟確認持久化；v6 證據記為
+`labeled_effort_position_map_v1`，契約為 `reasoning_labeled_ordered_control_v4`，並在
+schema-v2 receipt 以 nullable `model_selection_position_count`（整數 `2..8`，僅 v6
+verified 填寫）與 `model_selection_direct_semantic_count`（v6 為整數 `1..position_count`，
+v5 為 `0..3`；其他契約或 failed 為 null）記錄低敏感度位置數量，不保存原始 label 文字。
+模型或推理強度未驗證時會在附件上傳與 prompt 前停止；session 模式下會先寫入 failed
+receipt，再以最佳努力關閉 reasoning 選單（清理失敗只輸出警告）。schema-v2 receipt 仍以
+`model_selection`、`model_selection_contract`、可選的 `model_selection_evidence`、
+`failure_stage` 與 `failure_code` 保存低敏感度狀態，不保存 prompt、DOM 文字或路徑。
+
 ### 4. Headless 模式
 
 一般提問預設使用 headless Chrome，也就是 `--headless=true`。Chrome 會在背景執行，不會搶走焦點或跳出視窗。
@@ -311,7 +372,7 @@ ask-bridge "請對照這張設計圖與規格文件，指出不一致的地方�
 
 #### 顯示上傳結果
 
-provider 回覆後，可使用 `-i` / `--image-output` 指定生成圖片的下載路徑（資料夾或檔案路徑）。
+provider 回覆後，可使用 `-i` / `--image-output` 指定生成圖片的下載路徑（資料夾或檔案路徑）。指定此旗標即啟用嚴格圖片產物契約：零張圖片、下載錯誤、回應 ownership 改變或逾時都會以非零狀態結束，不會把空輸出視為成功。
 
 ### 9. 切換模型
 
@@ -330,7 +391,7 @@ ask-bridge --provider claude "證明這個數學問題。" --model Opus
 可用的模型名稱（視帳號權限與 provider UI 而定）：
 
 - **ChatGPT 模型**：`GPT-5.5`、`GPT-5.4`、`GPT-5.3`、`o3`
-- **ChatGPT 思考強度**：`智慧`、`即時`、`中等`、`高`、`超高`、`專業`
+- **ChatGPT 思考強度**：`即時`、`中等`、`高`；切換時會與頁面自己公告的推理強度標籤比對（2 到 8 個位置），頁面標示需要升級的鎖定位置不會被選取
 - **Gemini 模式**：`3.5 Flash`、`3.1 Flash-Lite`、`3.1 Pro`
 - **Claude 模型**：`Sonnet`、`Opus`、`Haiku`（實際名稱依 claude.ai 選單與帳號方案而定）
 

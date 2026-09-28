@@ -1,8 +1,10 @@
 use base64::{Engine as _, engine::general_purpose};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use mcp_cli::{McpClient, McpConnection, ServerConfig, StdioClient};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpStream;
@@ -10,11 +12,53 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 const ASK_BRIDGE_CHROME_MARKER: &str = "--ask-bridge-instance";
+const ISOLATED_NEW_TAB_CAPABILITY: &str = "isolated_new_tab_v1";
+const VERIFIED_FILE_UPLOAD_CAPABILITY: &str = "verified_file_upload_v1";
+const VERIFIED_MIXED_ATTACHMENT_CAPABILITY: &str = "verified_mixed_attachment_upload_v1";
+const VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY: &str = "verified_image_response_completion_v1";
+const VERIFIED_MODEL_SELECTION_CAPABILITY: &str = "verified_model_selection_v1";
+const VERIFIED_MODEL_SELECTION_V2_CAPABILITY: &str = "verified_model_selection_v2";
+const VERIFIED_MODEL_SELECTION_V3_CAPABILITY: &str = "verified_model_selection_v3";
+const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v4";
+const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v5";
+const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
+const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
+const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
+const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
+const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
+const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
+const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
+const PROMPT_SUBMISSION_FAILURE_STAGE: &str = "prompt_submission";
+const PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE: &str = "PROMPT_SUBMISSION_PRECLICK_FAILED";
+const PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE: &str = "PROMPT_SUBMISSION_STATE_UNKNOWN";
+
+const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Dynamic attachment verification timeout scaled by the number of files.
+/// ChatGPT renders file tiles progressively; with 4 files (e.g. repair
+/// requests) the 60-second base is not enough for all tiles to appear and
+/// stabilise.  Each file gets an additional 15 seconds of headroom.
+fn attachment_verify_timeout_for_count(count: usize) -> Duration {
+    Duration::from_secs(ATTACHMENT_VERIFY_TIMEOUT.as_secs() + (count as u64 * 15))
+}
+const ATTACHMENT_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const ATTACHMENT_REQUIRED_STABLE_PROBES: usize = 2;
+const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RESPONSE_REQUIRED_STABLE_PROBES: usize = 3;
+/// Minimum text content length (in bytes of trimmed textContent) for a text
+/// response to be considered complete.  ChatGPT sometimes shows short
+/// processing-status text (e.g. "Reading Schema For JSON Deck Plan
+/// Validation", ~44 bytes) while the Stop button briefly disappears during
+/// attachment processing.  Without this gate the stability tracker would
+/// declare the response complete and copy the status text instead of the
+/// real response.
+const MINIMUM_TEXT_RESPONSE_BYTES: usize = 200;
+const GENERATED_IMAGE_MIN_DIMENSION: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginState {
@@ -33,7 +77,7 @@ struct LoginSignals {
 }
 
 impl LoginSignals {
-    fn state(self, provider: Provider) -> LoginState {
+    fn state(self, _provider: Provider) -> LoginState {
         if self.auth_path {
             LoginState::LoggedOut
         } else if self.account {
@@ -42,8 +86,6 @@ impl LoginSignals {
             LoginState::Unknown
         } else if self.auth_control {
             LoginState::LoggedOut
-        } else if self.composer && provider == Provider::ChatGpt {
-            LoginState::LoggedIn
         } else {
             LoginState::Unknown
         }
@@ -102,7 +144,20 @@ impl Provider {
 
     fn ready_check_js(self) -> &'static str {
         match self {
-            Provider::ChatGpt => r#"() => document.getElementById('prompt-textarea') !== null"#,
+            Provider::ChatGpt => {
+                r#"() => {
+                if (document.readyState !== 'complete' || !document.body) return false;
+                return Boolean(
+                    document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]') ||
+                    document.querySelector('[data-testid="profile-button"], button[aria-label*="個人檔案"]') ||
+                    Array.from(document.querySelectorAll('a, button')).some((el) =>
+                        /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册)$/i.test(
+                            (el.getAttribute('aria-label') || el.textContent || '').trim()
+                        )
+                    )
+                );
+            }"#
+            }
             Provider::Gemini => {
                 r#"() => {
                     return document.querySelector('div[role="textbox"][aria-label*="Gemini"]') !== null ||
@@ -169,7 +224,9 @@ impl Provider {
                             document.querySelector('button[aria-label*="User"]') ||
                             document.querySelector('button[aria-label*="user"]') ||
                             document.querySelector('button[aria-label*="帳戶"]') ||
-                            document.querySelector('button[aria-label*="使用者"]');
+                            document.querySelector('button[aria-label*="個人檔案"]') ||
+                            document.querySelector('button[aria-label*="使用者"]') ||
+                            document.querySelector('button[aria-label*="設定檔"]');
 
                         return {
                             account: isVisible(accountMenu),
@@ -274,17 +331,34 @@ impl Provider {
 
     fn assistant_selector(self) -> &'static str {
         match self {
-            Provider::ChatGpt => "[data-message-author-role=\"assistant\"], .agent-turn",
+            // The current ChatGPT transcript exposes a keyed assistant unit.
+            // Keep the older turn/role markers as fallbacks, excluding a
+            // legacy wrapper when it contains the current keyed unit so one
+            // response is never counted twice.  Image answers are rendered as
+            // a generated-image canvas message that never receives a keyed
+            // assistant unit, so the generated-image message wrapper counts as
+            // the assistant turn while staying out of keyed and user scopes.
+            Provider::ChatGpt => {
+                r##"[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *), [data-chatgpt-search-message-ids]:has([data-testid="generated-image-gallery"]):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *):not([data-content-search-unit-key$=":assistant"]):not([data-content-search-unit-key$=":assistant"] *):not([data-chatgpt-search-unit-key$=":user"] *):not([data-content-search-unit-key$=":user"] *)"##
+            }
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
         }
     }
 
-    fn latest_response_selector(self) -> &'static str {
+    fn user_selector(self) -> &'static str {
         match self {
             Provider::ChatGpt => {
-                "[data-message-author-role=\"assistant\"], .agent-turn, model-response, .model-response, [data-test-id*=\"response\"], [data-testid*=\"response\"]"
+                r##"[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)"##
             }
+            Provider::Gemini => "user-query",
+            Provider::Claude => "[data-testid=\"user-message\"], .font-user-message",
+        }
+    }
+
+    fn latest_response_selector(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => Provider::ChatGpt.assistant_selector(),
             Provider::Gemini => "model-response",
             Provider::Claude => ".font-claude-response",
         }
@@ -302,7 +376,9 @@ impl Provider {
 
     fn composer_selectors_json(self) -> &'static str {
         match self {
-            Provider::ChatGpt => r##"["#prompt-textarea"]"##,
+            Provider::ChatGpt => {
+                r##"["#prompt-textarea", "[data-testid=\"composer-text-input\"]", "[role=\"textbox\"][contenteditable=\"true\"]"]"##
+            }
             Provider::Gemini => {
                 r#"[
                     "div[role=\"textbox\"][aria-label*=\"Gemini\"]",
@@ -356,7 +432,9 @@ impl Provider {
                 r##"[
                     "[data-testid=\"stop-button\"]",
                     "#composer-stop-button",
-                    "button[aria-label=\"Stop generating\"]"
+                    "button[aria-label=\"Stop generating\"]",
+                    "button[aria-label*=\"Stop\"]",
+                    "button[aria-label*=\"停止\"]"
                 ]"##
             }
             Provider::Gemini => {
@@ -425,7 +503,7 @@ fn parse_chatgpt_agent_prompt(prompt: &str) -> Option<ChatGptAgentPrompt<'_>> {
 
 #[derive(Parser)]
 #[command(name = "ask-bridge")]
-#[command(version = "0.2.8")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(disable_version_flag = true)]
 #[command(about = "AI browser CLI - Ask ChatGPT, Gemini or Claude from your Terminal with your subscription", long_about = None)]
 struct Cli {
@@ -446,8 +524,19 @@ struct Cli {
     headless: bool,
 
     /// Create a brand new provider session by opening a new tab and closing old ones.
+    /// This is retained for backwards compatibility and is destructive.
     #[arg(long, default_value_t = false)]
     new: bool,
+
+    /// Create an isolated provider tab while preserving every tab that existed
+    /// before this invocation. Requires a UUID session id for ownership and
+    /// receipt verification.
+    #[arg(long, conflicts_with = "new")]
+    new_tab_preserve_existing: bool,
+
+    /// UUID used to name and verify the isolated session receipt.
+    #[arg(long, value_name = "UUID", requires = "new_tab_preserve_existing")]
+    session_id: Option<String>,
 
     /// Print version information.
     #[arg(
@@ -483,17 +572,35 @@ struct Cli {
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 
-    /// Switch the provider model before sending the prompt.
+    /// Switch the provider model before sending the prompt.  Can be specified
+    /// multiple times to set both the model and the reasoning level, e.g.
+    /// `--model "GPT-5.5" --model "中等"`.
     /// ChatGPT examples: "GPT-5.5", "GPT-5.4", "GPT-5.3", "o3", or thinking levels such as
-    /// "即時", "中等", "高", "超高", "專業", "智慧". Gemini examples: "3.5 Flash",
+    /// "即時", "中等", "高" (plus English aliases such as "instant"/"medium"/"high").
+    /// Thinking levels are matched
+    /// against the labels the page itself announces for its reasoning control (a
+    /// bounded, labeled domain of 2-8 positions); positions the page reports as
+    /// upgrade-locked are never selected.  Gemini examples: "3.5 Flash",
     /// "3.1 Flash-Lite", or "3.1 Pro". Claude examples: "Sonnet", "Opus", "Haiku".
     /// Matching is case- and punctuation-insensitive.
-    #[arg(long = "model", value_name = "MODEL")]
-    model: Option<String>,
+    #[arg(long = "model", value_name = "MODEL", action = clap::ArgAction::Append)]
+    model: Vec<String>,
+
+    /// Upload and verify attachments in an isolated tab without typing or
+    /// submitting a prompt.  Exits 0 on verified, non-zero on attachment
+    /// failure.  Receipt prompt_submission stays not_started.
+    #[arg(long = "verify-attachments-only", default_value_t = false)]
+    verify_attachments_only: bool,
 }
 
 #[derive(Subcommand, Clone)]
 enum Commands {
+    /// Print the machine-readable capabilities of this binary.
+    Capabilities {
+        /// Emit a JSON capability document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Open Chrome browser, optionally navigate to a URL, and copy the latest response
     #[command(hide = true)]
     Open {
@@ -511,6 +618,13 @@ enum Commands {
     },
     /// Open Chrome browser and wait for manual login
     Login,
+    /// Verify the current provider session without sending a prompt.
+    #[command(name = "session-probe")]
+    SessionProbe {
+        /// Emit a machine-readable authentication result.
+        #[arg(long)]
+        json: bool,
+    },
     /// Close the managed Chrome browser instance
     Close,
     /// Set or show the global default provider used when --provider is not specified.
@@ -535,6 +649,1357 @@ fn config_file_path() -> Result<PathBuf, String> {
     let mut config_path = home::home_dir().ok_or("Could not locate home directory")?;
     config_path.push(".config/ask-bridge/config.json");
     Ok(config_path)
+}
+
+fn ask_bridge_state_dir() -> Result<PathBuf, String> {
+    let mut path = home::home_dir().ok_or("Could not locate home directory")?;
+    path.push(".config/ask-bridge");
+    Ok(path)
+}
+
+fn session_receipts_dir() -> Result<PathBuf, String> {
+    Ok(ask_bridge_state_dir()?.join("sessions"))
+}
+
+fn session_receipt_path(session_id: &str) -> Result<PathBuf, String> {
+    let session_id = validate_session_id(session_id)?;
+    Ok(session_receipts_dir()?.join(format!("{}.json", session_id)))
+}
+
+fn provider_lease_path(provider: Provider) -> Result<PathBuf, String> {
+    Ok(ask_bridge_state_dir()?.join(format!("{}.lease", provider)))
+}
+
+fn validate_session_id(value: &str) -> Result<String, String> {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.to_string())
+        .map_err(|_| "session id 必須是有效 UUID".to_string())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AttachmentVerification {
+    Pending,
+    Verified,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PromptSubmission {
+    NotStarted,
+    IntentRecorded,
+    Submitted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ModelSelection {
+    #[default]
+    NotRequested,
+    Verified,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ModelSelectionContract {
+    LegacyMenuV1,
+    ReasoningSliderV1,
+    ReasoningCalibratedControlV2,
+    ReasoningOrderedControlV3,
+    ReasoningLabeledOrderedControlV4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasoningEffort {
+    Instant,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    fn from_label(value: &str) -> Option<Self> {
+        let normalized = normalize_model_selection_label(value);
+        match normalized.as_str() {
+            "即時" | "即時推理" | "instant" | "fast" | "light" | "low" => Some(Self::Instant),
+            "中" | "中等" | "中等推理" | "medium" | "standard" | "thinking" => {
+                Some(Self::Medium)
+            }
+            "高" | "高推理" | "high" | "heavy" | "extended" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
+fn normalize_model_selection_label(value: &str) -> String {
+    let mut normalized = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>();
+    for marker in ["currentlyselected", "已選取", "selected", "已選"] {
+        if let Some(stripped) = normalized.strip_prefix(marker) {
+            normalized = stripped.to_string();
+        }
+        if let Some(stripped) = normalized.strip_suffix(marker) {
+            normalized = stripped.to_string();
+        }
+    }
+    normalized
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ModelSelectionEvidence {
+    CheckedStateV1,
+    AccessibleLabelV1,
+    BoundedOrdinalV1,
+    ResolvedBoundedOrdinalV2,
+    ClosedSetCalibrationV1,
+    OrderedBoundedEffortV1,
+    LabeledEffortPositionMapV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModelSelectionOutcome {
+    contract: ModelSelectionContract,
+    evidence: ModelSelectionEvidence,
+    /// v5/v6 only: number of positions carrying a directly observed semantic
+    /// label within the verified selection window.
+    direct_semantic_count: Option<u8>,
+    /// v6 only: span (`max - min + 1`) of the window that carried the verified
+    /// selection. `None` for every legacy contract.
+    position_count: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedOutputType {
+    #[default]
+    Text,
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseCompletion {
+    #[default]
+    Pending,
+    Completed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResponseFailureCode {
+    AssistantCountChanged,
+    PageOwnershipChanged,
+    PageUrlChanged,
+    ResponseIdentityChanged,
+    ProviderRejected,
+    ResponseProbeFailed,
+    ResponseTimeout,
+    PromptSubmissionStateUnknown,
+    ImageDownloadEmpty,
+    ImageDownloadFailed,
+}
+
+impl fmt::Display for ResponseFailureCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            ResponseFailureCode::AssistantCountChanged => "assistant_count_changed",
+            ResponseFailureCode::PageOwnershipChanged => "page_ownership_changed",
+            ResponseFailureCode::PageUrlChanged => "page_url_changed",
+            ResponseFailureCode::ResponseIdentityChanged => "response_identity_changed",
+            ResponseFailureCode::ProviderRejected => "provider_rejected",
+            ResponseFailureCode::ResponseProbeFailed => "response_probe_failed",
+            ResponseFailureCode::ResponseTimeout => "response_timeout",
+            ResponseFailureCode::PromptSubmissionStateUnknown => "prompt_submission_state_unknown",
+            ResponseFailureCode::ImageDownloadEmpty => "image_download_empty",
+            ResponseFailureCode::ImageDownloadFailed => "image_download_failed",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ImageDownloadError {
+    ResponseIdentityChanged,
+    DownloadFailed(String),
+}
+
+impl fmt::Display for ImageDownloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImageDownloadError::ResponseIdentityChanged => {
+                formatter.write_str("verified response identity changed before image download")
+            }
+            ImageDownloadError::DownloadFailed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for ImageDownloadError {
+    fn from(message: String) -> Self {
+        Self::DownloadFailed(message)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct ResponseDomProbe {
+    ownership_token_matches: bool,
+    provider_url_owned: bool,
+    url: String,
+    conversation_id: String,
+    turn_id: String,
+    artifact_ids: Vec<String>,
+    user_count: usize,
+    assistant_count: usize,
+    generation_control_visible: bool,
+    content_present: bool,
+    content_text_length: usize,
+    provider_failure_visible: bool,
+    loaded_large_image_count: usize,
+    dom_signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedResponseIdentity {
+    conversation_id: String,
+    turn_id: String,
+    artifact_ids: Vec<String>,
+    user_count: usize,
+    assistant_count: usize,
+    dom_signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResponseTrackerDecision {
+    Pending,
+    Completed(VerifiedResponseIdentity),
+    Unknown(ResponseFailureCode),
+}
+
+#[derive(Debug)]
+struct ResponseCompletionTracker {
+    expected_output_type: ExpectedOutputType,
+    initial_user_count: usize,
+    initial_assistant_count: usize,
+    response_conversation_id: Option<String>,
+    response_turn_id: Option<String>,
+    response_artifact_ids: Option<Vec<String>>,
+    stable_signature: Option<String>,
+    stable_probes: usize,
+    provider_failure_signature: Option<String>,
+    provider_failure_probes: usize,
+    was_generating: bool,
+    terminal: Option<ResponseTrackerDecision>,
+}
+
+impl ResponseCompletionTracker {
+    fn new(
+        expected_output_type: ExpectedOutputType,
+        initial_user_count: usize,
+        initial_assistant_count: usize,
+    ) -> Self {
+        Self {
+            expected_output_type,
+            initial_user_count,
+            initial_assistant_count,
+            response_conversation_id: None,
+            response_turn_id: None,
+            response_artifact_ids: None,
+            stable_signature: None,
+            stable_probes: 0,
+            provider_failure_signature: None,
+            provider_failure_probes: 0,
+            was_generating: false,
+            terminal: None,
+        }
+    }
+
+    fn observe(&mut self, probe: ResponseDomProbe) -> ResponseTrackerDecision {
+        if let Some(decision) = &self.terminal {
+            return decision.clone();
+        }
+
+        if !probe.ownership_token_matches {
+            return self.finish_unknown(ResponseFailureCode::PageOwnershipChanged);
+        }
+        if !probe.provider_url_owned {
+            return self.finish_unknown(ResponseFailureCode::PageUrlChanged);
+        }
+        if probe.user_count < self.initial_user_count
+            || probe.user_count > self.initial_user_count.saturating_add(1)
+        {
+            return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+        }
+        if probe.assistant_count < self.initial_assistant_count
+            || probe.assistant_count > self.initial_assistant_count.saturating_add(1)
+        {
+            return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
+        }
+        if probe.user_count == self.initial_user_count {
+            if self.response_conversation_id.is_some() {
+                return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+            }
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+        if probe.assistant_count == self.initial_assistant_count {
+            if self.response_conversation_id.is_some() {
+                return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
+            }
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+
+        match (
+            &self.response_conversation_id,
+            probe.conversation_id.as_str(),
+        ) {
+            (None, "") => {}
+            (None, conversation_id) => {
+                self.response_conversation_id = Some(conversation_id.to_string());
+            }
+            (Some(current), next) if current == next => {}
+            (Some(current), next)
+                if current.starts_with("home:") && next.starts_with("conversation:") =>
+            {
+                // ChatGPT creates a conversation with history.pushState after
+                // the first assistant shell appears.  The home page is not a
+                // response identity; lock only once the canonical /c/<id>
+                // route exists.  A later conversation-id change remains an
+                // ownership failure.
+                self.response_conversation_id = Some(next.to_string());
+            }
+            (Some(current), next)
+                if current.starts_with("conversation:WEB:")
+                    && next.starts_with("conversation:")
+                    && !next.starts_with("conversation:WEB:") =>
+            {
+                // The isolated ChatGPT tab can expose a temporary WEB
+                // conversation id before the server assigns the canonical
+                // UUID.  Treat that one SPA replacement like the home-page
+                // transition; once a real id is locked, A -> B is unknown.
+                self.response_conversation_id = Some(next.to_string());
+            }
+            (Some(_), _) => {
+                return self.finish_unknown(ResponseFailureCode::PageUrlChanged);
+            }
+        }
+
+        if probe.generation_control_visible {
+            // Provider UIs can briefly hide and remount Stop while the same
+            // image response is transitioning from an assistant shell to its
+            // loaded artifact.  It is a readiness signal, not an identity
+            // signal; counts, route, ownership token and semantic anchors
+            // above remain the fail-closed identity gates.
+            //
+            // During active generation the DOM legitimately evolves: turn_id
+            // and artifact_ids change as the image artifact is created and
+            // loaded.  Update the stored identity to the latest probe values
+            // rather than treating the drift as a terminal identity violation.
+            // The strict identity gates below only run once generation has
+            // stopped, so a post-generation identity change is still caught.
+            if !probe.turn_id.is_empty() {
+                self.response_turn_id = Some(probe.turn_id.clone());
+            }
+            if !probe.artifact_ids.is_empty() {
+                self.response_artifact_ids = Some(probe.artifact_ids.clone());
+            }
+            self.was_generating = true;
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+
+        // When transitioning from generating to not-generating, ChatGPT
+        // re-renders the response DOM (turn_id / artifact_ids may change as
+        // the image artifact is finalised).  Update the stored identity once
+        // to absorb this post-generation evolution, then proceed to the
+        // normal stability + identity checks for subsequent probes.
+        if self.was_generating {
+            if !probe.turn_id.is_empty() {
+                self.response_turn_id = Some(probe.turn_id.clone());
+            }
+            if !probe.artifact_ids.is_empty() {
+                self.response_artifact_ids = Some(probe.artifact_ids.clone());
+            }
+            self.was_generating = false;
+        }
+
+        if !probe.turn_id.is_empty() {
+            match &self.response_turn_id {
+                Some(current) if current != &probe.turn_id => {
+                    return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+                }
+                None => self.response_turn_id = Some(probe.turn_id.clone()),
+                Some(_) => {}
+            }
+        }
+        if !probe.artifact_ids.is_empty() {
+            match &self.response_artifact_ids {
+                Some(current) if current != &probe.artifact_ids => {
+                    return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+                }
+                None => self.response_artifact_ids = Some(probe.artifact_ids.clone()),
+                Some(_) => {}
+            }
+        }
+
+        if self.expected_output_type == ExpectedOutputType::Image
+            && probe.provider_failure_visible
+            && probe.content_present
+            && probe.loaded_large_image_count == 0
+            && !probe.dom_signature.is_empty()
+            && probe.conversation_id.starts_with("conversation:")
+            && !probe.turn_id.is_empty()
+            && probe.artifact_ids.is_empty()
+        {
+            // A provider refusal is a terminal response, but it does not
+            // satisfy the image artifact contract.  Require the same
+            // provider marker and DOM signature to persist for the normal
+            // stability window so a transient error label cannot terminate a
+            // still-streaming response.  Once stable, fail closed instead of
+            // waiting for the full provider timeout; the submitted receipt
+            // remains ambiguous for the caller.
+            if self.provider_failure_signature.as_deref() == Some(probe.dom_signature.as_str()) {
+                self.provider_failure_probes = self.provider_failure_probes.saturating_add(1);
+            } else {
+                self.provider_failure_signature = Some(probe.dom_signature.clone());
+                self.provider_failure_probes = 1;
+            }
+            if self.provider_failure_probes >= RESPONSE_REQUIRED_STABLE_PROBES {
+                return self.finish_unknown(ResponseFailureCode::ProviderRejected);
+            }
+            return ResponseTrackerDecision::Pending;
+        }
+
+        let artifact_ready = match self.expected_output_type {
+            ExpectedOutputType::Text => {
+                probe.content_present && probe.content_text_length >= MINIMUM_TEXT_RESPONSE_BYTES
+            }
+            ExpectedOutputType::Image => probe.loaded_large_image_count > 0,
+        };
+        if !artifact_ready || probe.dom_signature.is_empty() {
+            self.reset_stability();
+            return ResponseTrackerDecision::Pending;
+        }
+
+        if self.stable_signature.as_deref() == Some(probe.dom_signature.as_str()) {
+            self.stable_probes = self.stable_probes.saturating_add(1);
+        } else {
+            self.stable_signature = Some(probe.dom_signature.clone());
+            self.stable_probes = 1;
+        }
+
+        if self.stable_probes < RESPONSE_REQUIRED_STABLE_PROBES {
+            return ResponseTrackerDecision::Pending;
+        }
+
+        let decision = ResponseTrackerDecision::Completed(VerifiedResponseIdentity {
+            conversation_id: self.response_conversation_id.clone().unwrap_or_default(),
+            turn_id: self.response_turn_id.clone().unwrap_or_default(),
+            artifact_ids: self.response_artifact_ids.clone().unwrap_or_default(),
+            user_count: probe.user_count,
+            assistant_count: probe.assistant_count,
+            dom_signature: probe.dom_signature,
+        });
+        self.terminal = Some(decision.clone());
+        decision
+    }
+
+    fn timeout(&mut self) -> ResponseTrackerDecision {
+        if let Some(decision) = &self.terminal {
+            return decision.clone();
+        }
+        self.finish_unknown(ResponseFailureCode::ResponseTimeout)
+    }
+
+    fn finish_unknown(&mut self, code: ResponseFailureCode) -> ResponseTrackerDecision {
+        let decision = ResponseTrackerDecision::Unknown(code);
+        self.terminal = Some(decision.clone());
+        decision
+    }
+
+    fn reset_stability(&mut self) {
+        self.stable_signature = None;
+        self.stable_probes = 0;
+        self.provider_failure_signature = None;
+        self.provider_failure_probes = 0;
+    }
+}
+
+fn enforce_download_contract(
+    expected_output_type: ExpectedOutputType,
+    download_result: Result<usize, ImageDownloadError>,
+) -> Result<usize, ResponseFailureCode> {
+    match download_result {
+        Err(ImageDownloadError::ResponseIdentityChanged) => {
+            Err(ResponseFailureCode::ResponseIdentityChanged)
+        }
+        Err(ImageDownloadError::DownloadFailed(_)) => Err(ResponseFailureCode::ImageDownloadFailed),
+        Ok(0) if expected_output_type == ExpectedOutputType::Image => {
+            Err(ResponseFailureCode::ImageDownloadEmpty)
+        }
+        Ok(downloaded) => Ok(downloaded),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SessionReceipt {
+    schema_version: u8,
+    capability: String,
+    capabilities: Vec<String>,
+    attachment_verification: AttachmentVerification,
+    attachment_count: usize,
+    attachment_total_bytes: u64,
+    prompt_submission: PromptSubmission,
+    failure_code: Option<String>,
+    #[serde(default)]
+    model_selection: ModelSelection,
+    #[serde(default)]
+    model_selection_contract: Option<ModelSelectionContract>,
+    #[serde(default)]
+    model_selection_evidence: Option<ModelSelectionEvidence>,
+    /// v5 (0..=3) and v6 (1..=position_count) verified selections only:
+    /// number of positions with a directly observed semantic label. Null for
+    /// other verified selections and for failed paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_selection_direct_semantic_count: Option<u8>,
+    /// v6 only: span (`max - min + 1`, 2..=8) of the verified selection
+    /// window. Null for every legacy contract and for failed paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_selection_position_count: Option<u8>,
+    #[serde(default)]
+    failure_stage: Option<String>,
+    #[serde(default)]
+    expected_output_type: ExpectedOutputType,
+    #[serde(default)]
+    response_completion: ResponseCompletion,
+    #[serde(default)]
+    downloaded_image_count: usize,
+    #[serde(default)]
+    response_failure_code: Option<ResponseFailureCode>,
+}
+
+impl SessionReceipt {
+    #[cfg(test)]
+    fn new(attachment_count: usize, attachment_total_bytes: u64) -> Self {
+        Self::new_for_output(
+            attachment_count,
+            attachment_total_bytes,
+            ExpectedOutputType::Text,
+        )
+    }
+
+    fn new_for_output(
+        attachment_count: usize,
+        attachment_total_bytes: u64,
+        expected_output_type: ExpectedOutputType,
+    ) -> Self {
+        Self {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+            capabilities: vec![
+                ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+                BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string(),
+                VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
+                VERIFIED_MIXED_ATTACHMENT_CAPABILITY.to_string(),
+                VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V2_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V3_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V4_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V5_CAPABILITY.to_string(),
+                VERIFIED_MODEL_SELECTION_V6_CAPABILITY.to_string(),
+                VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY.to_string(),
+            ],
+            attachment_verification: AttachmentVerification::Pending,
+            attachment_count,
+            attachment_total_bytes,
+            prompt_submission: PromptSubmission::NotStarted,
+            failure_code: None,
+            model_selection: ModelSelection::NotRequested,
+            model_selection_contract: None,
+            model_selection_evidence: None,
+            model_selection_direct_semantic_count: None,
+            model_selection_position_count: None,
+            failure_stage: None,
+            expected_output_type,
+            response_completion: ResponseCompletion::Pending,
+            downloaded_image_count: 0,
+            response_failure_code: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionReceiptEvent {
+    AttachmentsVerified,
+    AttachmentsFailed,
+    PromptIntentRecorded,
+    PromptSubmitted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptSubmissionFailureDisposition {
+    SafeBeforeClick,
+    UnknownAfterClick,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptSubmissionFailure {
+    disposition: PromptSubmissionFailureDisposition,
+    message: String,
+}
+
+impl PromptSubmissionFailure {
+    fn safe(message: impl Into<String>) -> Self {
+        Self {
+            disposition: PromptSubmissionFailureDisposition::SafeBeforeClick,
+            message: message.into(),
+        }
+    }
+
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            disposition: PromptSubmissionFailureDisposition::UnknownAfterClick,
+            message: message.into(),
+        }
+    }
+
+    fn with_context(mut self, context: &str) -> Self {
+        self.message = format!("{}: {}", context, self.message);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachmentSummary {
+    file_names: Vec<String>,
+    total_bytes: u64,
+}
+
+impl AttachmentSummary {
+    fn count(&self) -> usize {
+        self.file_names.len()
+    }
+}
+
+struct ProviderLease {
+    file: std::fs::File,
+    _path: PathBuf,
+}
+
+impl Drop for ProviderLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn acquire_provider_lease(provider: Provider, session_id: &str) -> Result<ProviderLease, String> {
+    let path = provider_lease_path(provider)?;
+    acquire_provider_lease_at(&path, provider, session_id)
+}
+
+fn acquire_provider_lease_at(
+    path: &Path,
+    provider: Provider,
+    session_id: &str,
+) -> Result<ProviderLease, String> {
+    if let Some(parent) = path.parent() {
+        ensure_private_directory(parent)?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("ask-bridge lease 路徑不是受信任的 regular file".to_string());
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("無法開啟 {}：{}", path.display(), error))?;
+    file.try_lock_exclusive().map_err(|_| {
+        format!(
+            "{} 目前已有另一個 ask-bridge 工作；請等待該工作完成後再試",
+            provider.display_name()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("無法設定 ask-bridge lease 權限：{}", error))?;
+    }
+
+    let record = serde_json::json!({
+        "pid": std::process::id(),
+        "provider": provider.to_string(),
+        "session_id": validate_session_id(session_id)?,
+    });
+    let content = serde_json::to_vec(&record)
+        .map_err(|error| format!("無法序列化 ask-bridge lease：{}", error))?;
+    file.set_len(0)
+        .map_err(|error| format!("無法清理 ask-bridge lease：{}", error))?;
+    (&file)
+        .write_all(&content)
+        .map_err(|error| format!("無法寫入 ask-bridge lease：{}", error))?;
+    file.sync_all()
+        .map_err(|error| format!("無法同步 ask-bridge lease：{}", error))?;
+
+    Ok(ProviderLease {
+        file,
+        _path: path.to_path_buf(),
+    })
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("受保護狀態目錄不是可信任的 directory".to_string());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .map_err(|error| format!("無法建立受保護狀態目錄：{}", error))?;
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| format!("無法驗證受保護狀態目錄：{}", error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("受保護狀態目錄建立後不是可信任的 directory".to_string());
+            }
+        }
+        Err(error) => return Err(format!("無法檢查受保護狀態目錄：{}", error)),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("無法設定受保護狀態目錄權限：{}", error))?;
+    }
+    Ok(())
+}
+
+fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("無法判定 receipt 目錄：{}", path.display()))?;
+    ensure_private_directory(parent)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("受保護 JSON 目標不是可信任的 regular file".to_string());
+    }
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let content = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("無法序列化 session receipt：{}", error))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|error| format!("無法建立暫存 receipt：{}", error))?;
+        file.write_all(&content)
+            .map_err(|error| format!("無法寫入 session receipt：{}", error))?;
+        file.sync_all()
+            .map_err(|error| format!("無法同步 session receipt：{}", error))?;
+        std::fs::rename(&temp_path, path)
+            .map_err(|error| format!("無法原子發布 session receipt：{}", error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("無法設定 session receipt 權限：{}", error))?;
+            let parent_directory = std::fs::File::open(parent)
+                .map_err(|error| format!("無法開啟 receipt 目錄以同步：{}", error))?;
+            parent_directory
+                .sync_all()
+                .map_err(|error| format!("無法同步 receipt 目錄：{}", error))?;
+        }
+        Ok::<(), String>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn read_session_receipt(path: &Path) -> Result<SessionReceipt, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("無法讀取 session receipt metadata：{}", error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("session receipt 不是可信任的 regular file".to_string());
+    }
+    let receipt: SessionReceipt = serde_json::from_slice(
+        &std::fs::read(path).map_err(|error| format!("無法讀取 session receipt：{}", error))?,
+    )
+    .map_err(|error| format!("session receipt 格式無效：{}", error))?;
+    if receipt.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
+        return Err("session receipt schema version 不相容".to_string());
+    }
+    Ok(receipt)
+}
+
+fn write_attachment_probe_receipt(
+    path: &Path,
+    probe: &AttachmentProbeSummary,
+) -> Result<(), String> {
+    let receipt = read_session_receipt(path)?;
+    // attachment_probe is an additive field; prompt_submission stays
+    // not_started for the verify-attachments-only mode.
+    let mut json =
+        serde_json::to_value(&receipt).map_err(|error| format!("無法序列化 receipt：{}", error))?;
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "attachment_probe".to_string(),
+            serde_json::to_value(probe).unwrap_or_default(),
+        );
+    }
+    write_private_json(path, &json)?;
+    Ok(())
+}
+
+fn write_session_receipt_preserving_attachment_probe(
+    path: &Path,
+    receipt: &SessionReceipt,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("無法讀取 session receipt metadata：{}", error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("session receipt 不是可信任的 regular file".to_string());
+    }
+    let existing = serde_json::from_slice::<Value>(
+        &std::fs::read(path).map_err(|error| format!("無法讀取 session receipt：{}", error))?,
+    )
+    .map_err(|error| format!("session receipt 格式無效：{}", error))?;
+    let attachment_probe = existing.get("attachment_probe").cloned();
+    let mut updated = serde_json::to_value(receipt)
+        .map_err(|error| format!("無法序列化 session receipt：{}", error))?;
+    if let (Some(probe), Some(object)) = (attachment_probe, updated.as_object_mut()) {
+        object.insert("attachment_probe".to_string(), probe);
+    }
+    write_private_json(path, &updated)
+}
+
+fn record_model_selection_verified(
+    path: &Path,
+    outcome: ModelSelectionOutcome,
+) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission != PromptSubmission::NotStarted {
+        return Err("prompt 已開始後不得回寫模型選擇 verified".to_string());
+    }
+    if receipt.model_selection == ModelSelection::Failed {
+        return Err("模型選擇已失敗後不得回寫 verified".to_string());
+    }
+    receipt.model_selection = ModelSelection::Verified;
+    receipt.model_selection_contract = Some(outcome.contract);
+    receipt.model_selection_evidence = Some(outcome.evidence);
+    match outcome.contract {
+        ModelSelectionContract::ReasoningOrderedControlV3 => {
+            let count = outcome.direct_semantic_count.filter(|count| *count <= 3);
+            if count.is_none() {
+                return Err("v5 verified receipt 缺少合法的 direct semantic count".to_string());
+            }
+            receipt.model_selection_direct_semantic_count = count;
+            receipt.model_selection_position_count = None;
+        }
+        ModelSelectionContract::ReasoningLabeledOrderedControlV4 => {
+            let position_count = outcome
+                .position_count
+                .filter(|count| (2..=8).contains(count));
+            let count = outcome.direct_semantic_count;
+            let counts_are_legal = match (position_count, count) {
+                (Some(span), Some(count)) => count >= 1 && count <= span,
+                _ => false,
+            };
+            if !counts_are_legal {
+                return Err("v6 verified receipt 缺少合法的 labeled position count".to_string());
+            }
+            receipt.model_selection_position_count = position_count;
+            receipt.model_selection_direct_semantic_count = count;
+        }
+        ModelSelectionContract::LegacyMenuV1
+        | ModelSelectionContract::ReasoningSliderV1
+        | ModelSelectionContract::ReasoningCalibratedControlV2 => {
+            receipt.model_selection_direct_semantic_count = None;
+            receipt.model_selection_position_count = None;
+        }
+    }
+    receipt.failure_stage = None;
+    receipt.failure_code = None;
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("模型選擇 verified receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn record_model_selection_failed(path: &Path) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission != PromptSubmission::NotStarted {
+        return Err("prompt 已開始後不得標記模型選擇安全失敗".to_string());
+    }
+    receipt.model_selection = ModelSelection::Failed;
+    receipt.model_selection_contract = None;
+    receipt.model_selection_evidence = None;
+    receipt.model_selection_direct_semantic_count = None;
+    receipt.model_selection_position_count = None;
+    receipt.failure_stage = Some(MODEL_SELECTION_FAILURE_STAGE.to_string());
+    receipt.failure_code = Some(MODEL_SELECTION_FAILURE_CODE.to_string());
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("模型選擇 failed receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    match event {
+        SessionReceiptEvent::AttachmentsVerified => {
+            if receipt.attachment_verification != AttachmentVerification::Pending
+                || receipt.prompt_submission != PromptSubmission::NotStarted
+            {
+                return Err("附件驗證狀態轉移不合法".to_string());
+            }
+            receipt.attachment_verification = AttachmentVerification::Verified;
+            receipt.failure_code = None;
+        }
+        SessionReceiptEvent::AttachmentsFailed => {
+            if receipt.attachment_verification != AttachmentVerification::Pending
+                || receipt.prompt_submission != PromptSubmission::NotStarted
+            {
+                return Err("prompt intent 後不得標記附件為安全失敗".to_string());
+            }
+            receipt.attachment_verification = AttachmentVerification::Failed;
+            receipt.failure_code = Some(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        SessionReceiptEvent::PromptIntentRecorded => {
+            if receipt.attachment_verification != AttachmentVerification::Verified
+                || receipt.prompt_submission != PromptSubmission::NotStarted
+            {
+                return Err("附件尚未驗證或 prompt 已開始，拒絕記錄新的 submit intent".to_string());
+            }
+            receipt.prompt_submission = PromptSubmission::IntentRecorded;
+        }
+        SessionReceiptEvent::PromptSubmitted => {
+            if receipt.prompt_submission != PromptSubmission::IntentRecorded {
+                return Err("沒有 durable intent，拒絕標記 prompt submitted".to_string());
+            }
+            receipt.prompt_submission = PromptSubmission::Submitted;
+        }
+    }
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("session receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn record_prompt_submission_failure(
+    path: &Path,
+    disposition: PromptSubmissionFailureDisposition,
+) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.attachment_verification != AttachmentVerification::Verified
+        || receipt.prompt_submission != PromptSubmission::IntentRecorded
+    {
+        return Err("prompt submission failure receipt 狀態不合法".to_string());
+    }
+    if receipt.response_completion != ResponseCompletion::Pending {
+        return Err("prompt submission failure 不得覆寫既有 response 終態".to_string());
+    }
+
+    receipt.failure_stage = Some(PROMPT_SUBMISSION_FAILURE_STAGE.to_string());
+    match disposition {
+        PromptSubmissionFailureDisposition::SafeBeforeClick => {
+            receipt.failure_code = Some(PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE.to_string());
+            receipt.response_failure_code = None;
+        }
+        PromptSubmissionFailureDisposition::UnknownAfterClick => {
+            receipt.failure_code = Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE.to_string());
+            receipt.response_completion = ResponseCompletion::Unknown;
+            receipt.response_failure_code = Some(ResponseFailureCode::PromptSubmissionStateUnknown);
+        }
+    }
+
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("prompt submission failure receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn record_session_response_outcome(
+    path: &Path,
+    completion: ResponseCompletion,
+    downloaded_image_count: usize,
+    failure_code: Option<ResponseFailureCode>,
+) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission == PromptSubmission::NotStarted {
+        return Err("prompt 尚未開始，不得記錄 response terminal outcome".to_string());
+    }
+    if completion == ResponseCompletion::Pending {
+        return Err("response outcome 不得回寫 pending".to_string());
+    }
+    if receipt.response_completion == ResponseCompletion::Unknown
+        && completion != ResponseCompletion::Unknown
+    {
+        return Err("unknown response outcome 不得改寫為其他終態".to_string());
+    }
+    if receipt.response_completion == ResponseCompletion::Completed
+        && completion != ResponseCompletion::Completed
+    {
+        return Err("completed response outcome 不得倒退".to_string());
+    }
+    if downloaded_image_count < receipt.downloaded_image_count {
+        return Err("下載圖片計數不得倒退".to_string());
+    }
+    if completion == ResponseCompletion::Unknown && failure_code.is_none() {
+        return Err("unknown response outcome 必須包含固定 failure code".to_string());
+    }
+
+    receipt.response_completion = completion;
+    receipt.downloaded_image_count = downloaded_image_count;
+    receipt.response_failure_code = failure_code;
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("response outcome 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+fn write_session_receipt(
+    session_id: &str,
+    attachment_count: usize,
+    attachment_total_bytes: u64,
+    expected_output_type: ExpectedOutputType,
+) -> Result<PathBuf, String> {
+    let session_id = validate_session_id(session_id)?;
+    let path = session_receipt_path(&session_id)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(
+                "session receipt 已存在；請使用新的 UUID，避免重用舊分頁 ownership".to_string(),
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("無法檢查 session receipt：{}", error)),
+    }
+    let receipt = SessionReceipt::new_for_output(
+        attachment_count,
+        attachment_total_bytes,
+        expected_output_type,
+    );
+    write_private_json(&path, &receipt)?;
+    let persisted = read_session_receipt(&path)?;
+    if persisted != receipt {
+        return Err("session receipt 驗證失敗：內容與本次工作不一致".to_string());
+    }
+    Ok(path)
+}
+
+fn capabilities_value() -> Value {
+    serde_json::json!({
+        "schema_version": 2,
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [
+            ISOLATED_NEW_TAB_CAPABILITY,
+            BACKGROUND_ISOLATED_TAB_CAPABILITY,
+            VERIFIED_FILE_UPLOAD_CAPABILITY,
+            VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
+            VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V2_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
+            VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY
+        ],
+        "isolated_new_tab_v1": {
+            "flag": "--new-tab-preserve-existing",
+            "session_id_flag": "--session-id",
+            "receipt": "0600-json",
+            "ownership": "exact-page-id",
+            "lease": "provider-scoped-cross-process"
+        },
+        "background_isolated_tab_v1": {
+            "new_page_background": "headless",
+            "foreground": "visible",
+            "scope": "isolated-new-tab-only"
+        },
+        "verified_file_upload_v1": {
+            "verification": "filename-multiset-stable-dom-probe",
+            "stable_probes": ATTACHMENT_REQUIRED_STABLE_PROBES,
+            "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
+            "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
+            "timeout_per_file_seconds": 15,
+            "submit_before_verified": false
+        },
+        "verified_mixed_attachment_upload_v1": {
+            "verification": "typed-document-image-stable-dom-probe",
+            "document_evidence": "filename-multiset",
+            "image_evidence": "preview-delta-natural-dimensions",
+            "upload_sequence": "documents-first-then-images",
+            "stable_probes": ATTACHMENT_REQUIRED_STABLE_PROBES,
+            "probe_interval_ms": ATTACHMENT_VERIFY_POLL_INTERVAL.as_millis(),
+            "timeout_seconds": ATTACHMENT_VERIFY_TIMEOUT.as_secs(),
+            "timeout_per_file_seconds": 15,
+            "submit_before_verified": false,
+            "receipt_fields": ["attachment_probe"]
+        },
+        "verified_prompt_submission_outcome_v1": {
+            "failure_stage": PROMPT_SUBMISSION_FAILURE_STAGE,
+            "safe_before_click_code": PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE,
+            "unknown_after_click_code": PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE,
+            "unknown_response_code": "prompt_submission_state_unknown",
+            "echo_verification": "semantic_projection_v2",
+            "prompt_or_response_text_in_receipt": false
+        },
+        "verified_image_response_completion_v1": {
+            "expected_output_flag": "--image-output",
+            "verification": "new-assistant-no-generation-control-loaded-large-image-stable-dom",
+            "user_delta": 1,
+            "assistant_delta": 1,
+            "minimum_image_dimension": GENERATED_IMAGE_MIN_DIMENSION,
+            "stable_probes": RESPONSE_REQUIRED_STABLE_PROBES,
+            "probe_interval_ms": RESPONSE_POLL_INTERVAL.as_millis(),
+            "zero_images_exit_success": false,
+            "download_error_exit_success": false,
+            "interference_result": "unknown",
+            "receipt_fields": [
+                "expected_output_type",
+                "response_completion",
+                "downloaded_image_count",
+                "response_failure_code"
+            ]
+        },
+        "verified_model_selection_v1": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "failure_stage",
+                "failure_code"
+            ]
+        },
+        "verified_model_selection_v2": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1"],
+            "evidence": ["checked_state_v1", "accessible_label_v1", "bounded_ordinal_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "ordinal_profile": {
+                "marker": "data-model-reasoning-effort-slider",
+                "role": "slider",
+                "min": 0,
+                "max": 2,
+                "total": 3,
+                "mapping": {"instant": 0, "medium": 1, "high": 2},
+                "transition": "exact_single_step"
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "failure_stage",
+                "failure_code"
+            ]
+        },
+        "verified_model_selection_v3": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1"],
+            "evidence": ["checked_state_v1", "accessible_label_v1", "bounded_ordinal_v1", "resolved_bounded_ordinal_v2"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "ordinal_profile": {
+                "min": 0,
+                "max": 2,
+                "total": 3,
+                "mapping": {"instant": 0, "medium": 1, "high": 2},
+                "transition": "exact_single_step"
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "failure_stage",
+                "failure_code"
+            ]
+        },
+        "verified_model_selection_v4": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1", "reasoning_calibrated_control_v2"],
+            "evidence": ["checked_state_v1", "accessible_label_v1", "bounded_ordinal_v1", "resolved_bounded_ordinal_v2", "closed_set_calibration_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "calibration": {
+                "closed_set": ["instant", "medium", "high"],
+                "minimum_direct_semantics": 2,
+                "third_value": "unique_remaining_value",
+                "ordinal_is_consistency_check": true
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "failure_stage",
+                "failure_code"
+            ]
+        },
+        "verified_model_selection_v5": {
+            "selection_contracts": ["legacy_menu_v1", "reasoning_slider_v1", "reasoning_ordered_control_v3"],
+            "evidence": ["checked_state_v1", "accessible_label_v1", "bounded_ordinal_v1", "resolved_bounded_ordinal_v2", "ordered_bounded_effort_v1"],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "calibration": {
+                "domain": "typed_ordered_three_state",
+                "closed_set": ["instant", "medium", "high"],
+                "rank_mapping": {"instant": 0, "medium": 1, "high": 2},
+                "minimum_direct_semantics": 0,
+                "maximum_direct_semantics": 3,
+                "direct_semantics": "supporting_contradiction_veto_only",
+                "target_index_source": "typed_effort_rank",
+                "ordinal_is_consistency_check": true
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "model_selection_direct_semantic_count",
+                "failure_stage",
+                "failure_code"
+            ]
+        },
+        "verified_model_selection_v6": {
+            "selection_contracts": [
+                "legacy_menu_v1",
+                "reasoning_slider_v1",
+                "reasoning_labeled_ordered_control_v4"
+            ],
+            "evidence": [
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2",
+                "labeled_effort_position_map_v1"
+            ],
+            "verified_after_selection": true,
+            "pre_submit_fail_closed": true,
+            "trusted_input": "mcp_press_key",
+            "post_selection_persistence": "close_reopen_state",
+            "control_bundle": {
+                "marker": "data-model-reasoning-effort-slider",
+                "state_owner_relation": ["marker", "descendant"],
+                "focus_owner_relation": ["state_owner", "descendant"],
+                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+            },
+            "labeled_position_map": {
+                "domain": "labeled_ordered_position_map",
+                "minimum_span": 2,
+                "maximum_span": 8,
+                "label_source": "nearest_reasoning_container_aria_describedby",
+                "target_index_source": "direct_label_match",
+                "lock_evidence": [
+                    "tick_data_locked",
+                    "root_data_locked",
+                    "announcement_upgrade_hint"
+                ],
+                "unknown_label_policy": "skippable_not_selectable",
+                "duplicate_label_policy": "fail_closed",
+                "minimum_direct_semantics": 1,
+                "maximum_direct_semantics": 8,
+                "ordinal_is_consistency_check": true
+            },
+            "receipt_fields": [
+                "model_selection",
+                "model_selection_contract",
+                "model_selection_evidence",
+                "model_selection_position_count",
+                "model_selection_direct_semantic_count",
+                "failure_stage",
+                "failure_code"
+            ]
+        }
+    })
+}
+
+fn print_capabilities(json_output: bool) -> Result<(), String> {
+    let value = capabilities_value();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&value)
+                .map_err(|error| format!("無法輸出 capabilities：{}", error))?
+        );
+    } else {
+        println!("ask-bridge capabilities");
+        println!("  {}", ISOLATED_NEW_TAB_CAPABILITY);
+        println!("  {}", BACKGROUND_ISOLATED_TAB_CAPABILITY);
+        println!("  {}", VERIFIED_FILE_UPLOAD_CAPABILITY);
+        println!("  {}", VERIFIED_MIXED_ATTACHMENT_CAPABILITY);
+        println!("  {}", VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V2_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V3_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V4_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);
+        println!("  {}", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);
+        println!("  safe flag: --new-tab-preserve-existing");
+    }
+    Ok(())
 }
 
 fn parse_configured_provider(content: &str) -> Result<Option<Provider>, String> {
@@ -600,26 +2065,11 @@ fn resolve_provider(cli_provider: Option<Provider>) -> Result<Provider, String> 
 
 fn write_global_provider_config(provider: Provider) -> Result<(), String> {
     let config_path = config_file_path()?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create config directory {}: {}",
-                parent.to_string_lossy(),
-                e
-            )
-        })?;
-    }
-
-    let content =
-        serde_json::to_string_pretty(&serde_json::json!({"provider": provider.to_string()}))
-            .map_err(|e| format!("Failed to serialize provider config: {}", e))?;
-    std::fs::write(&config_path, format!("{}\n", content)).map_err(|e| {
-        format!(
-            "Failed to write config file {}: {}",
-            config_path.to_string_lossy(),
-            e
-        )
-    })?;
+    write_private_json(
+        &config_path,
+        &serde_json::json!({"provider": provider.to_string()}),
+    )
+    .map_err(|error| format!("Failed to write private provider config: {}", error))?;
 
     println!(
         "Set default provider to '{}' in {}",
@@ -726,6 +2176,18 @@ struct Page {
     selected: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedPageBinding {
+    session_id: String,
+    page_id: usize,
+}
+
+/// A safe invocation has exactly one browser page that it may mutate. The
+/// binding is process-local and is enforced again before every page-bound MCP
+/// call, so a manually selected tab or a second legacy invocation cannot turn
+/// a request into a different-tab mutation.
+static OWNED_PAGE_BINDING: std::sync::Mutex<Option<OwnedPageBinding>> = std::sync::Mutex::new(None);
+
 #[derive(Clone, Copy, Debug)]
 struct PageLoginState {
     id: usize,
@@ -804,12 +2266,7 @@ fn check_node_runtime() -> Result<(), String> {
 /// (2026-07-11). Bump this version deliberately and re-run the e2e check.
 const MCP_PACKAGE_SPEC: &str = "chrome-devtools-mcp@1.5.0";
 
-fn build_chrome_devtools_server_config(
-    quiet_mcp: bool,
-    headless: bool,
-    log_path: &str,
-    is_windows: bool,
-) -> Value {
+fn build_chrome_devtools_server_config(quiet_mcp: bool, headless: bool, is_windows: bool) -> Value {
     let mut mcp_args = vec![
         "-y".to_string(),
         MCP_PACKAGE_SPEC.to_string(),
@@ -822,8 +2279,6 @@ fn build_chrome_devtools_server_config(
     if headless {
         mcp_args.push("--headless".to_string());
     }
-    mcp_args.push("--logFile".to_string());
-    mcp_args.push(log_path.to_string());
 
     let mut chrome_devtools_server = serde_json::json!({
         "command": if is_windows { "npx.cmd" } else { "npx" },
@@ -848,25 +2303,27 @@ fn build_chrome_devtools_server_config(
 }
 
 fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
-    let mut config_dir = home::home_dir().ok_or("Could not locate home directory")?;
-    config_dir.push(".config/ask-bridge");
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("Failed to create config directory: {}", e))?;
-
-    let log_path = config_dir
-        .join("chrome-devtools-mcp.log")
-        .to_string_lossy()
-        .to_string();
-
-    config_dir.push("mcp_servers.json");
-    let config_path = config_dir.to_string_lossy().to_string();
-
-    let chrome_devtools_server = build_chrome_devtools_server_config(
+    let config_dir = ask_bridge_state_dir()?;
+    let config_path = write_mcp_config_at(
+        &config_dir,
         quiet_mcp,
         headless,
-        &log_path,
         cfg!(target_os = "windows"),
-    );
+    )?;
+    Ok(config_path.to_string_lossy().to_string())
+}
+
+fn write_mcp_config_at(
+    config_dir: &Path,
+    quiet_mcp: bool,
+    headless: bool,
+    is_windows: bool,
+) -> Result<PathBuf, String> {
+    ensure_private_directory(config_dir)?;
+    let config_path = config_dir.join("mcp_servers.json");
+
+    let chrome_devtools_server =
+        build_chrome_devtools_server_config(quiet_mcp, headless, is_windows);
 
     let config_content = serde_json::json!({
         "mcpServers": {
@@ -874,10 +2331,8 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
         }
     });
 
-    let content_str = serde_json::to_string_pretty(&config_content).map_err(|e| e.to_string())?;
-
-    std::fs::write(&config_path, content_str)
-        .map_err(|e| format!("Failed to write mcp_servers.json: {}", e))?;
+    write_private_json(&config_path, &config_content)
+        .map_err(|e| format!("Failed to write private mcp_servers.json: {}", e))?;
 
     Ok(config_path)
 }
@@ -1763,7 +3218,48 @@ const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
+#[derive(Clone, Copy, Debug)]
+struct McpOperationDeadline {
+    expires_at: Instant,
+}
+
+impl McpOperationDeadline {
+    fn from_timeout(timeout: Duration) -> Result<Self, String> {
+        Self::from_start(Instant::now(), timeout)
+    }
+
+    fn from_start(started_at: Instant, timeout: Duration) -> Result<Self, String> {
+        let expires_at = started_at
+            .checked_add(timeout)
+            .ok_or_else(|| "MCP operation deadline overflow".to_string())?;
+        Ok(Self { expires_at })
+    }
+
+    fn phase_timeout(self, cap: Duration, phase: &str) -> Result<Duration, String> {
+        self.phase_timeout_at(Instant::now(), cap, phase)
+    }
+
+    fn phase_timeout_at(
+        self,
+        now: Instant,
+        cap: Duration,
+        phase: &str,
+    ) -> Result<Duration, String> {
+        let remaining = self.expires_at.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return Err(format!("MCP operation deadline exhausted before {}", phase));
+        }
+        Ok(remaining.min(cap))
+    }
+}
+
+fn mcp_session_connect(
+    config_path: &str,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<McpSession, String> {
+    if let Some(deadline) = deadline {
+        deadline.phase_timeout(MCP_CONNECT_TIMEOUT, "MCP config load")?;
+    }
     let client = McpClient::load(Some(config_path))
         .map_err(|e| format!("Failed to load MCP config: {}", e))?;
     let server_config = client
@@ -1792,10 +3288,14 @@ fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
                 _ => client.connect("chrome-devtools").await,
             }
         };
-        match tokio::time::timeout(MCP_CONNECT_TIMEOUT, connect_future).await {
+        let connect_timeout = match deadline {
+            Some(deadline) => deadline.phase_timeout(MCP_CONNECT_TIMEOUT, "MCP session connect")?,
+            None => MCP_CONNECT_TIMEOUT,
+        };
+        match tokio::time::timeout(connect_timeout, connect_future).await {
             Err(_) => Err(format!(
                 "Failed to start chrome-devtools MCP server: timed out after {}s",
-                MCP_CONNECT_TIMEOUT.as_secs()
+                connect_timeout.as_secs()
             )),
             Ok(result) => {
                 result.map_err(|e| format!("Failed to start chrome-devtools MCP server: {}", e))
@@ -1809,7 +3309,10 @@ fn mcp_session_connect(config_path: &str) -> Result<McpSession, String> {
     })
 }
 
-fn mcp_session_reset(slot: &mut Option<McpSession>) {
+fn mcp_session_reset(
+    slot: &mut Option<McpSession>,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<(), String> {
     if let Some(session) = slot.take() {
         let McpSession {
             connection,
@@ -1819,9 +3322,23 @@ fn mcp_session_reset(slot: &mut Option<McpSession>) {
         // Best-effort close (kills the child); if even that stalls, dropping
         // the runtime stops the background tasks and the orphaned child exits
         // on stdin EOF.
+        let close_timeout = match deadline {
+            Some(deadline) => {
+                match deadline.phase_timeout(MCP_CLOSE_TIMEOUT, "MCP session reset") {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        drop(connection);
+                        drop(runtime);
+                        return Err(error);
+                    }
+                }
+            }
+            None => MCP_CLOSE_TIMEOUT,
+        };
         let _ = runtime
-            .block_on(async { tokio::time::timeout(MCP_CLOSE_TIMEOUT, connection.close()).await });
+            .block_on(async { tokio::time::timeout(close_timeout, connection.close()).await });
     }
+    Ok(())
 }
 
 fn mcp_session_call(
@@ -1829,23 +3346,28 @@ fn mcp_session_call(
     config_path: &str,
     tool: &str,
     args: Value,
+    call_timeout: Duration,
+    deadline: Option<McpOperationDeadline>,
 ) -> Result<Value, String> {
     let needs_connect = slot
         .as_ref()
         .map(|session| session.config_path != config_path)
         .unwrap_or(true);
     if needs_connect {
-        mcp_session_reset(slot);
-        *slot = Some(mcp_session_connect(config_path)?);
+        mcp_session_reset(slot, deadline)?;
+        *slot = Some(mcp_session_connect(config_path, deadline)?);
     }
     let session = slot.as_ref().expect("session connected above");
+    let tool_timeout = match deadline {
+        Some(deadline) => deadline.phase_timeout(call_timeout, "MCP tool call")?,
+        None => call_timeout,
+    };
     session.runtime.block_on(async {
-        match tokio::time::timeout(MCP_CALL_TIMEOUT, session.connection.call_tool(tool, args)).await
-        {
+        match tokio::time::timeout(tool_timeout, session.connection.call_tool(tool, args)).await {
             Err(_) => Err(format!(
                 "MCP tool '{}' timed out after {}s",
                 tool,
-                MCP_CALL_TIMEOUT.as_secs()
+                tool_timeout.as_secs()
             )),
             Ok(result) => result.map_err(|e| format!("mcp-cli library call failed: {}", e)),
         }
@@ -1863,13 +3385,23 @@ fn mcp_session_call(
 fn mcp_error_is_transport(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("timed out")
+        || lower.contains("deadline exhausted")
         || lower.contains("failed to send request to process stdin")
         || lower.contains("server process exited unexpectedly")
         || lower.contains("stdio response receiver canceled")
         || lower.contains("failed to start chrome-devtools mcp server")
 }
 
-fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+fn call_mcp_tool_raw(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+    call_mcp_tool_raw_with_deadline(config_path, tool, args, None)
+}
+
+fn call_mcp_tool_raw_with_deadline(
+    config_path: &str,
+    tool: &str,
+    args: Value,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<Value, String> {
     let _stderr_guard = if FORWARD_MCP_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
         None
     } else {
@@ -1882,11 +3414,18 @@ fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, St
     let mut slot = MCP_SESSION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match mcp_session_call(&mut slot, config_path, tool, args) {
+    match mcp_session_call(
+        &mut slot,
+        config_path,
+        tool,
+        args,
+        MCP_CALL_TIMEOUT,
+        deadline,
+    ) {
         Ok(value) => Ok(value),
         Err(error) => {
             if mcp_error_is_transport(&error) {
-                mcp_session_reset(&mut slot);
+                let _ = mcp_session_reset(&mut slot, deadline);
                 return Err(format!(
                     "{} (MCP session was reset; re-run the command)",
                     error
@@ -1894,6 +3433,180 @@ fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, St
             }
             Err(error)
         }
+    }
+}
+
+fn bind_owned_page(session_id: &str, page_id: usize) -> Result<(), String> {
+    let session_id = validate_session_id(session_id)?;
+    let mut binding = OWNED_PAGE_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if binding.is_some() {
+        return Err("本程序已有 active owned page；不得覆寫分頁 ownership".to_string());
+    }
+    *binding = Some(OwnedPageBinding {
+        session_id,
+        page_id,
+    });
+    Ok(())
+}
+
+fn clear_owned_page() {
+    let mut binding = OWNED_PAGE_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *binding = None;
+}
+
+fn owned_page_binding() -> Option<OwnedPageBinding> {
+    OWNED_PAGE_BINDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn page_bound_mcp_tool(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "list_pages" | "new_page" | "select_page" | "close_page"
+    )
+}
+
+fn call_mcp_tool(config_path: &str, tool: &str, args: Value) -> Result<Value, String> {
+    call_mcp_tool_with_deadline(config_path, tool, args, None)
+}
+
+fn call_mcp_tool_with_deadline(
+    config_path: &str,
+    tool: &str,
+    args: Value,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<Value, String> {
+    if let Some(binding) = owned_page_binding() {
+        if tool == "close_page" || tool == "new_page" {
+            return Err(format!(
+                "isolated session {} 不允許 {}，以免破壞既有或未受管頁籤",
+                binding.session_id, tool
+            ));
+        }
+        if tool == "select_page" {
+            let requested_page_id = args.get("pageId").and_then(Value::as_u64);
+            if requested_page_id != Some(binding.page_id as u64) {
+                return Err(format!(
+                    "isolated session {} 只能選取 owned page ID {}",
+                    binding.session_id, binding.page_id
+                ));
+            }
+        }
+        if page_bound_mcp_tool(tool) {
+            call_mcp_tool_raw_with_deadline(
+                config_path,
+                "select_page",
+                serde_json::json!({
+                    "pageId": binding.page_id,
+                    "bringToFront": false
+                }),
+                deadline,
+            )?;
+        }
+    }
+    call_mcp_tool_raw_with_deadline(config_path, tool, args, deadline)
+}
+
+/// Decide whether to close the owned tab after a verified success.
+///
+/// Returns the exact owned page ID to close, or an `Err` with a reason to
+/// skip. This is a pure decision: it never performs any MCP call, so it can be
+/// tested without a live browser. Cleanup is refused for submitted/unknown
+/// outcomes, identity-changed responses, unknown downloads, and unbounded
+/// pages.
+fn decide_owned_tab_cleanup(
+    binding: Option<&OwnedPageBinding>,
+    receipt: Option<&SessionReceipt>,
+) -> Result<usize, String> {
+    let Some(binding) = binding else {
+        return Err("no active owned page binding; nothing to clean up".to_string());
+    };
+    let Some(receipt) = receipt else {
+        return Err("no session receipt; cannot verify success outcome".to_string());
+    };
+    if receipt.response_completion != ResponseCompletion::Completed {
+        return Err(format!(
+            "response outcome is not Completed ({:?}); skipping cleanup",
+            receipt.response_completion
+        ));
+    }
+    if receipt.response_failure_code.is_some() {
+        return Err("response failure recorded; skipping cleanup".to_string());
+    }
+    if receipt.expected_output_type == ExpectedOutputType::Image
+        && receipt.downloaded_image_count == 0
+    {
+        return Err("image download count is unknown/empty; skipping cleanup".to_string());
+    }
+    Ok(binding.page_id)
+}
+
+/// Verify the exact owned page still exists in the live page list before
+/// closing it, so cleanup can never close an existing or unowned tab (e.g. a
+/// newly-created page that reused the ID after the owned page disappeared).
+fn verify_owned_page_present(
+    page_id: usize,
+    current_page_ids: &std::collections::HashSet<usize>,
+) -> Result<(), String> {
+    if current_page_ids.contains(&page_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "owned page ID {} is no longer present; skipping cleanup",
+            page_id
+        ))
+    }
+}
+
+/// Internal cleanup: after a verified success, raw-close the exact owned page.
+///
+/// This is a SUPPORTING, non-gating step. It deliberately uses
+/// `call_mcp_tool_raw` so it does NOT relax the general isolated mutation
+/// guard in `call_mcp_tool` (which still rejects `close_page`/`new_page`).
+/// Any failure is surfaced as an `Err` for the caller to sanitise into a
+/// warning; it never changes the success receipt, downloaded images, output
+/// files, or process exit success.
+fn cleanup_owned_page_after_success(
+    config_path: &str,
+    receipt_path: Option<&Path>,
+) -> Result<(), String> {
+    let binding = owned_page_binding();
+    let receipt = match receipt_path {
+        Some(path) => Some(read_session_receipt(path)?),
+        None => None,
+    };
+    let page_id = decide_owned_tab_cleanup(binding.as_ref(), receipt.as_ref())?;
+    let current_page_ids: std::collections::HashSet<usize> = list_pages(config_path)?
+        .into_iter()
+        .map(|page| page.id)
+        .collect();
+    verify_owned_page_present(page_id, &current_page_ids)?;
+    call_mcp_tool_raw(
+        config_path,
+        "close_page",
+        serde_json::json!({ "pageId": page_id }),
+    )?;
+    clear_owned_page();
+    Ok(())
+}
+
+/// Run owned-tab cleanup after a verified success, sanitising any failure to a
+/// warning string. Returns `None` on success (or when there is nothing to
+/// clean up) and `Some(warning)` on failure, so the caller can print the
+/// warning without changing the already-verified success result.
+fn run_owned_tab_cleanup_warning(config_path: &str, receipt_path: Option<&Path>) -> Option<String> {
+    match cleanup_owned_page_after_success(config_path, receipt_path) {
+        Ok(()) => None,
+        Err(error) => Some(format!(
+            "Warning: could not close owned tab after success: {}",
+            error
+        )),
     }
 }
 
@@ -1961,7 +3674,7 @@ fn tool_text(val: &Value) -> Result<String, String> {
         .and_then(|obj| obj.get("text"))
         .and_then(|t| t.as_str())
         .map(|text| text.to_string())
-        .ok_or_else(|| format!("Could not extract text field from tool result: {:?}", val))
+        .ok_or_else(|| "Could not extract text field from tool result".to_string())
 }
 
 fn take_snapshot_text(config_path: &str) -> Result<String, String> {
@@ -2067,6 +3780,2711 @@ mod tests {
     use super::*;
 
     #[test]
+    fn declares_verified_upload_and_isolated_capabilities() {
+        let capabilities = capabilities_value();
+        let advertised = capabilities["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
+        assert!(advertised.contains(&BACKGROUND_ISOLATED_TAB_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_V2_CAPABILITY));
+        assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_V3_CAPABILITY));
+        assert_eq!(
+            capabilities["isolated_new_tab_v1"]["flag"].as_str(),
+            Some("--new-tab-preserve-existing")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["new_page_background"].as_str(),
+            Some("headless")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["foreground"].as_str(),
+            Some("visible")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["scope"].as_str(),
+            Some("isolated-new-tab-only")
+        );
+        assert_eq!(
+            capabilities["verified_file_upload_v1"]["verification"].as_str(),
+            Some("filename-multiset-stable-dom-probe")
+        );
+        assert_eq!(
+            capabilities["verified_mixed_attachment_upload_v1"]["verification"].as_str(),
+            Some("typed-document-image-stable-dom-probe")
+        );
+        assert_eq!(
+            capabilities["verified_image_response_completion_v1"]["verification"].as_str(),
+            Some("new-assistant-no-generation-control-loaded-large-image-stable-dom")
+        );
+        assert_eq!(
+            capabilities["verified_image_response_completion_v1"]["zero_images_exit_success"]
+                .as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            capabilities["verified_image_response_completion_v1"]["user_delta"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v1"]["pre_submit_fail_closed"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v1"]["selection_contracts"],
+            serde_json::json!(["legacy_menu_v1", "reasoning_slider_v1"])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v2"]["evidence"],
+            serde_json::json!([
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v2"]["ordinal_profile"]["mapping"],
+            serde_json::json!({"instant": 0, "medium": 1, "high": 2})
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v3"]["evidence"],
+            serde_json::json!([
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v3"]["control_bundle"]["role_evidence"],
+            serde_json::json!(["slider", "native_range", "missing", "conflict"])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v4"]["evidence"],
+            serde_json::json!([
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2",
+                "closed_set_calibration_v1"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v4"]["selection_contracts"],
+            serde_json::json!([
+                "legacy_menu_v1",
+                "reasoning_slider_v1",
+                "reasoning_calibrated_control_v2"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v4"]["calibration"]["minimum_direct_semantics"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["evidence"],
+            serde_json::json!([
+                "checked_state_v1",
+                "accessible_label_v1",
+                "bounded_ordinal_v1",
+                "resolved_bounded_ordinal_v2",
+                "ordered_bounded_effort_v1"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["selection_contracts"],
+            serde_json::json!([
+                "legacy_menu_v1",
+                "reasoning_slider_v1",
+                "reasoning_ordered_control_v3"
+            ])
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["calibration"]["rank_mapping"],
+            serde_json::json!({"instant": 0, "medium": 1, "high": 2})
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["calibration"]["minimum_direct_semantics"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            capabilities["verified_model_selection_v5"]["calibration"]["maximum_direct_semantics"],
+            serde_json::json!(3)
+        );
+        assert!(
+            capabilities["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "verified_model_selection_v5")
+        );
+        assert!(
+            capabilities["version"]
+                .as_str()
+                .unwrap()
+                .contains("preserve")
+        );
+
+        let cli = Cli::try_parse_from([
+            "ask-bridge",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(cli.new_tab_preserve_existing);
+        assert_eq!(
+            cli.session_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ask-bridge",
+                "--session-id",
+                "00000000-0000-4000-8000-000000000001",
+                "prompt"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ask-bridge",
+                "--new",
+                "--new-tab-preserve-existing",
+                "--session-id",
+                "00000000-0000-4000-8000-000000000001",
+                "prompt",
+            ])
+            .is_err()
+        );
+        let probe = Cli::try_parse_from(["ask-bridge", "session-probe", "--json"]).unwrap();
+        assert!(matches!(
+            probe.command,
+            Some(Commands::SessionProbe { json: true })
+        ));
+    }
+
+    #[test]
+    fn isolated_new_page_args_maps_headless_to_background() {
+        let headless = isolated_new_page_args("https://chatgpt.com/", true);
+        assert_eq!(headless["url"].as_str(), Some("https://chatgpt.com/"));
+        assert_eq!(headless["background"].as_bool(), Some(true));
+
+        let visible = isolated_new_page_args("https://chatgpt.com/", false);
+        assert_eq!(visible["url"].as_str(), Some("https://chatgpt.com/"));
+        assert_eq!(visible["background"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn session_receipt_declares_background_isolated_tab_capability() {
+        let receipt = SessionReceipt::new(0, 0);
+        assert!(
+            receipt
+                .capabilities
+                .contains(&BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string())
+        );
+        assert!(
+            receipt
+                .capabilities
+                .contains(&VERIFIED_MODEL_SELECTION_V3_CAPABILITY.to_string())
+        );
+        assert_eq!(receipt.schema_version, SESSION_RECEIPT_SCHEMA_VERSION);
+    }
+
+    fn response_probe(
+        assistant_count: usize,
+        generating: bool,
+        loaded_large_image_count: usize,
+        signature: &str,
+    ) -> ResponseDomProbe {
+        ResponseDomProbe {
+            ownership_token_matches: true,
+            provider_url_owned: true,
+            url: "https://chatgpt.com/c/response-contract".to_string(),
+            conversation_id: "conversation:response-contract".to_string(),
+            turn_id: String::new(),
+            artifact_ids: Vec::new(),
+            user_count: 1,
+            assistant_count,
+            generation_control_visible: generating,
+            content_present: assistant_count > 0,
+            content_text_length: if assistant_count > 0 { 1000 } else { 0 },
+            provider_failure_visible: false,
+            loaded_large_image_count,
+            dom_signature: signature.to_string(),
+        }
+    }
+
+    #[test]
+    fn image_completion_waits_for_loaded_artifact_after_assistant_and_stop_disappear() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 4);
+
+        // Two seconds of a new assistant node with no Stop control is not a
+        // completed image response while the expected artifact is absent.
+        for _ in 0..4 {
+            assert_eq!(
+                tracker.observe(response_probe(5, false, 0, "assistant-only")),
+                ResponseTrackerDecision::Pending
+            );
+        }
+
+        assert_eq!(
+            tracker.observe(response_probe(5, false, 1, "image-v1")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(response_probe(5, false, 1, "image-v1")),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(response_probe(5, false, 1, "image-v1")),
+            ResponseTrackerDecision::Completed(_)
+        ));
+        assert_eq!(RESPONSE_REQUIRED_STABLE_PROBES, 3);
+        assert_eq!(RESPONSE_POLL_INTERVAL, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn image_completion_resets_stability_when_dom_signature_changes() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 1);
+        assert_eq!(
+            tracker.observe(response_probe(2, false, 1, "image-loading")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(response_probe(2, false, 1, "image-final")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(response_probe(2, false, 1, "image-final")),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(response_probe(2, false, 1, "image-final")),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn text_completion_uses_content_contract_without_requiring_an_image() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+        for expected in [
+            ResponseTrackerDecision::Pending,
+            ResponseTrackerDecision::Pending,
+        ] {
+            assert_eq!(
+                tracker.observe(response_probe(7, false, 0, "stable-text")),
+                expected
+            );
+        }
+        assert!(matches!(
+            tracker.observe(response_probe(7, false, 0, "stable-text")),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn text_completion_rejects_short_processing_status_text() {
+        // R8: ChatGPT can show a short processing-status text (e.g. "Reading
+        // Schema For JSON Deck Plan Validation", ~44 bytes) while the Stop
+        // button briefly disappears during attachment processing.  Such a
+        // short text must NOT be treated as a completed response.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+        let mut short_probe = response_probe(7, false, 0, "short-status");
+        short_probe.content_text_length = 44; // simulates "Reading Schema..." status text
+        // Even after 5 probes (well beyond the 3-probe stability window) the
+        // short text should never reach Completed.
+        for _ in 0..5 {
+            assert_eq!(
+                tracker.observe(short_probe.clone()),
+                ResponseTrackerDecision::Pending
+            );
+        }
+    }
+
+    #[test]
+    fn text_completion_accepts_response_meeting_minimum_length() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+        // A response at exactly the minimum boundary should complete normally
+        // after the stability window.
+        let mut min_probe = response_probe(7, false, 0, "min-length-text");
+        min_probe.content_text_length = MINIMUM_TEXT_RESPONSE_BYTES;
+        for _ in 0..(RESPONSE_REQUIRED_STABLE_PROBES - 1) {
+            assert_eq!(
+                tracker.observe(min_probe.clone()),
+                ResponseTrackerDecision::Pending
+            );
+        }
+        assert!(matches!(
+            tracker.observe(min_probe),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn attachment_verify_timeout_scales_with_file_count() {
+        // R10: 4-file repair requests need more than the 60-second base.
+        assert_eq!(
+            attachment_verify_timeout_for_count(0),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            attachment_verify_timeout_for_count(2),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            attachment_verify_timeout_for_count(4),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn chatgpt_assistant_selector_deduplicates_nested_role_nodes() {
+        let selector = Provider::ChatGpt.assistant_selector();
+        assert!(selector.starts_with("[data-chatgpt-search-unit-key$=\":assistant\"]"));
+        assert!(selector.contains(".agent-turn:not(:has("));
+        assert!(selector.contains("[data-message-author-role=\"assistant\"]"));
+        assert!(selector.contains(":not(.agent-turn *)"));
+        assert!(selector.contains(
+            "[data-chatgpt-search-message-ids]:has([data-testid=\"generated-image-gallery\"])"
+        ));
+        assert!(selector.contains(":not([data-chatgpt-search-unit-key$=\":user\"] *)"));
+    }
+
+    #[test]
+    fn text_completion_fails_closed_on_assistant_count_change() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 6);
+
+        // The DOM probe must canonicalize one visual turn before it reaches
+        // this state machine.  A real count delta remains an identity change
+        // for text as well as image tasks, so it must fail closed.
+        assert_eq!(
+            tracker.observe(response_probe(8, false, 0, "text-final-v1")),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::AssistantCountChanged)
+        );
+    }
+
+    #[test]
+    fn image_provider_rejection_fails_closed_without_waiting_for_timeout() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 0);
+        let mut rejected = response_probe(1, false, 0, "provider-rejection");
+        rejected.provider_failure_visible = true;
+        rejected.turn_id = "request-WEB:refusal-0".to_string();
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn response_completion_fails_closed_on_ownership_url_or_assistant_interference() {
+        let mut ownership = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut lost = response_probe(3, false, 1, "ready");
+        lost.ownership_token_matches = false;
+        assert_eq!(
+            ownership.observe(lost),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::PageOwnershipChanged)
+        );
+
+        let mut count = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            count.observe(response_probe(4, false, 1, "other-response")),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::AssistantCountChanged)
+        );
+
+        let mut extra_user = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut manually_submitted = response_probe(3, false, 1, "other-prompt-response");
+        manually_submitted.user_count = 2;
+        assert_eq!(
+            extra_user.observe(manually_submitted),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+
+        let mut url = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            url.observe(response_probe(3, false, 1, "ready")),
+            ResponseTrackerDecision::Pending
+        );
+        let mut navigated = response_probe(3, false, 1, "ready");
+        navigated.url = "https://chatgpt.com/c/different-conversation".to_string();
+        navigated.conversation_id = "conversation:different-conversation".to_string();
+        assert_eq!(
+            url.observe(navigated),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::PageUrlChanged)
+        );
+
+        let mut new_chat = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut home_shell = response_probe(3, false, 0, "assistant-shell");
+        home_shell.url = "https://chatgpt.com/".to_string();
+        home_shell.conversation_id = "home:https://chatgpt.com".to_string();
+        assert_eq!(
+            new_chat.observe(home_shell),
+            ResponseTrackerDecision::Pending
+        );
+        let mut conversation_shell = response_probe(3, false, 0, "assistant-shell");
+        conversation_shell.url = "https://chatgpt.com/c/new-conversation".to_string();
+        conversation_shell.conversation_id = "conversation:new-conversation".to_string();
+        assert_eq!(
+            new_chat.observe(conversation_shell),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut web_chat = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut web_shell = response_probe(3, false, 0, "assistant-shell");
+        web_shell.conversation_id = "conversation:WEB:temporary".to_string();
+        assert_eq!(
+            web_chat.observe(web_shell),
+            ResponseTrackerDecision::Pending
+        );
+        let mut uuid_shell = response_probe(3, false, 0, "assistant-shell");
+        uuid_shell.conversation_id = "conversation:canonical-uuid".to_string();
+        assert_eq!(
+            web_chat.observe(uuid_shell),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut regenerated = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            regenerated.observe(response_probe(3, false, 0, "assistant-shell")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            regenerated.observe(response_probe(3, true, 0, "manual-regeneration")),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut remounted_stop = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            remounted_stop.observe(response_probe(3, false, 0, "assistant-shell")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            remounted_stop.observe(response_probe(3, true, 0, "assistant-shell")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            remounted_stop.observe(response_probe(3, false, 1, "image-v1")),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut timeout = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        assert_eq!(
+            timeout.timeout(),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseTimeout)
+        );
+    }
+
+    #[test]
+    fn response_completion_uses_semantic_turn_and_artifact_identity() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut shell = response_probe(3, false, 0, "shell");
+        shell.turn_id = "turn-1".to_string();
+        assert_eq!(tracker.observe(shell), ResponseTrackerDecision::Pending);
+
+        let mut remounted_stop = response_probe(3, true, 0, "shell-mutated");
+        remounted_stop.turn_id = "turn-1".to_string();
+        assert_eq!(
+            tracker.observe(remounted_stop),
+            ResponseTrackerDecision::Pending
+        );
+
+        // During active generation the DOM legitimately evolves: turn_id
+        // and artifact_ids change as the image artifact is created.  This
+        // must be Pending, not a terminal ResponseIdentityChanged.
+        let mut generating_evolved = response_probe(3, true, 0, "shell-mutated-2");
+        generating_evolved.turn_id = "turn-2".to_string();
+        generating_evolved.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            tracker.observe(generating_evolved),
+            ResponseTrackerDecision::Pending
+        );
+
+        let mut image = response_probe(3, false, 1, "image-v1");
+        image.turn_id = "turn-2".to_string();
+        image.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            tracker.observe(image.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(image.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(image),
+            ResponseTrackerDecision::Completed(_)
+        ));
+
+        let mut changed_turn = response_probe(3, false, 1, "image-v2");
+        changed_turn.turn_id = "turn-2".to_string();
+        changed_turn.artifact_ids = vec!["image-artifact-2".to_string()];
+        let mut identity_tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+        let mut first = response_probe(3, false, 1, "image-v1");
+        first.turn_id = "turn-1".to_string();
+        first.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(
+            identity_tracker.observe(first),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            identity_tracker.observe(changed_turn),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+    }
+
+    #[test]
+    fn generation_allows_turn_and_artifact_evolution() {
+        // Regression: ChatGPT was still generating an image (Stop button
+        // visible) when turn_id / artifact_ids evolved.  The tracker must
+        // treat this as Pending, not a terminal ResponseIdentityChanged.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+
+        // Assistant shell appears with turn-1, no generation yet.
+        let mut shell = response_probe(3, false, 0, "shell");
+        shell.turn_id = "turn-1".to_string();
+        assert_eq!(tracker.observe(shell), ResponseTrackerDecision::Pending);
+
+        // Generation starts; turn_id stays the same.
+        let mut generating = response_probe(3, true, 0, "shell-generating");
+        generating.turn_id = "turn-1".to_string();
+        assert_eq!(
+            tracker.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+
+        // During generation, turn_id changes to turn-2 and an artifact appears.
+        // This is legitimate DOM evolution during image generation.
+        let mut evolved = response_probe(3, true, 0, "shell-evolved");
+        evolved.turn_id = "turn-2".to_string();
+        evolved.artifact_ids = vec!["image-artifact-1".to_string()];
+        assert_eq!(tracker.observe(evolved), ResponseTrackerDecision::Pending);
+
+        // Generation continues; artifact_ids grow (second image element).
+        let mut more_artifacts = response_probe(3, true, 0, "shell-more-artifacts");
+        more_artifacts.turn_id = "turn-2".to_string();
+        more_artifacts.artifact_ids = vec![
+            "image-artifact-1".to_string(),
+            "image-artifact-2".to_string(),
+        ];
+        assert_eq!(
+            tracker.observe(more_artifacts),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Generation stops; the loaded image is now present with the latest
+        // identity.  Stability window must accumulate before Completed.
+        let mut image_ready = response_probe(3, false, 1, "image-final");
+        image_ready.turn_id = "turn-2".to_string();
+        image_ready.artifact_ids = vec![
+            "image-artifact-1".to_string(),
+            "image-artifact-2".to_string(),
+        ];
+        assert_eq!(
+            tracker.observe(image_ready.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(image_ready.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(image_ready),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn post_generation_dom_re_render_does_not_fail_as_identity_change() {
+        // Regression (S08): ChatGPT re-renders the response DOM when
+        // generation finishes (Stop disappears).  turn_id and/or
+        // artifact_ids can change at this transition.  The tracker must
+        // absorb the one-time post-generation identity evolution instead
+        // of declaring ResponseIdentityChanged, because the image is
+        // already present and the response is legitimately complete.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+
+        // Assistant shell with no image, no Stop.
+        let mut shell = response_probe(3, false, 0, "shell");
+        shell.turn_id = "turn-gen-1".to_string();
+        assert_eq!(tracker.observe(shell), ResponseTrackerDecision::Pending);
+
+        // Generation starts; Stop visible, image being created.
+        let mut generating = response_probe(3, true, 0, "generating");
+        generating.turn_id = "turn-gen-1".to_string();
+        generating.artifact_ids = vec!["img-partial".to_string()];
+        assert_eq!(
+            tracker.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Generation finishes: Stop disappears, DOM re-renders with a new
+        // turn_id and finalised artifact_ids, and the image is now loaded.
+        let mut done = response_probe(3, false, 1, "image-final");
+        done.turn_id = "turn-done-2".to_string();
+        done.artifact_ids = vec!["img-final".to_string()];
+        // This must NOT be ResponseIdentityChanged — it should be Pending
+        // (first stability probe after the post-generation transition).
+        assert_eq!(
+            tracker.observe(done.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(done.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            tracker.observe(done),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn post_generation_identity_change_after_stable_is_still_caught() {
+        // After the post-generation transition absorbs one identity change,
+        // subsequent identity changes must still be caught as
+        // ResponseIdentityChanged.
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 2);
+
+        let mut generating = response_probe(3, true, 0, "generating");
+        generating.turn_id = "turn-A".to_string();
+        generating.artifact_ids = vec!["img-A".to_string()];
+        assert_eq!(
+            tracker.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+
+        // Post-generation transition: identity changes to turn-B.
+        let mut done = response_probe(3, false, 1, "image-final");
+        done.turn_id = "turn-B".to_string();
+        done.artifact_ids = vec!["img-B".to_string()];
+        assert_eq!(
+            tracker.observe(done.clone()),
+            ResponseTrackerDecision::Pending
+        );
+
+        // A further identity change (turn-C) is still caught.
+        let mut changed = response_probe(3, false, 1, "image-v2");
+        changed.turn_id = "turn-C".to_string();
+        changed.artifact_ids = vec!["img-C".to_string()];
+        assert_eq!(
+            tracker.observe(changed),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+    }
+
+    #[test]
+    fn strict_image_download_rejects_zero_and_download_errors() {
+        assert_eq!(
+            enforce_download_contract(ExpectedOutputType::Image, Ok(2)).unwrap(),
+            2
+        );
+        assert_eq!(
+            enforce_download_contract(ExpectedOutputType::Image, Ok(0)).unwrap_err(),
+            ResponseFailureCode::ImageDownloadEmpty
+        );
+        assert_eq!(
+            enforce_download_contract(
+                ExpectedOutputType::Image,
+                Err(ImageDownloadError::DownloadFailed(
+                    "PRIVATE DOWNLOAD DETAILS".to_string()
+                ))
+            )
+            .unwrap_err(),
+            ResponseFailureCode::ImageDownloadFailed
+        );
+    }
+
+    #[test]
+    fn response_receipt_fields_are_additive_and_low_sensitivity() {
+        let root = make_test_dir("response_receipt_privacy");
+        let path = root.join("receipt.json");
+        let canary = "PRIVATE-PROMPT-URL-FILENAME-DOM";
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_output(0, 0, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+        record_session_response_outcome(
+            &path,
+            ResponseCompletion::Unknown,
+            0,
+            Some(ResponseFailureCode::ResponseTimeout),
+        )
+        .unwrap();
+
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.expected_output_type, ExpectedOutputType::Image);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Unknown);
+        assert_eq!(receipt.downloaded_image_count, 0);
+        assert_eq!(
+            receipt.response_failure_code,
+            Some(ResponseFailureCode::ResponseTimeout)
+        );
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains(canary));
+        for forbidden in [
+            "prompt",
+            "response_content",
+            "url",
+            "file_name",
+            "dom",
+            "semantic_label",
+        ] {
+            assert!(!json.contains(&format!("\"{forbidden}\"")));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pre_submit_interference_stays_safe_but_post_submit_interference_is_unknown() {
+        let safe_root = make_test_dir("pre_submit_interference");
+        let safe_path = safe_root.join("receipt.json");
+        write_private_json(&safe_path, &SessionReceipt::new(0, 0)).unwrap();
+        let submit_count = std::cell::Cell::new(0);
+        let result = execute_verified_prompt_submission(
+            Some(&safe_path),
+            || Ok(()),
+            || Err::<usize, _>("owned page changed before submit".to_string()),
+            || {
+                submit_count.set(submit_count.get() + 1);
+                Ok("submitted".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(submit_count.get(), 0);
+        let safe = read_session_receipt(&safe_path).unwrap();
+        assert_eq!(safe.prompt_submission, PromptSubmission::NotStarted);
+        assert_eq!(safe.response_completion, ResponseCompletion::Pending);
+
+        let unknown_root = make_test_dir("post_submit_interference");
+        let unknown_path = unknown_root.join("receipt.json");
+        write_private_json(
+            &unknown_path,
+            &SessionReceipt::new_for_output(0, 0, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        let submitted = execute_verified_prompt_submission(
+            Some(&unknown_path),
+            || Ok(()),
+            || Ok(2usize),
+            || Ok("submitted".to_string()),
+        )
+        .unwrap();
+        assert_eq!(submitted.0, 2);
+        record_session_response_outcome(
+            &unknown_path,
+            ResponseCompletion::Unknown,
+            0,
+            Some(ResponseFailureCode::PageOwnershipChanged),
+        )
+        .unwrap();
+        let unknown = read_session_receipt(&unknown_path).unwrap();
+        assert_eq!(unknown.prompt_submission, PromptSubmission::Submitted);
+        assert_eq!(unknown.response_completion, ResponseCompletion::Unknown);
+
+        std::fs::remove_dir_all(safe_root).unwrap();
+        std::fs::remove_dir_all(unknown_root).unwrap();
+    }
+
+    #[test]
+    fn response_probe_contract_checks_token_controls_large_images_and_dom_signature() {
+        let baseline = ResponseBaseline {
+            initial_user_count: 2,
+            initial_assistant_count: 3,
+            ownership_token: "00000000-0000-4000-8000-000000000003".to_string(),
+        };
+        let script = build_response_probe_script(Provider::ChatGpt, &baseline).unwrap();
+        assert!(script.contains("__ask_bridge_response_owner_v1"));
+        assert!(script.contains("generation_control_visible"));
+        assert!(script.contains("user_count"));
+        assert!(script.contains("img.complete"));
+        assert!(script.contains("const minimumImageDimension = 256"));
+        assert!(script.contains("naturalWidth < minimumImageDimension"));
+        assert!(script.contains("naturalHeight < minimumImageDimension"));
+        assert!(script.contains("dom_signature"));
+        assert!(script.contains("provider_failure_visible"));
+        assert!(script.contains("conversation_id"));
+        assert!(script.contains("turn_id"));
+        assert!(script.contains("[data-turn-key]"));
+        assert!(script.contains("artifact_ids"));
+        assert!(script.contains("data-chatgpt-selection-message-id"));
+        assert!(script.contains("window.location.origin"));
+        assert!(!script.contains("__TOKEN__"));
+        assert!(!script.contains("__ASSISTANT_SELECTOR__"));
+        assert!(!script.contains("__USER_SELECTOR__"));
+    }
+
+    #[test]
+    fn chatgpt_response_selectors_cover_current_and_legacy_transcripts() {
+        let assistant = Provider::ChatGpt.assistant_selector();
+        let user = Provider::ChatGpt.user_selector();
+
+        assert!(assistant.contains("[data-chatgpt-search-unit-key$=\":assistant\"]"));
+        assert!(assistant.contains(".agent-turn"));
+        assert!(assistant.contains("[data-message-author-role=\"assistant\"]"));
+        assert!(user.contains("[data-chatgpt-search-unit-key$=\":user\"]"));
+        assert!(user.contains("[data-message-author-role=\"user\"]"));
+        assert_eq!(Provider::ChatGpt.latest_response_selector(), assistant);
+    }
+
+    #[test]
+    fn chatgpt_submission_verifies_prompt_before_and_after_send() {
+        let prompt = format!(
+            "workflow prompt begins\n{}\nsource.sha256: {}\nworkflow prompt ends",
+            "required slide instructions ".repeat(40),
+            "a".repeat(64)
+        );
+        let script = build_chatgpt_prompt_submission_script(&prompt).unwrap();
+        let input_helper = include_str!("chatgpt_prompt_input.js");
+
+        assert!(script.contains("workflow prompt begins"));
+        assert!(script.contains("normalize(readText(composer)).includes(expectedText)"));
+        assert!(script.contains("verifyPromptEcho(prompt, latestText)"));
+        assert!(script.contains("semantic_projection_v2"));
+        assert!(script.contains("anchor_matches"));
+        assert!(script.contains("attempt < 900"));
+        assert!(script.contains("let submitClicked = false"));
+        assert!(script.contains("safe: ChatGPT send button did not become active"));
+        assert!(script.contains("unknown: ChatGPT did not render the submitted prompt"));
+        assert!(!script.contains("normalize(latestText).includes(expectedText)"));
+        assert!(script.contains("initialUserCount + 1"));
+        assert!(script.contains("verification: 'semantic_projection_v2'"));
+        assert!(script.contains("data-chatgpt-search-unit-key"));
+        assert!(!script.contains("__PROMPT__"));
+        assert!(!script.contains("__PROMPT_ECHO_VERIFIER__"));
+        assert!(!script.contains("__USER_SELECTOR__"));
+        assert!(!script.contains("__SEND_SELECTORS__"));
+        assert!(!script.contains("execCommand('insertText'"));
+        assert!(input_helper.contains("'Input.insertText'"));
+        assert!(input_helper.contains("process.stdin"));
+        assert!(input_helper.contains("__ask_bridge_prompt_input_token"));
+    }
+
+    #[test]
+    fn legacy_schema_v2_receipt_defaults_new_response_fields() {
+        let root = make_test_dir("legacy_response_receipt");
+        let path = root.join("receipt.json");
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "capability": ISOLATED_NEW_TAB_CAPABILITY,
+            "capabilities": [ISOLATED_NEW_TAB_CAPABILITY, VERIFIED_FILE_UPLOAD_CAPABILITY],
+            "attachment_verification": "verified",
+            "attachment_count": 1,
+            "attachment_total_bytes": 123,
+            "prompt_submission": "submitted",
+            "failure_code": null
+        });
+        write_private_json(&path, &legacy).unwrap();
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.expected_output_type, ExpectedOutputType::Text);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Pending);
+        assert_eq!(receipt.downloaded_image_count, 0);
+        assert_eq!(receipt.response_failure_code, None);
+        assert_eq!(receipt.model_selection, ModelSelection::NotRequested);
+        assert_eq!(receipt.model_selection_contract, None);
+        assert_eq!(receipt.model_selection_evidence, None);
+        assert_eq!(receipt.failure_stage, None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_selection_receipt_records_verified_and_failed_states() {
+        let verified_root = make_test_dir("model_selection_verified");
+        let verified_path = verified_root.join("receipt.json");
+        write_private_json(&verified_path, &SessionReceipt::new(0, 0)).unwrap();
+        record_model_selection_verified(
+            &verified_path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningCalibratedControlV2,
+                evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
+                direct_semantic_count: None,
+                position_count: None,
+            },
+        )
+        .unwrap();
+        let verified = read_session_receipt(&verified_path).unwrap();
+        assert_eq!(verified.model_selection, ModelSelection::Verified);
+        assert_eq!(
+            verified.model_selection_contract,
+            Some(ModelSelectionContract::ReasoningCalibratedControlV2)
+        );
+        assert_eq!(
+            verified.model_selection_evidence,
+            Some(ModelSelectionEvidence::ClosedSetCalibrationV1)
+        );
+        assert_eq!(verified.failure_stage, None);
+        assert_eq!(verified.failure_code, None);
+
+        let failed_root = make_test_dir("model_selection_failed");
+        let failed_path = failed_root.join("receipt.json");
+        write_private_json(&failed_path, &SessionReceipt::new(0, 0)).unwrap();
+        record_model_selection_failed(&failed_path).unwrap();
+        let failed = read_session_receipt(&failed_path).unwrap();
+        assert_eq!(failed.model_selection, ModelSelection::Failed);
+        assert_eq!(failed.model_selection_contract, None);
+        assert_eq!(failed.model_selection_evidence, None);
+        assert_eq!(
+            failed.failure_stage.as_deref(),
+            Some(MODEL_SELECTION_FAILURE_STAGE)
+        );
+        assert_eq!(
+            failed.failure_code.as_deref(),
+            Some(MODEL_SELECTION_FAILURE_CODE)
+        );
+        assert_eq!(failed.prompt_submission, PromptSubmission::NotStarted);
+
+        std::fs::remove_dir_all(verified_root).unwrap();
+        std::fs::remove_dir_all(failed_root).unwrap();
+    }
+
+    #[test]
+    fn chatgpt_model_selection_scripts_declare_both_contracts_without_dom_payloads() {
+        let source = include_str!("main.rs");
+        let target_json = serde_json::to_string("即時").unwrap();
+        let selection_script = build_chatgpt_model_selection_script(&target_json);
+        assert!(selection_script.contains("data-model-reasoning-effort-slider"));
+        assert!(selection_script.contains("aria-valuemin"));
+        assert!(selection_script.contains("model radio selection was not verified"));
+        assert!(selection_script.contains("legacy_menu_v1"));
+        assert!(selection_script.contains("slider_ready"));
+        assert!(selection_script.contains("state_owner_relation"));
+        assert!(selection_script.contains("focus_owner_relation"));
+        assert!(selection_script.contains("role_evidence"));
+        assert!(selection_script.contains("state owner is ambiguous"));
+        assert!(selection_script.contains("focus owner is ambiguous"));
+        assert!(selection_script.contains("aria-labelledby"));
+        assert!(selection_script.contains("ordinal_conflict"));
+        assert!(selection_script.contains("semantic_effort"));
+        assert!(selection_script.contains("document.activeElement === focusOwner"));
+        assert!(!selection_script.contains("outerHTML"));
+        assert!(!selection_script.contains("__CONTROL_BUNDLE_RESOLVER__"));
+        assert!(source.contains("include_str!(\"chatgpt_control_bundle_resolver.js\")"));
+        assert!(source.contains("previous.now - 1"));
+        assert!(source.contains("previous.now + 1"));
+        assert!(source.contains("reasoning slider reopen status"));
+
+        let state_script = build_chatgpt_slider_state_script(&target_json);
+        assert!(state_script.contains("aria-describedby"));
+        assert!(state_script.contains("aria-valuenow"));
+        assert!(state_script.contains("announcement_present"));
+        assert!(state_script.contains("state_owner_relation"));
+        assert!(state_script.contains("semantic_effort"));
+        assert!(!state_script.contains("__PROMPT__"));
+
+        let reopen_script = build_chatgpt_reopen_slider_script();
+        assert!(reopen_script.contains("state_owner_relation"));
+        assert!(!reopen_script.contains("__CONTROL_BUNDLE_RESOLVER__"));
+    }
+
+    #[test]
+    fn reasoning_effort_aliases_use_the_exact_three_position_mapping() {
+        assert_eq!(
+            ReasoningEffort::from_label("即時"),
+            Some(ReasoningEffort::Instant)
+        );
+        assert_eq!(
+            ReasoningEffort::from_label("selected fast"),
+            Some(ReasoningEffort::Instant)
+        );
+        assert_eq!(
+            ReasoningEffort::from_label("中等推理"),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            ReasoningEffort::from_label("HIGH"),
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn ordered_domain_state_requires_consistent_span_ordinal_and_labels() {
+        let valid = serde_json::json!({
+            "found": true,
+            "marker_present": true,
+            "marker_count": 1,
+            "role_slider": true,
+            "role_evidence": "slider",
+            "state_owner_relation": "marker",
+            "focus_owner_relation": "state_owner",
+            "min": 0,
+            "max": 2,
+            "now": 0,
+            "matched": false,
+            "announcement_present": true,
+            "ordinal_present": true,
+            "ordinal_current": 1,
+            "ordinal_total": 3,
+            "ordinal_consistent": true,
+            "semantic_effort": null,
+            "semantic_conflict": false,
+            "focused": true
+        });
+        let state = parse_chatgpt_slider_state(&valid).unwrap();
+        state.validate_ordered_domain().unwrap();
+        assert!(state.requires_bounded_ordinal());
+
+        let mut marked_without_ordinal = valid.clone();
+        marked_without_ordinal["ordinal_present"] = serde_json::json!(false);
+        marked_without_ordinal["ordinal_current"] = serde_json::Value::Null;
+        marked_without_ordinal["ordinal_total"] = serde_json::Value::Null;
+        marked_without_ordinal["announcement_present"] = serde_json::json!(false);
+        let marked_without_ordinal = parse_chatgpt_slider_state(&marked_without_ordinal).unwrap();
+        assert!(marked_without_ordinal.requires_bounded_ordinal());
+        marked_without_ordinal.validate_ordered_domain().unwrap();
+        ChatGptLabeledPositionLedger::default()
+            .observe(&marked_without_ordinal)
+            .unwrap();
+
+        let mut direct_semantic = valid.clone();
+        direct_semantic["semantic_effort"] = serde_json::json!("high");
+        parse_chatgpt_slider_state(&direct_semantic)
+            .unwrap()
+            .validate_ordered_domain()
+            .unwrap();
+
+        let mut semantic_conflict = valid.clone();
+        semantic_conflict["semantic_conflict"] = serde_json::json!(true);
+        assert!(
+            parse_chatgpt_slider_state(&semantic_conflict)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut ordinal_mismatch = valid.clone();
+        ordinal_mismatch["ordinal_current"] = serde_json::json!(2);
+        assert!(
+            parse_chatgpt_slider_state(&ordinal_mismatch)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut focus_failure = valid.clone();
+        focus_failure["focused"] = serde_json::json!(false);
+        assert!(parse_chatgpt_slider_state(&focus_failure).is_err());
+
+        // An ordinal that disagrees with the announced span still fails,
+        // even when the value itself is legal.
+        let mut unknown_cardinality = valid.clone();
+        unknown_cardinality["ordinal_total"] = serde_json::json!(4);
+        assert!(
+            parse_chatgpt_slider_state(&unknown_cardinality)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        // A four-position page with a matching ordinal is a legal labeled
+        // domain (the former hard-coded three-state profile is gone).
+        let mut four_position = valid.clone();
+        four_position["max"] = serde_json::json!(3);
+        four_position["now"] = serde_json::json!(2);
+        four_position["ordinal_current"] = serde_json::json!(3);
+        four_position["ordinal_total"] = serde_json::json!(4);
+        four_position["semantic_effort"] = serde_json::json!("high");
+        four_position["tick_count"] = serde_json::json!(4);
+        four_position["lock_map_present"] = serde_json::json!(true);
+        four_position["locked_positions"] = serde_json::json!([3]);
+        four_position["current_locked"] = serde_json::json!(false);
+        let four_position = parse_chatgpt_slider_state(&four_position).unwrap();
+        four_position.validate_ordered_domain().unwrap();
+        assert_eq!(four_position.span(), 4);
+
+        // The same page whose ordinal claims three positions fails closed.
+        let mut three_position_ordinal = valid;
+        three_position_ordinal["ordinal_current"] = serde_json::json!(2);
+        assert!(
+            parse_chatgpt_slider_state(&three_position_ordinal)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolved_bounded_ordinal_accepts_roleless_and_split_owner_profiles() {
+        let roleless = serde_json::json!({
+            "found": true,
+            "marker_present": true,
+            "marker_count": 1,
+            "role_evidence": "missing",
+            "state_owner_relation": "marker",
+            "focus_owner_relation": "state_owner",
+            "min": 0,
+            "max": 2,
+            "now": 0,
+            "matched": false,
+            "announcement_present": true,
+            "ordinal_present": true,
+            "ordinal_current": 1,
+            "ordinal_total": 3,
+            "ordinal_consistent": true,
+            "semantic_effort": null,
+            "semantic_conflict": false,
+            "focused": true
+        });
+        let roleless_state = parse_chatgpt_slider_state(&roleless).unwrap();
+        roleless_state.validate_ordered_domain().unwrap();
+
+        let mut split_owner = roleless.clone();
+        split_owner["state_owner_relation"] = serde_json::json!("descendant");
+        split_owner["role_evidence"] = serde_json::json!("native_range");
+        let split_state = parse_chatgpt_slider_state(&split_owner).unwrap();
+        split_state.validate_ordered_domain().unwrap();
+        assert!(!roleless_state.same_observable_state(&split_state));
+
+        let mut exact_role = roleless.clone();
+        exact_role["role_evidence"] = serde_json::json!("slider");
+        let exact_state = parse_chatgpt_slider_state(&exact_role).unwrap();
+        exact_state.validate_ordered_domain().unwrap();
+
+        let mut conflicting_role = roleless.clone();
+        conflicting_role["role_evidence"] = serde_json::json!("conflict");
+        assert!(
+            parse_chatgpt_slider_state(&conflicting_role)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut ambiguous_marker = roleless.clone();
+        ambiguous_marker["marker_count"] = serde_json::json!(2);
+        assert!(
+            parse_chatgpt_slider_state(&ambiguous_marker)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut invalid_relation = roleless;
+        invalid_relation["state_owner_relation"] = serde_json::json!("ancestor");
+        assert!(parse_chatgpt_slider_state(&invalid_relation).is_err());
+    }
+
+    #[test]
+    fn labeled_position_ledger_counts_only_the_accepted_window_and_rejects_contradictions() {
+        let base = serde_json::json!({
+            "found": true,
+            "marker_present": true,
+            "marker_count": 1,
+            "role_evidence": "missing",
+            "state_owner_relation": "marker",
+            "focus_owner_relation": "state_owner",
+            "min": 0,
+            "max": 3,
+            "now": 0,
+            "matched": false,
+            "announcement_present": false,
+            "ordinal_present": false,
+            "ordinal_current": null,
+            "ordinal_total": null,
+            "ordinal_consistent": false,
+            "ordinal_conflict": false,
+            "semantic_effort": null,
+            "semantic_conflict": false,
+            "focused": true
+        });
+        let state_for = |min: i64, max: i64, now: i64, effort: Option<&str>| {
+            let mut value = base.clone();
+            value["min"] = serde_json::json!(min);
+            value["max"] = serde_json::json!(max);
+            value["now"] = serde_json::json!(now);
+            value["semantic_effort"] =
+                effort.map_or(serde_json::Value::Null, |effort| serde_json::json!(effort));
+            parse_chatgpt_slider_state(&value).unwrap()
+        };
+
+        // Only reads taken in the exact accepted window are counted.
+        let mut ledger = ChatGptLabeledPositionLedger::default();
+        ledger
+            .observe(&state_for(0, 3, 0, Some("instant")))
+            .unwrap();
+        ledger.observe(&state_for(0, 3, 1, Some("medium"))).unwrap();
+        ledger.observe(&state_for(0, 3, 2, Some("high"))).unwrap();
+        ledger.observe(&state_for(0, 3, 3, None)).unwrap();
+        assert_eq!(ledger.window_count(0, 3), 3);
+        assert_eq!(ledger.window_count(0, 2), 0);
+        assert_eq!(ledger.window_count(1, 3), 0);
+
+        // A re-rendered window may observe the same tier again without
+        // inflating the accepted window's count (F2).
+        let mut rerendered = ledger.clone();
+        rerendered
+            .observe(&state_for(1, 3, 2, Some("high")))
+            .unwrap();
+        assert_eq!(rerendered.window_count(0, 3), 3);
+        assert_eq!(rerendered.window_count(1, 3), 1);
+
+        // The same position may not change its label inside one window.
+        let mut changed = ChatGptLabeledPositionLedger::default();
+        changed
+            .observe(&state_for(0, 3, 1, Some("medium")))
+            .unwrap();
+        assert!(changed.observe(&state_for(0, 3, 1, Some("high"))).is_err());
+
+        // Two positions may not carry the same recognizable label.
+        let mut duplicate = ChatGptLabeledPositionLedger::default();
+        duplicate
+            .observe(&state_for(0, 3, 1, Some("high")))
+            .unwrap();
+        assert!(
+            duplicate
+                .observe(&state_for(0, 3, 2, Some("high")))
+                .is_err()
+        );
+
+        // Unrecognizable announcements are skipped, never counted.
+        let mut unknown_only = ChatGptLabeledPositionLedger::default();
+        unknown_only.observe(&state_for(0, 3, 3, None)).unwrap();
+        assert_eq!(unknown_only.window_count(0, 3), 0);
+
+        let mut semantic_conflict = base.clone();
+        semantic_conflict["semantic_conflict"] = serde_json::json!(true);
+        assert!(
+            ChatGptLabeledPositionLedger::default()
+                .observe(&parse_chatgpt_slider_state(&semantic_conflict).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v5_receipt_carries_direct_semantic_count_only_for_v5_verified_selections() {
+        let dir = make_test_dir("v5_receipt_count");
+        let path = dir.join("receipt.json");
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+
+        record_model_selection_verified(
+            &path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                direct_semantic_count: Some(1),
+                position_count: None,
+            },
+        )
+        .unwrap();
+        let v5 = read_session_receipt(&path).unwrap();
+        assert_eq!(v5.model_selection_direct_semantic_count, Some(1));
+
+        // Legacy (v1/v4) verified selection must never carry a v5 count.
+        record_model_selection_verified(
+            &path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningCalibratedControlV2,
+                evidence: ModelSelectionEvidence::ClosedSetCalibrationV1,
+                direct_semantic_count: None,
+                position_count: None,
+            },
+        )
+        .unwrap();
+        let v4 = read_session_receipt(&path).unwrap();
+        assert_eq!(v4.model_selection_direct_semantic_count, None);
+        assert_eq!(
+            v4.model_selection_contract,
+            Some(ModelSelectionContract::ReasoningCalibratedControlV2)
+        );
+
+        // Failed receipts clear contract/evidence/count entirely.
+        record_model_selection_failed(&path).unwrap();
+        let failed = read_session_receipt(&path).unwrap();
+        assert_eq!(failed.model_selection_direct_semantic_count, None);
+        assert_eq!(failed.model_selection_contract, None);
+        assert_eq!(failed.model_selection_evidence, None);
+
+        // A v5 verified outcome without a legal count is rejected.
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        assert!(
+            record_model_selection_verified(
+                &path,
+                ModelSelectionOutcome {
+                    contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                    evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                    direct_semantic_count: None,
+                    position_count: None,
+                },
+            )
+            .is_err()
+        );
+
+        // A v5 verified outcome above 3 is rejected (unknown profile).
+        write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        assert!(
+            record_model_selection_verified(
+                &path,
+                ModelSelectionOutcome {
+                    contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                    evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                    direct_semantic_count: Some(4),
+                    position_count: None,
+                },
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct FakeSliderPage {
+        labels: Vec<Option<ReasoningEffort>>,
+        locked: Vec<bool>,
+        target: ReasoningEffort,
+        min: i64,
+        now: i64,
+        announcement: bool,
+        reads: usize,
+        drop_last_after_reads: Option<usize>,
+        shift_min_after_reads: Option<usize>,
+        presses: Vec<String>,
+        reopen_calls: usize,
+    }
+
+    impl FakeSliderPage {
+        fn new(
+            labels: Vec<Option<ReasoningEffort>>,
+            locked: Vec<bool>,
+            now: i64,
+            target: ReasoningEffort,
+        ) -> Self {
+            assert_eq!(labels.len(), locked.len());
+            Self {
+                labels,
+                locked,
+                target,
+                min: 0,
+                now,
+                announcement: true,
+                reads: 0,
+                drop_last_after_reads: None,
+                shift_min_after_reads: None,
+                presses: Vec::new(),
+                reopen_calls: 0,
+            }
+        }
+
+        fn span(&self) -> i64 {
+            i64::try_from(self.labels.len()).unwrap_or(0)
+        }
+
+        fn max(&self) -> i64 {
+            self.min + self.span() - 1
+        }
+
+        fn locked_positions(&self) -> Vec<i64> {
+            self.locked
+                .iter()
+                .enumerate()
+                .filter(|(_, locked)| **locked)
+                .map(|(index, _)| self.min + i64::try_from(index).unwrap_or(0))
+                .collect()
+        }
+
+        fn projection(&self) -> serde_json::Value {
+            let index = usize::try_from(self.now - self.min).unwrap_or(0);
+            let effort = self.labels.get(index).copied().flatten();
+            let locked = self.locked.get(index).copied().unwrap_or(false);
+            serde_json::json!({
+                "found": true,
+                "marker_present": true,
+                "marker_count": 1,
+                "role_evidence": "slider",
+                "state_owner_relation": "marker",
+                "focus_owner_relation": "state_owner",
+                "min": self.min,
+                "max": self.max(),
+                "now": self.now,
+                "matched": effort == Some(self.target),
+                "announcement_present": self.announcement,
+                "ordinal_present": self.announcement,
+                "ordinal_current": self.now - self.min + 1,
+                "ordinal_total": self.span(),
+                "ordinal_consistent": true,
+                "ordinal_conflict": false,
+                "semantic_effort": effort.map(|effort| match effort {
+                    ReasoningEffort::Instant => "instant",
+                    ReasoningEffort::Medium => "medium",
+                    ReasoningEffort::High => "high",
+                }),
+                "semantic_conflict": false,
+                "semantic_unknown": self.announcement && effort.is_none(),
+                "focused": true,
+                "tick_count": self.span(),
+                "lock_map_present": true,
+                "locked_positions": self.locked_positions(),
+                "current_locked": locked,
+            })
+        }
+
+        fn state(&self) -> ChatGptSliderState {
+            parse_chatgpt_slider_state(&self.projection()).unwrap()
+        }
+    }
+
+    impl ChatGptSliderPage for FakeSliderPage {
+        fn read_slider(&mut self) -> Result<ChatGptSliderState, String> {
+            self.reads += 1;
+            if let Some(threshold) = self.shift_min_after_reads
+                && self.reads > threshold
+            {
+                self.min += 1;
+                self.now += 1;
+                self.shift_min_after_reads = None;
+            }
+            if let Some(threshold) = self.drop_last_after_reads
+                && self.reads > threshold
+                && self.span() > 2
+            {
+                self.labels.pop();
+                self.locked.pop();
+                self.drop_last_after_reads = None;
+            }
+            Ok(self.state())
+        }
+
+        fn press_key(&mut self, key: &str) -> Result<(), String> {
+            self.presses.push(key.to_string());
+            match key {
+                "ArrowLeft" => self.now = (self.now - 1).max(self.min),
+                "ArrowRight" => self.now = (self.now + 1).min(self.max()),
+                "Escape" => {}
+                other => return Err(format!("unexpected key {}", other)),
+            }
+            Ok(())
+        }
+
+        fn reopen_slider(&mut self) -> Result<(), String> {
+            self.reopen_calls += 1;
+            Ok(())
+        }
+
+        fn settle(&mut self) {}
+    }
+
+    #[test]
+    fn labeled_walker_selects_the_target_label_on_a_four_position_page() {
+        let mut page = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        let initial = page.state();
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut page, ReasoningEffort::High, initial)
+                .unwrap();
+        assert_eq!(
+            outcome.contract,
+            ModelSelectionContract::ReasoningLabeledOrderedControlV4
+        );
+        assert_eq!(
+            outcome.evidence,
+            ModelSelectionEvidence::LabeledEffortPositionMapV1
+        );
+        assert_eq!(outcome.position_count, Some(4));
+        assert_eq!(outcome.direct_semantic_count, Some(3));
+        assert_eq!(page.now, 2);
+        assert_eq!(page.reopen_calls, 1);
+        assert_eq!(
+            page.presses
+                .iter()
+                .filter(|key| key.as_str() == "Escape")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn labeled_walker_accepts_a_locked_start_and_a_minimum_target() {
+        let mut page = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            3,
+            ReasoningEffort::Instant,
+        );
+        let initial = page.state();
+        assert!(initial.current_locked);
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut page, ReasoningEffort::Instant, initial)
+                .unwrap();
+        assert_eq!(page.now, 0);
+        assert_eq!(outcome.position_count, Some(4));
+        assert_eq!(outcome.direct_semantic_count, Some(3));
+    }
+
+    #[test]
+    fn labeled_walker_refuses_locked_barriers_duplicate_labels_and_missing_announcements() {
+        let mut barrier = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                None,
+            ],
+            vec![false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        let initial = barrier.state();
+        let error =
+            select_chatgpt_labeled_ordered_control(&mut barrier, ReasoningEffort::High, initial)
+                .unwrap_err();
+        assert!(error.contains("unlocked slider domain"), "{}", error);
+
+        let mut duplicate = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::High),
+            ],
+            vec![false, false, false],
+            2,
+            ReasoningEffort::High,
+        );
+        let initial = duplicate.state();
+        let error =
+            select_chatgpt_labeled_ordered_control(&mut duplicate, ReasoningEffort::High, initial)
+                .unwrap_err();
+        assert!(
+            error.contains("duplicate semantic labels")
+                || error.contains("semantic calibration conflict"),
+            "{}",
+            error
+        );
+
+        let mut silent = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+            ],
+            vec![false, false, false],
+            2,
+            ReasoningEffort::High,
+        );
+        silent.announcement = false;
+        let initial = silent.state();
+        let error =
+            select_chatgpt_labeled_ordered_control(&mut silent, ReasoningEffort::High, initial)
+                .unwrap_err();
+        assert!(error.contains("announcement was not verified"), "{}", error);
+    }
+
+    #[test]
+    fn labeled_walker_survives_domain_rerender_without_losing_the_selection() {
+        // The trailing locked tier disappears mid-run (F2: 4 -> 3 positions).
+        let mut shrinking = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        shrinking.drop_last_after_reads = Some(3);
+        let initial = shrinking.state();
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut shrinking, ReasoningEffort::High, initial)
+                .unwrap();
+        assert_eq!(outcome.position_count, Some(3));
+        assert_eq!(outcome.direct_semantic_count, Some(3));
+
+        // The whole window shifts by one position before the walk starts
+        // (min 0 -> 1). The legal selection must survive and the receipt
+        // count must stay inside the accepted window.
+        let mut shifting = FakeSliderPage::new(
+            vec![
+                Some(ReasoningEffort::Instant),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                None,
+            ],
+            vec![false, false, false, true],
+            2,
+            ReasoningEffort::High,
+        );
+        shifting.shift_min_after_reads = Some(0);
+        let shifted = shifting.read_slider().unwrap();
+        assert_eq!(shifted.min, 1);
+        assert_eq!(shifted.now, 3);
+        let outcome =
+            select_chatgpt_labeled_ordered_control(&mut shifting, ReasoningEffort::High, shifted)
+                .unwrap();
+        assert_eq!(outcome.position_count, Some(4));
+        let position_count = outcome.position_count.unwrap();
+        let count = outcome.direct_semantic_count.unwrap();
+        assert!(count >= 1 && count <= position_count, "{}", count);
+    }
+
+    #[test]
+    fn ordered_domain_accepts_wide_labeled_profiles_and_rejects_lock_or_span_drift() {
+        let base = serde_json::json!({
+            "found": true,
+            "marker_present": true,
+            "marker_count": 1,
+            "role_evidence": "slider",
+            "state_owner_relation": "marker",
+            "focus_owner_relation": "state_owner",
+            "min": 0,
+            "max": 3,
+            "now": 2,
+            "matched": true,
+            "announcement_present": true,
+            "ordinal_present": true,
+            "ordinal_current": 3,
+            "ordinal_total": 4,
+            "ordinal_consistent": true,
+            "ordinal_conflict": false,
+            "semantic_effort": "high",
+            "semantic_conflict": false,
+            "focused": true,
+            "tick_count": 4,
+            "lock_map_present": true,
+            "locked_positions": [3],
+            "current_locked": false,
+            "semantic_unknown": false
+        });
+        let four = parse_chatgpt_slider_state(&base).unwrap();
+        four.validate_ordered_domain().unwrap();
+        assert_eq!(four.span(), 4);
+
+        // A locked start is legal evidence as long as the map agrees (F-05).
+        let mut locked_start = base.clone();
+        locked_start["now"] = serde_json::json!(3);
+        locked_start["ordinal_current"] = serde_json::json!(4);
+        locked_start["semantic_effort"] = serde_json::Value::Null;
+        locked_start["semantic_unknown"] = serde_json::json!(true);
+        locked_start["current_locked"] = serde_json::json!(true);
+        parse_chatgpt_slider_state(&locked_start)
+            .unwrap()
+            .validate_ordered_domain()
+            .unwrap();
+
+        // Root-only lock evidence (no ticks) must not fail the whole domain.
+        let mut root_only = base.clone();
+        root_only["lock_map_present"] = serde_json::json!(false);
+        root_only["tick_count"] = serde_json::Value::Null;
+        root_only["locked_positions"] = serde_json::Value::Null;
+        root_only["current_locked"] = serde_json::json!(false);
+        parse_chatgpt_slider_state(&root_only)
+            .unwrap()
+            .validate_ordered_domain()
+            .unwrap();
+
+        // Spans outside 2..=8 fail closed at parse time.
+        let mut too_small = base.clone();
+        too_small["max"] = serde_json::json!(0);
+        too_small["now"] = serde_json::json!(0);
+        assert!(parse_chatgpt_slider_state(&too_small).is_err());
+
+        let mut too_large = base.clone();
+        too_large["max"] = serde_json::json!(8);
+        assert!(parse_chatgpt_slider_state(&too_large).is_err());
+
+        // A short lock map, an out-of-range lock and a lock verdict that
+        // contradicts the map all fail closed.
+        let mut short_map = base.clone();
+        short_map["tick_count"] = serde_json::json!(2);
+        assert!(
+            parse_chatgpt_slider_state(&short_map)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut out_of_range = base.clone();
+        out_of_range["locked_positions"] = serde_json::json!([5]);
+        assert!(
+            parse_chatgpt_slider_state(&out_of_range)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        let mut contradicting = base.clone();
+        contradicting["current_locked"] = serde_json::json!(true);
+        assert!(
+            parse_chatgpt_slider_state(&contradicting)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+
+        // The ordinal must match the announced span, never a fixed total.
+        let mut bad_ordinal = base;
+        bad_ordinal["ordinal_total"] = serde_json::json!(3);
+        assert!(
+            parse_chatgpt_slider_state(&bad_ordinal)
+                .unwrap()
+                .validate_ordered_domain()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v6_receipt_requires_position_and_direct_semantic_counts_inside_the_hit_window() {
+        let dir = make_test_dir("v6_receipt_count");
+        let path = dir.join("receipt.json");
+        let fresh = || write_private_json(&path, &SessionReceipt::new(0, 0)).unwrap();
+        let v6 =
+            |position_count: Option<u8>, direct_semantic_count: Option<u8>| ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningLabeledOrderedControlV4,
+                evidence: ModelSelectionEvidence::LabeledEffortPositionMapV1,
+                direct_semantic_count,
+                position_count,
+            };
+
+        for (position_count, direct_semantic_count) in [(2u8, 1u8), (4, 1), (4, 4), (8, 1), (8, 8)]
+        {
+            fresh();
+            record_model_selection_verified(
+                &path,
+                v6(Some(position_count), Some(direct_semantic_count)),
+            )
+            .unwrap();
+            let receipt = read_session_receipt(&path).unwrap();
+            assert_eq!(receipt.model_selection_position_count, Some(position_count));
+            assert_eq!(
+                receipt.model_selection_direct_semantic_count,
+                Some(direct_semantic_count)
+            );
+            assert_eq!(
+                receipt.model_selection_contract,
+                Some(ModelSelectionContract::ReasoningLabeledOrderedControlV4)
+            );
+            assert_eq!(
+                receipt.model_selection_evidence,
+                Some(ModelSelectionEvidence::LabeledEffortPositionMapV1)
+            );
+        }
+
+        for (position_count, direct_semantic_count) in [
+            (None, Some(1u8)),
+            (Some(4u8), None),
+            (Some(1), Some(1)),
+            (Some(9), Some(1)),
+            (Some(4), Some(0)),
+            (Some(4), Some(5)),
+        ] {
+            fresh();
+            assert!(
+                record_model_selection_verified(&path, v6(position_count, direct_semantic_count))
+                    .is_err(),
+                "{:?}",
+                (position_count, direct_semantic_count)
+            );
+        }
+
+        // Legacy contracts never carry the v6 position count.
+        fresh();
+        record_model_selection_verified(
+            &path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::ReasoningOrderedControlV3,
+                evidence: ModelSelectionEvidence::OrderedBoundedEffortV1,
+                direct_semantic_count: Some(3),
+                position_count: Some(4),
+            },
+        )
+        .unwrap();
+        let legacy = read_session_receipt(&path).unwrap();
+        assert_eq!(legacy.model_selection_position_count, None);
+        assert_eq!(legacy.model_selection_direct_semantic_count, Some(3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn capabilities_and_receipts_declare_v5_and_v6_everywhere() {
+        let value = capabilities_value();
+        let capabilities = value["capabilities"].as_array().unwrap();
+        for capability in [
+            VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
+            VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
+        ] {
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(capability)),
+                "{}",
+                capability
+            );
+        }
+        let v6 = &value["verified_model_selection_v6"];
+        assert_eq!(v6["labeled_position_map"]["minimum_span"], 2);
+        assert_eq!(v6["labeled_position_map"]["maximum_span"], 8);
+        assert_eq!(
+            v6["labeled_position_map"]["target_index_source"],
+            "direct_label_match"
+        );
+        assert!(
+            v6["selection_contracts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some("reasoning_labeled_ordered_control_v4"))
+        );
+        assert!(
+            v6["receipt_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some("model_selection_position_count"))
+        );
+
+        let receipt = SessionReceipt::new(0, 0);
+        assert!(
+            receipt
+                .capabilities
+                .iter()
+                .any(|entry| entry == VERIFIED_MODEL_SELECTION_V6_CAPABILITY)
+        );
+
+        let source = include_str!("main.rs");
+        assert!(source.contains("println!(\"  {}\", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);"));
+        assert!(source.contains("println!(\"  {}\", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);"));
+    }
+
+    #[test]
+    fn chatgpt_slider_state_parser_rejects_invalid_or_unverified_state() {
+        let invalid = serde_json::json!({
+            "found": true,
+            "min": 0,
+            "max": 2,
+            "now": 3,
+            "matched": true,
+            "announcement_present": true
+        });
+        assert!(parse_chatgpt_slider_state(&invalid).is_err());
+
+        let valid_unmatched = serde_json::json!({
+            "found": true,
+            "min": 0,
+            "max": 2,
+            "now": 1,
+            "matched": false,
+            "announcement_present": true,
+            "marker_present": false,
+            "marker_count": 0,
+            "role_evidence": "missing",
+            "state_owner_relation": null,
+            "focus_owner_relation": "state_owner",
+            "focused": true
+        });
+        let state = parse_chatgpt_slider_state(&valid_unmatched).unwrap();
+        assert_eq!(state.now, 1);
+        assert!(!state.matched);
+    }
+
+    #[test]
+    fn private_session_receipt_is_atomic_and_mode_600_on_unix() {
+        let root = std::env::temp_dir().join(format!("ask-bridge-test-{}", Uuid::new_v4()));
+        let path = root.join("sessions").join("receipt.json");
+        let receipt = SessionReceipt::new(2, 57_081);
+        write_private_json(&path, &receipt).unwrap();
+        let persisted: SessionReceipt =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted, receipt);
+        assert_eq!(persisted.schema_version, 2);
+        assert_eq!(
+            persisted.attachment_verification,
+            AttachmentVerification::Pending
+        );
+        assert_eq!(persisted.prompt_submission, PromptSubmission::NotStarted);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_lifecycle_is_auditable_without_sensitive_values() {
+        let root = make_test_dir("receipt_lifecycle");
+        let path = root.join("receipt.json");
+        let canary = "PRIVATE-PROMPT-BASE64-FILENAME-ACCOUNT";
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join(format!("{canary}.md"));
+        std::fs::write(&source, canary.as_bytes()).unwrap();
+        let summary = summarize_attachments(&[], &[source.to_string_lossy().to_string()]).unwrap();
+        write_private_json(
+            &path,
+            &SessionReceipt::new(summary.count(), summary.total_bytes),
+        )
+        .unwrap();
+
+        record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+        let crash_receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(
+            crash_receipt.prompt_submission,
+            PromptSubmission::IntentRecorded
+        );
+        assert_eq!(
+            crash_receipt.attachment_verification,
+            AttachmentVerification::Verified
+        );
+
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+        let submitted = read_session_receipt(&path).unwrap();
+        assert_eq!(submitted.prompt_submission, PromptSubmission::Submitted);
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        assert!(!serialized.contains(canary));
+        let object = serde_json::from_str::<Value>(&serialized)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        for forbidden_key in [
+            "prompt",
+            "content",
+            "base64",
+            "path",
+            "file_name",
+            "account",
+            "provider",
+            "owned_page_id",
+            "pid",
+        ] {
+            assert!(
+                !object.contains_key(forbidden_key),
+                "receipt leaked forbidden key {forbidden_key}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_json_rejects_symlink_destination_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = make_test_dir("private_json_symlink");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let victim = root.join("victim.json");
+        std::fs::write(&victim, b"unchanged").unwrap();
+        let destination = real.join("receipt.json");
+        symlink(&victim, &destination).unwrap();
+        assert!(write_private_json(&destination, &SessionReceipt::new(0, 0)).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+
+        let linked_parent = root.join("linked");
+        symlink(&real, &linked_parent).unwrap();
+        assert!(
+            write_private_json(
+                &linked_parent.join("other.json"),
+                &SessionReceipt::new(0, 0)
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attachment_probe_requires_two_stable_complete_observations() {
+        let pending = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: true,
+            has_error: false,
+            complete: false,
+        };
+        let complete = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 2,
+            missing_count: 0,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: false,
+            complete: true,
+        };
+        let mut tracker = AttachmentVerificationTracker::new(2);
+        assert!(!tracker.observe(pending).unwrap());
+        assert!(!tracker.observe(complete.clone()).unwrap());
+        assert!(tracker.observe(complete).unwrap());
+        assert_eq!(ATTACHMENT_VERIFY_POLL_INTERVAL, Duration::from_millis(500));
+        assert_eq!(ATTACHMENT_VERIFY_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(ATTACHMENT_REQUIRED_STABLE_PROBES, 2);
+    }
+
+    #[test]
+    fn attachment_probe_fails_closed_on_error_or_wrong_multiset() {
+        let mut tracker = AttachmentVerificationTracker::new(2);
+        let error = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: true,
+            complete: false,
+        };
+        assert!(tracker.observe(error).is_err());
+
+        let wrong_multiset = AttachmentProbe {
+            expected_count: 2,
+            observed_count: 3,
+            missing_count: 0,
+            unexpected_count: 1,
+            uploading: false,
+            has_error: false,
+            complete: false,
+        };
+        assert!(!tracker.observe(wrong_multiset).unwrap());
+    }
+
+    #[test]
+    fn mcp_connect_and_tool_share_one_deterministic_deadline() {
+        let started_at = Instant::now();
+        let deadline =
+            McpOperationDeadline::from_start(started_at, Duration::from_millis(100)).unwrap();
+
+        assert_eq!(
+            deadline
+                .phase_timeout_at(started_at, MCP_CONNECT_TIMEOUT, "connect")
+                .unwrap(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            deadline
+                .phase_timeout_at(
+                    started_at + Duration::from_millis(70),
+                    MCP_CALL_TIMEOUT,
+                    "tool",
+                )
+                .unwrap(),
+            Duration::from_millis(30)
+        );
+        let exhausted = deadline
+            .phase_timeout_at(
+                started_at + Duration::from_millis(100),
+                MCP_CALL_TIMEOUT,
+                "tool",
+            )
+            .unwrap_err();
+        assert!(exhausted.contains("deadline exhausted"));
+    }
+
+    #[test]
+    fn attachment_dom_probe_uses_filename_multiset_and_structured_states() {
+        let script =
+            build_attachment_probe_script(Provider::ChatGpt, &["same.md".into(), "same.md".into()])
+                .unwrap();
+        assert!(script.contains("expectedNames"));
+        assert!(script.contains("missing_count"));
+        assert!(script.contains("unexpected_count"));
+        assert!(script.contains("uploading"));
+        assert!(script.contains("has_error"));
+        assert!(script.contains("same.md"));
+    }
+
+    #[test]
+    fn native_upload_success_skips_fallback_and_failure_uses_it_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        run_native_then_fallback(
+            || {
+                calls.borrow_mut().push("native");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["native"]);
+
+        calls.borrow_mut().clear();
+        run_native_then_fallback(
+            || {
+                calls.borrow_mut().push("native");
+                Err("native unavailable".to_string())
+            },
+            || {
+                calls.borrow_mut().push("fallback");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["native", "fallback"]);
+    }
+
+    #[test]
+    fn chatgpt_document_policy_does_not_retry_after_ambiguous_upload() {
+        assert_eq!(
+            document_upload_policy(Provider::ChatGpt),
+            DocumentUploadPolicy::NativeOnly
+        );
+    }
+
+    #[test]
+    fn attachment_failure_keeps_prompt_not_started_and_never_submits() {
+        let root = make_test_dir("attachment_fail_gate");
+        let path = root.join("receipt.json");
+        write_private_json(&path, &SessionReceipt::new(1, 123)).unwrap();
+        let submit_count = std::cell::Cell::new(0);
+        let result = execute_verified_prompt_submission(
+            Some(&path),
+            || Err("upload did not stabilize".to_string()),
+            || Ok(7usize),
+            || {
+                submit_count.set(submit_count.get() + 1);
+                Ok("submitted".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(submit_count.get(), 0);
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(
+            receipt.attachment_verification,
+            AttachmentVerification::Failed
+        );
+        assert_eq!(receipt.prompt_submission, PromptSubmission::NotStarted);
+        assert_eq!(
+            receipt.failure_code.as_deref(),
+            Some(ATTACHMENT_VERIFICATION_FAILURE_CODE)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uploading_missing_error_and_timeout_gates_never_submit() {
+        let not_verified = |probe: AttachmentProbe| {
+            let mut tracker = AttachmentVerificationTracker::new(2);
+            match tracker.observe(probe) {
+                Ok(true) => Ok(()),
+                Ok(false) | Err(_) => Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string()),
+            }
+        };
+        let uploading = not_verified(AttachmentProbe {
+            expected_count: 2,
+            observed_count: 2,
+            missing_count: 0,
+            unexpected_count: 0,
+            uploading: true,
+            has_error: false,
+            complete: false,
+        });
+        let missing = not_verified(AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: false,
+            complete: false,
+        });
+        let upload_error = not_verified(AttachmentProbe {
+            expected_count: 2,
+            observed_count: 1,
+            missing_count: 1,
+            unexpected_count: 0,
+            uploading: false,
+            has_error: true,
+            complete: false,
+        });
+        let started_at = Instant::now();
+        let deadline =
+            McpOperationDeadline::from_start(started_at, Duration::from_millis(10)).unwrap();
+        let timeout = deadline
+            .phase_timeout_at(
+                started_at + Duration::from_millis(10),
+                MCP_CALL_TIMEOUT,
+                "attachment verification",
+            )
+            .map(|_| ());
+
+        for (case, gate_result) in [
+            ("uploading", uploading),
+            ("missing", missing),
+            ("error", upload_error),
+            ("timeout", timeout),
+        ] {
+            let root = make_test_dir(&format!("attachment_{case}_gate"));
+            let path = root.join("receipt.json");
+            write_private_json(&path, &SessionReceipt::new(2, 123)).unwrap();
+            let submit_count = std::cell::Cell::new(0);
+            let result = execute_verified_prompt_submission(
+                Some(&path),
+                || gate_result,
+                || Ok(0usize),
+                || {
+                    submit_count.set(submit_count.get() + 1);
+                    Ok("submitted".to_string())
+                },
+            );
+
+            assert!(result.is_err(), "{case} must fail closed");
+            assert_eq!(submit_count.get(), 0, "{case} must never submit");
+            let receipt = read_session_receipt(&path).unwrap();
+            assert_eq!(
+                receipt.attachment_verification,
+                AttachmentVerification::Failed,
+                "{case}"
+            );
+            assert_eq!(
+                receipt.prompt_submission,
+                PromptSubmission::NotStarted,
+                "{case}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn typed_attachment_tracker_verifies_documents_and_images() {
+        let expectations = AttachmentExpectations::new(
+            &["report.md".to_string(), "plan.json".to_string()],
+            &["style.png".to_string()],
+        )
+        .unwrap();
+        assert_eq!(expectations.document_names.len(), 2);
+        assert_eq!(expectations.image_count, 1);
+
+        let mut tracker = TypedAttachmentTracker::new(&expectations);
+
+        // Uploading → not ready.
+        assert!(
+            !tracker
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: true,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // First stable probe → not enough (need 2).
+        assert!(
+            !tracker
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: false,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Second stable probe → verified.
+        assert!(
+            tracker
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: false,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Missing image → not ready.
+        let mut tracker2 = TypedAttachmentTracker::new(&expectations);
+        assert!(
+            !tracker2
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        image_count: 0,
+                        image_loaded: false,
+                        uploading: false,
+                        provider_error: false,
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Provider error → Err.
+        let mut tracker3 = TypedAttachmentTracker::new(&expectations);
+        let result = tracker3.observe(
+            &TypedAttachmentProbe {
+                document_count: 2,
+                image_count: 1,
+                image_loaded: true,
+                uploading: false,
+                provider_error: true,
+            },
+            &expectations,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "provider_error");
+    }
+
+    #[test]
+    fn attachment_probe_summary_has_no_sensitive_fields() {
+        let expectations =
+            AttachmentExpectations::new(&["report.md".to_string()], &["style.png".to_string()])
+                .unwrap();
+        let probe = TypedAttachmentProbe {
+            document_count: 1,
+            image_count: 1,
+            image_loaded: true,
+            uploading: false,
+            provider_error: false,
+        };
+        let summary = AttachmentProbeSummary::new(&expectations, &probe);
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("typed_mixed_v1"));
+        assert!(json.contains("\"expected_documents\":1"));
+        assert!(json.contains("\"expected_images\":1"));
+        // No filenames, paths, DOM text or prompts.
+        assert!(!json.contains("report.md"));
+        assert!(!json.contains("style.png"));
+        assert!(!json.contains("/"));
+    }
+
+    #[test]
+    fn receipt_state_transitions_preserve_additive_attachment_probe() {
+        let root = make_test_dir("preserve_attachment_probe");
+        let path = root.join("receipt.json");
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_output(2, 42, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        let expectations =
+            AttachmentExpectations::new(&["source.md".to_string()], &["anchor.png".to_string()])
+                .unwrap();
+        let probe = TypedAttachmentProbe {
+            document_count: 1,
+            image_count: 1,
+            image_loaded: true,
+            uploading: false,
+            provider_error: false,
+        };
+        write_attachment_probe_receipt(&path, &AttachmentProbeSummary::new(&expectations, &probe))
+            .unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+        record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+        record_session_response_outcome(&path, ResponseCompletion::Completed, 1, None).unwrap();
+
+        let json: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            json["attachment_probe"]["expected_documents"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(json["downloaded_image_count"].as_u64(), Some(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verify_attachments_only_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "ask-bridge",
+            "--provider",
+            "chatgpt",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "--file",
+            "report.md",
+            "--image",
+            "style.png",
+            "--verify-attachments-only",
+            "placeholder",
+        ])
+        .unwrap();
+        assert!(cli.verify_attachments_only);
+        assert_eq!(cli.files, vec!["report.md".to_string()]);
+        assert_eq!(cli.images, vec!["style.png".to_string()]);
+    }
+
+    #[test]
+    fn submit_failure_after_durable_intent_records_safe_and_unknown_outcomes() {
+        let safe_root = make_test_dir("submit_intent_safe_gate");
+        let safe_path = safe_root.join("receipt.json");
+        write_private_json(&safe_path, &SessionReceipt::new(0, 0)).unwrap();
+        let safe_result = execute_verified_prompt_submission(
+            Some(&safe_path),
+            || Ok(()),
+            || Ok(0usize),
+            || Err(PromptSubmissionFailure::safe("send button unavailable")),
+        );
+        assert!(safe_result.is_err());
+        let safe = read_session_receipt(&safe_path).unwrap();
+        assert_eq!(
+            safe.attachment_verification,
+            AttachmentVerification::Verified
+        );
+        assert_eq!(safe.prompt_submission, PromptSubmission::IntentRecorded);
+        assert_eq!(
+            safe.failure_stage.as_deref(),
+            Some(PROMPT_SUBMISSION_FAILURE_STAGE)
+        );
+        assert_eq!(
+            safe.failure_code.as_deref(),
+            Some(PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE)
+        );
+        assert_eq!(safe.response_completion, ResponseCompletion::Pending);
+        assert_eq!(safe.response_failure_code, None);
+
+        let unknown_root = make_test_dir("submit_intent_unknown_gate");
+        let unknown_path = unknown_root.join("receipt.json");
+        write_private_json(&unknown_path, &SessionReceipt::new(0, 0)).unwrap();
+        let unknown_result = execute_verified_prompt_submission(
+            Some(&unknown_path),
+            || Ok(()),
+            || Ok(0usize),
+            || Err(PromptSubmissionFailure::unknown("user turn echo missing")),
+        );
+        assert!(unknown_result.is_err());
+        let unknown = read_session_receipt(&unknown_path).unwrap();
+        assert_eq!(
+            unknown.attachment_verification,
+            AttachmentVerification::Verified
+        );
+        assert_eq!(unknown.prompt_submission, PromptSubmission::IntentRecorded);
+        assert_eq!(
+            unknown.failure_stage.as_deref(),
+            Some(PROMPT_SUBMISSION_FAILURE_STAGE)
+        );
+        assert_eq!(
+            unknown.failure_code.as_deref(),
+            Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE)
+        );
+        assert_eq!(unknown.response_completion, ResponseCompletion::Unknown);
+        assert_eq!(
+            unknown.response_failure_code,
+            Some(ResponseFailureCode::PromptSubmissionStateUnknown)
+        );
+
+        let safe_json = std::fs::read_to_string(&safe_path).unwrap();
+        let unknown_json = std::fs::read_to_string(&unknown_path).unwrap();
+        assert!(!safe_json.contains("send button unavailable"));
+        assert!(!unknown_json.contains("user turn echo missing"));
+
+        std::fs::remove_dir_all(safe_root).unwrap();
+        std::fs::remove_dir_all(unknown_root).unwrap();
+    }
+
+    #[test]
+    fn provider_lease_is_exclusive_and_private() {
+        let root = std::env::temp_dir().join(format!("ask-bridge-lease-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("chatgpt.lease");
+        let first = acquire_provider_lease_at(
+            &path,
+            Provider::ChatGpt,
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .unwrap();
+        assert!(
+            acquire_provider_lease_at(
+                &path,
+                Provider::ChatGpt,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(first);
+        let second = acquire_provider_lease_at(
+            &path,
+            Provider::ChatGpt,
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .unwrap();
+        drop(second);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn isolated_binding_rejects_other_page_mutations_and_close() {
+        clear_owned_page();
+        bind_owned_page("00000000-0000-4000-8000-000000000001", 7).unwrap();
+        assert_eq!(owned_page_binding().unwrap().page_id, 7);
+        assert!(bind_owned_page("00000000-0000-4000-8000-000000000002", 8).is_err());
+        assert!(call_mcp_tool("unused", "close_page", serde_json::json!({"pageId": 2})).is_err());
+        assert!(
+            call_mcp_tool(
+                "unused",
+                "new_page",
+                serde_json::json!({"url": "https://example.test"})
+            )
+            .is_err()
+        );
+        assert!(call_mcp_tool("unused", "select_page", serde_json::json!({"pageId": 8})).is_err());
+        clear_owned_page();
+    }
+
+    fn completed_receipt() -> SessionReceipt {
+        let mut receipt = SessionReceipt::new(0, 0);
+        receipt.response_completion = ResponseCompletion::Completed;
+        receipt
+    }
+
+    fn owned_binding(page_id: usize) -> OwnedPageBinding {
+        OwnedPageBinding {
+            session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            page_id,
+        }
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_enters_for_exact_owned_page() {
+        let binding = owned_binding(7);
+        assert_eq!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&completed_receipt())).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_refuses_unbounded_and_other_ids() {
+        let binding = owned_binding(7);
+        let receipt = completed_receipt();
+        // Unbounded page (no binding) is refused.
+        assert!(decide_owned_tab_cleanup(None, Some(&receipt)).is_err());
+        // No receipt is refused.
+        assert!(decide_owned_tab_cleanup(Some(&binding), None).is_err());
+        // The decision only ever returns the exact owned page ID (7), never an
+        // "other" ID.
+        assert_eq!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&receipt)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_refuses_submitted_unknown_and_identity_changed() {
+        let binding = owned_binding(7);
+        // Submitted/unknown outcome (Pending) is refused.
+        assert!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&SessionReceipt::new(0, 0))).is_err()
+        );
+        // Unknown outcome is refused.
+        let mut unknown = SessionReceipt::new(0, 0);
+        unknown.response_completion = ResponseCompletion::Unknown;
+        assert!(decide_owned_tab_cleanup(Some(&binding), Some(&unknown)).is_err());
+        // Identity-changed (failure code present) is refused.
+        let mut identity_changed = completed_receipt();
+        identity_changed.response_failure_code = Some(ResponseFailureCode::ResponseIdentityChanged);
+        assert!(decide_owned_tab_cleanup(Some(&binding), Some(&identity_changed)).is_err());
+    }
+
+    #[test]
+    fn owned_tab_cleanup_decision_refuses_unknown_image_download() {
+        let binding = owned_binding(7);
+        let mut receipt = completed_receipt();
+        receipt.expected_output_type = ExpectedOutputType::Image;
+        // Image output with zero downloaded images is an unknown download.
+        assert!(decide_owned_tab_cleanup(Some(&binding), Some(&receipt)).is_err());
+        // A known download count allows cleanup.
+        receipt.downloaded_image_count = 3;
+        assert_eq!(
+            decide_owned_tab_cleanup(Some(&binding), Some(&receipt)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn owned_tab_cleanup_verifies_page_present_before_close() {
+        let present: std::collections::HashSet<usize> = [7usize].into_iter().collect();
+        assert!(verify_owned_page_present(7, &present).is_ok());
+        // A newly-created / other page (not the owned page) is refused.
+        let other: std::collections::HashSet<usize> = [8usize].into_iter().collect();
+        assert!(verify_owned_page_present(7, &other).is_err());
+        // An empty page list (owned page disappeared) is refused.
+        let empty: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        assert!(verify_owned_page_present(7, &empty).is_err());
+    }
+
+    #[test]
+    fn owned_tab_cleanup_refuses_without_mcp_for_unsafe_states() {
+        clear_owned_page();
+        // No binding: refused before any MCP call.
+        assert!(cleanup_owned_page_after_success("unused", None).is_err());
+        // Binding but no receipt: refused before any MCP call.
+        bind_owned_page("00000000-0000-4000-8000-000000000001", 7).unwrap();
+        assert!(cleanup_owned_page_after_success("unused", None).is_err());
+        clear_owned_page();
+    }
+
+    #[test]
+    fn owned_tab_cleanup_failure_is_non_gating_warning() {
+        clear_owned_page();
+        // No binding -> cleanup refuses -> a warning is returned, not an error
+        // that would change the already-verified success result.
+        let warning = run_owned_tab_cleanup_warning("unused", None);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Warning:"));
+        // A completed receipt with no binding is still refused (unbounded
+        // page), and the failure is sanitised to a warning.
+        let root = make_test_dir("cleanup_non_gating");
+        let path = root.join("receipt.json");
+        write_private_json(&path, &completed_receipt()).unwrap();
+        let warning = run_owned_tab_cleanup_warning("unused", Some(&path));
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Warning:"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn validates_chrome_devtools_mcp_node_versions() {
         for version in [
             "v20.19.0",
@@ -2110,7 +6528,7 @@ mod tests {
         // `@latest` makes every npx spawn re-resolve the dist-tag against the
         // npm registry; combined with mcp-cli's timeout-less request wait this
         // hung whole runs (2026-07-11). The package spec must pin a version.
-        let config = build_chrome_devtools_server_config(true, true, "/tmp/mcp.log", false);
+        let config = build_chrome_devtools_server_config(true, true, false);
         let args = config["args"].as_array().expect("args array");
         let pkg = args
             .iter()
@@ -2210,10 +6628,10 @@ mod tests {
                 .collect()
         }
 
-        let log_path = r"C:\Temp\ask bridge\chrome-devtools-mcp.log";
-        let quiet_windows = build_chrome_devtools_server_config(true, true, log_path, true);
-        let verbose_windows = build_chrome_devtools_server_config(false, true, log_path, true);
-        let quiet_unix = build_chrome_devtools_server_config(true, true, log_path, false);
+        let privacy_canary = "PRIVATE-PROMPT-BASE64-CANARY";
+        let quiet_windows = build_chrome_devtools_server_config(true, true, true);
+        let verbose_windows = build_chrome_devtools_server_config(false, true, true);
+        let quiet_unix = build_chrome_devtools_server_config(true, true, false);
         let quiet_args = config_args(&quiet_windows);
         let verbose_args = config_args(&verbose_windows);
 
@@ -2224,11 +6642,13 @@ mod tests {
             MCP_PACKAGE_SPEC,
             "--browser-url=http://127.0.0.1:9223",
             "--headless",
-            "--logFile",
-            log_path,
         ] {
             assert!(quiet_args.contains(&required));
             assert!(verbose_args.contains(&required));
+        }
+        for args in [&quiet_args, &verbose_args] {
+            assert!(!args.contains(&"--logFile"));
+            assert!(!args.iter().any(|arg| arg.contains(privacy_canary)));
         }
         assert!(quiet_args.contains(&"--no-usage-statistics"));
         assert!(quiet_args.contains(&"--no-performance-crux"));
@@ -2237,6 +6657,30 @@ mod tests {
         assert!(!quiet_args.iter().any(|arg| arg.contains("2>nul")));
         assert_eq!(quiet_windows["env"]["CI"].as_str(), Some("1"));
         assert!(verbose_windows.get("env").is_none());
+    }
+
+    #[test]
+    fn private_mcp_config_has_no_raw_log_and_uses_private_permissions() {
+        let root = make_test_dir("private_mcp_config");
+        let config_dir = root.join("state");
+        let path = write_mcp_config_at(&config_dir, true, true, false).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("--logFile"));
+        assert!(!content.contains("chrome-devtools-mcp.log"));
+        assert!(!content.contains("PRIVATE-PROMPT-BASE64-CANARY"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2672,7 +7116,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_without_account_or_auth_controls_has_logged_in_state() {
+    fn composer_without_account_or_auth_controls_is_unknown() {
         let signals = LoginSignals {
             account: false,
             auth_control: false,
@@ -2681,7 +7125,7 @@ mod tests {
             stable: true,
         };
 
-        assert_eq!(signals.state(Provider::ChatGpt), LoginState::LoggedIn);
+        assert_eq!(signals.state(Provider::ChatGpt), LoginState::Unknown);
     }
 
     #[test]
@@ -3090,71 +7534,15 @@ fn write_clipboard(content: &str) -> Result<(), String> {
 }
 
 fn click_latest_copy_button(config_path: &str, provider: Provider) -> Result<(), String> {
-    let response_selector = serde_json::to_string(provider.latest_response_selector())
-        .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
-    let script = r#"() => {
-                const isVisible = (el) => {
-                    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-                    const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                };
-
-                const labelOf = (el) => [
-                    el.getAttribute('aria-label'),
-                    el.getAttribute('title'),
-                    el.getAttribute('data-testid'),
-                    el.textContent
-                ].filter(Boolean).join(' ');
-
-                const isCopyButton = (el) => {
-                    const label = labelOf(el);
-                    return /copy|複製|复制|コピー|복사/i.test(label)
-                        && !/prompt|提示詞|提示词|入力|table|表格/i.test(label);
-                };
-                const copyButtonScore = (el) => {
-                    const label = labelOf(el);
-                    if (!isCopyButton(el) || !isVisible(el)) return -1;
-                    if (el.closest('pre, code, [class*="code"], [data-testid*="code"]')) return -1;
-                    if (/copy-turn-action-button/i.test(label)) return 100;
-                    if (/response|回應|回答|reply/i.test(label)) return 90;
-                    if (el.closest('model-response, response-container, [data-message-author-role="assistant"], .agent-turn, [data-is-streaming], .font-claude-response')) return 50;
-                    return 10;
-                };
-                const messages = Array.from(document.querySelectorAll(__RESPONSE_SELECTOR__));
-                const latest = messages[messages.length - 1];
-                if (!latest) return { ok: false, reason: "No assistant message found" };
-
-                latest.scrollIntoView({ block: 'center', inline: 'nearest' });
-                for (const type of ['pointerover', 'mouseover', 'mouseenter']) {
-                    latest.dispatchEvent(new MouseEvent(type, { bubbles: true, view: window }));
-                }
-
-                const scopes = [
-                    latest,
-                    latest.closest('article'),
-                    latest.closest('[data-testid^="conversation-turn"]'),
-                    latest.parentElement,
-                    latest.parentElement?.parentElement
-                ].filter(Boolean);
-
-                for (const scope of scopes) {
-                    const buttons = Array.from(scope.querySelectorAll('button'));
-                    const candidates = buttons
-                        .map((button) => ({ button, score: copyButtonScore(button) }))
-                        .filter((candidate) => candidate.score >= 0)
-                        .sort((a, b) => b.score - a.score);
-                    if (candidates.length > 0) {
-                        const button = candidates[0].button;
-                        button.click();
-                        return { ok: true, label: labelOf(button) };
-                    }
-                }
-
-                return { ok: false, reason: "Copy response button not found" };
-            }"#
-    .replace("__RESPONSE_SELECTOR__", &response_selector);
+    let selector_options = serde_json::json!({
+        "assistantSelector": provider.latest_response_selector(),
+        "userSelector": provider.user_selector(),
+    });
+    let script = format!(
+        "() => ({})({})",
+        include_str!("chatgpt_copy_button_selector.js"),
+        selector_options
+    );
     let res = call_mcp_tool(
         config_path,
         "evaluate_script",
@@ -3549,20 +7937,100 @@ fn download_images_from_latest_message(
     config_path: &str,
     provider: Provider,
     image_output: Option<&str>,
+    verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
     verbose: bool,
-) -> Result<(), String> {
+) -> Result<usize, ImageDownloadError> {
     if verbose {
         println!("Checking for generated images in the latest assistant response...");
     }
     let latest_selector = serde_json::to_string(provider.latest_response_selector())
         .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
+    let user_selector = serde_json::to_string(provider.user_selector())
+        .map_err(|e| format!("Failed to serialize user selector: {}", e))?;
+    let expected_identity = match verified_response {
+        Some((baseline, identity)) => serde_json::json!({
+            "ownership_token": baseline.ownership_token,
+            "conversation_id": identity.conversation_id,
+            "turn_id": identity.turn_id,
+            "artifact_ids": identity.artifact_ids,
+            "user_count": identity.user_count,
+            "assistant_count": identity.assistant_count,
+        }),
+        None => Value::Null,
+    };
+    let expected_identity_json = serde_json::to_string(&expected_identity)
+        .map_err(|_| "Failed to serialize verified response identity".to_string())?;
     let image_scan_js = r#"() => {
                 window.__downloaded_images_status = "pending";
                 window.__downloaded_images = null;
                 (async () => {
                     try {
-                        const messages = document.querySelectorAll(__LATEST_SELECTOR__);
-                        const latestMessage = messages[messages.length - 1];
+                        const latestSelector = __LATEST_SELECTOR__;
+                        const assistantSelector = __ASSISTANT_SELECTOR__;
+                        const userSelector = __USER_SELECTOR__;
+                        const expectedIdentity = __EXPECTED_IDENTITY__;
+                        const minimumImageDimension = __MINIMUM_IMAGE_DIMENSION__;
+                        const stopSelectors = __STOP_SELECTORS__;
+                        const isVisibleControl = (element) => {
+                            if (!element) return false;
+                            const style = window.getComputedStyle(element);
+                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                            const rect = element.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0;
+                        };
+                        const conversationId = (() => {
+                            const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
+                            return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
+                        })();
+                        const semanticIdentity = (element) => {
+                            const turn = element
+                                ? (element.closest('section[data-turn="assistant"][data-turn-id]') ||
+                                    element.closest('[data-turn="assistant"][data-turn-id]') ||
+                                    element.closest('[data-turn-key]') || element)
+                                : null;
+                            const turnId = turn?.getAttribute('data-turn-id') ||
+                                turn?.getAttribute('data-turn-key') ||
+                                element?.getAttribute('data-chatgpt-selection-message-id') || '';
+                            const artifactIds = turn
+                                ? Array.from(turn.querySelectorAll('[id^="image-"]'))
+                                    .map((candidate) => candidate.id)
+                                    .filter(Boolean)
+                                    .filter((id, index, all) => all.indexOf(id) === index)
+                                    .sort()
+                                : [];
+                            return { turnId, artifactIds };
+                        };
+                        const responseState = () => {
+                            const assistantMessages = Array.from(document.querySelectorAll(assistantSelector));
+                            const userMessages = Array.from(document.querySelectorAll(userSelector));
+                            const latestMessages = expectedIdentity
+                                ? assistantMessages
+                                : Array.from(document.querySelectorAll(latestSelector));
+                            const latestMessage = latestMessages[latestMessages.length - 1] || null;
+                            if (!expectedIdentity) return { ok: true, latestMessage };
+                            const identity = semanticIdentity(latestMessage);
+                            const generationControl = stopSelectors
+                                .map((selector) => document.querySelector(selector))
+                                .find(isVisibleControl);
+                            const ok =
+                                window.__ask_bridge_response_owner_v1 === expectedIdentity.ownership_token &&
+                                conversationId === expectedIdentity.conversation_id &&
+                                (!expectedIdentity.turn_id || identity.turnId === expectedIdentity.turn_id) &&
+                                (expectedIdentity.artifact_ids.length === 0 ||
+                                    JSON.stringify(identity.artifactIds) === JSON.stringify(expectedIdentity.artifact_ids)) &&
+                                userMessages.length === expectedIdentity.user_count &&
+                                assistantMessages.length === expectedIdentity.assistant_count &&
+                                !generationControl;
+                            return { ok, latestMessage };
+                        };
+                        const before = responseState();
+                        if (!before.ok) {
+                            window.__downloaded_images_status = "error: response_identity_changed";
+                            return;
+                        }
+                        const latestMessage = before.latestMessage;
                         if (!latestMessage) {
                             window.__downloaded_images = [];
                             window.__downloaded_images_status = "success";
@@ -3574,10 +8042,7 @@ fn download_images_from_latest_message(
                         const candidateImgs = imgs.filter(img => {
                             const src = img.src || '';
                             if (src.includes('avatar') || src.includes('profile')) return false;
-                            const width = img.naturalWidth || img.width || 0;
-                            const height = img.naturalHeight || img.height || 0;
-                            if (width > 0 && width < 100) return false;
-                            if (height > 0 && height < 100) return false;
+                            if (!img.complete || img.naturalWidth < minimumImageDimension || img.naturalHeight < minimumImageDimension) return false;
                             if (!src.startsWith('http') && !src.startsWith('blob:') && !src.startsWith('data:image/')) return false;
                             if (seenSrcs.has(src)) return false;
                             seenSrcs.add(src);
@@ -3585,24 +8050,19 @@ fn download_images_from_latest_message(
                         });
 
                         const imagesData = [];
+                        let failedCount = 0;
                         for (let i = 0; i < candidateImgs.length; i++) {
                             const img = candidateImgs[i];
                             try {
-                                if (!img.complete) {
-                                    await new Promise((resolve) => {
-                                        img.addEventListener('load', resolve);
-                                        img.addEventListener('error', resolve);
-                                        setTimeout(resolve, 10000);
-                                    });
-                                }
-
                                 let dataUrl = "";
                                 if ((img.src || '').startsWith('data:image/')) {
                                     dataUrl = img.src;
                                 } else {
                                     try {
                                         const response = await fetch(img.src);
+                                        if (!response.ok) throw new Error('image_fetch_failed');
                                         const blob = await response.blob();
+                                        if (!blob.type.startsWith('image/')) throw new Error('image_type_invalid');
                                         dataUrl = await new Promise((resolve, reject) => {
                                             const reader = new FileReader();
                                             reader.onloadend = () => resolve(reader.result);
@@ -3622,24 +8082,41 @@ fn download_images_from_latest_message(
                                 if (dataUrl && dataUrl.startsWith('data:image/')) {
                                     imagesData.push({
                                         index: i,
-                                        src: img.src,
-                                        alt: img.alt || "",
                                         dataUrl: dataUrl
                                     });
+                                } else {
+                                    failedCount += 1;
                                 }
-                            } catch (err) {
-                                // ignore
+                            } catch (_) {
+                                failedCount += 1;
                             }
+                        }
+                        const after = responseState();
+                        if (!after.ok) {
+                            window.__downloaded_images_status = "error: response_identity_changed";
+                            return;
+                        }
+                        if (failedCount > 0) {
+                            window.__downloaded_images_status = "error: image_download_failed";
+                            return;
                         }
                         window.__downloaded_images = imagesData;
                         window.__downloaded_images_status = "success";
-                    } catch (e) {
-                        window.__downloaded_images_status = "error: " + e.message;
+                    } catch (_) {
+                        window.__downloaded_images_status = "error: image_download_failed";
                     }
                 })();
                 return { ok: true };
             }"#
-    .replace("__LATEST_SELECTOR__", &latest_selector);
+    .replace("__LATEST_SELECTOR__", &latest_selector)
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__EXPECTED_IDENTITY__", &expected_identity_json)
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
+    .replace(
+        "__MINIMUM_IMAGE_DIMENSION__",
+        &GENERATED_IMAGE_MIN_DIMENSION.to_string(),
+    );
 
     let start_res = call_mcp_tool(
         config_path,
@@ -3651,7 +8128,9 @@ fn download_images_from_latest_message(
 
     let start_parsed = parse_script_result(&start_res)?;
     if !start_parsed["ok"].as_bool().unwrap_or(false) {
-        return Err("Failed to initiate image scanning script".to_string());
+        return Err(ImageDownloadError::DownloadFailed(
+            "Failed to initiate image scanning script".to_string(),
+        ));
     }
 
     let mut wait_cycles = 0;
@@ -3675,11 +8154,19 @@ fn download_images_from_latest_message(
     }
 
     if status.starts_with("error:") {
-        return Err(format!("Image scanning failed: {}", status));
+        return if status == "error: response_identity_changed" {
+            Err(ImageDownloadError::ResponseIdentityChanged)
+        } else {
+            Err(ImageDownloadError::DownloadFailed(
+                "Image scanning failed for the verified response".to_string(),
+            ))
+        };
     }
 
     if status == "pending" {
-        return Err("Timed out waiting for images to download in browser".to_string());
+        return Err(ImageDownloadError::DownloadFailed(
+            "Timed out waiting for images to download in browser".to_string(),
+        ));
     }
 
     let get_res = call_mcp_tool(
@@ -3698,14 +8185,18 @@ fn download_images_from_latest_message(
     let parsed = parse_script_result(&get_res)?;
     let images = match parsed.as_array() {
         Some(arr) => arr,
-        None => return Ok(()),
+        None => {
+            return Err(ImageDownloadError::DownloadFailed(
+                "Image scanner returned an invalid result".to_string(),
+            ));
+        }
     };
 
     if images.is_empty() {
         if verbose {
             println!("No generated images found in the latest response.");
         }
-        return Ok(());
+        return Ok(0);
     }
 
     let epoch = std::time::SystemTime::now()
@@ -3714,19 +8205,19 @@ fn download_images_from_latest_message(
         .as_secs();
 
     let total = images.len();
+    let mut saved_count = 0usize;
     for (idx, img) in images.iter().enumerate() {
-        let data_url = match img["dataUrl"].as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let parts: Vec<&str> = data_url.splitn(2, ',').collect();
-        if parts.len() != 2 {
-            continue;
+        let data_url = img["dataUrl"]
+            .as_str()
+            .ok_or_else(|| "Downloaded image result was incomplete".to_string())?;
+        let (header, base64_data) = data_url
+            .split_once(',')
+            .ok_or_else(|| "Downloaded image data was malformed".to_string())?;
+        if !header.starts_with("data:image/") {
+            return Err(ImageDownloadError::DownloadFailed(
+                "Downloaded image data had an invalid media type".to_string(),
+            ));
         }
-
-        let header = parts[0];
-        let base64_data = parts[1];
 
         let ext = if header.contains("image/png") {
             "png"
@@ -3783,6 +8274,7 @@ fn download_images_from_latest_message(
 
         std::fs::write(&file_path, decoded)
             .map_err(|e| format!("Failed to write image file {:?}: {}", file_path, e))?;
+        saved_count = saved_count.saturating_add(1);
 
         println!(
             "Downloaded and saved generated image to: {}",
@@ -3790,7 +8282,7 @@ fn download_images_from_latest_message(
         );
     }
 
-    Ok(())
+    Ok(saved_count)
 }
 
 /// Display an image in the terminal using kitty's icat protocol.
@@ -3799,61 +8291,616 @@ fn display_image_in_terminal(image_path: &str) {
     let _ = Command::new("kitty").args(["icat", image_path]).status();
 }
 
-fn wait_for_attachment_indicator(
+fn summarize_attachments(
+    image_paths: &[String],
+    file_paths: &[String],
+) -> Result<AttachmentSummary, String> {
+    let mut file_names = Vec::with_capacity(image_paths.len() + file_paths.len());
+    let mut total_bytes = 0u64;
+    for path in image_paths.iter().chain(file_paths.iter()) {
+        let metadata = std::fs::metadata(path)
+            .map_err(|_| "無法讀取其中一個附件；尚未開啟 provider 分頁".to_string())?;
+        if !metadata.is_file() {
+            return Err("附件必須是 regular file；尚未開啟 provider 分頁".to_string());
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| "附件總大小超出可表示範圍".to_string())?;
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "附件檔名不是有效 UTF-8".to_string())?;
+        file_names.push(file_name.to_string());
+    }
+    Ok(AttachmentSummary {
+        file_names,
+        total_bytes,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AttachmentProbe {
+    expected_count: usize,
+    observed_count: usize,
+    missing_count: usize,
+    unexpected_count: usize,
+    uploading: bool,
+    has_error: bool,
+    complete: bool,
+}
+
+/// Typed expectations for a mixed (document + image) attachment upload.
+///
+/// Images in ChatGPT's composer do not expose their original filename in the
+/// DOM, so the legacy exact-filename multiset verifier cannot confirm them.
+/// This typed model separates document evidence (filename chip) from image
+/// evidence (preview count delta relative to a baseline + non-zero natural
+/// dimensions).
+#[derive(Clone, Debug)]
+struct AttachmentExpectations {
+    document_names: Vec<String>,
+    image_count: usize,
+}
+
+impl AttachmentExpectations {
+    fn new(file_paths: &[String], image_paths: &[String]) -> Result<Self, String> {
+        let mut document_names = Vec::with_capacity(file_paths.len());
+        for path in file_paths {
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| "附件檔名不是有效 UTF-8".to_string())?;
+            document_names.push(name.to_string());
+        }
+        Ok(Self {
+            document_names,
+            image_count: image_paths.len(),
+        })
+    }
+}
+
+/// Typed DOM probe result for mixed attachment verification.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct TypedAttachmentProbe {
+    document_count: usize,
+    image_count: usize,
+    image_loaded: bool,
+    uploading: bool,
+    provider_error: bool,
+}
+
+/// Sanitized receipt diagnostics for a typed attachment probe.  Contains only
+/// count/enum-safe fields — no filenames, paths, DOM text or prompts.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct AttachmentProbeSummary {
+    mode: &'static str,
+    failure_stage: Option<String>,
+    failure_reason: Option<String>,
+    expected_documents: usize,
+    observed_documents: usize,
+    expected_images: usize,
+    observed_images: usize,
+    missing_documents: usize,
+    unexpected_documents: usize,
+    uploading: bool,
+    provider_error: bool,
+}
+
+impl AttachmentProbeSummary {
+    fn new(expectations: &AttachmentExpectations, probe: &TypedAttachmentProbe) -> Self {
+        Self {
+            mode: "typed_mixed_v1",
+            failure_stage: None,
+            failure_reason: None,
+            expected_documents: expectations.document_names.len(),
+            observed_documents: probe.document_count,
+            expected_images: expectations.image_count,
+            observed_images: probe.image_count,
+            missing_documents: expectations
+                .document_names
+                .len()
+                .saturating_sub(probe.document_count),
+            unexpected_documents: probe
+                .document_count
+                .saturating_sub(expectations.document_names.len()),
+            uploading: probe.uploading,
+            provider_error: probe.provider_error,
+        }
+    }
+
+    fn with_failure(mut self, stage: &str, reason: &str) -> Self {
+        self.failure_stage = Some(stage.to_string());
+        self.failure_reason = Some(reason.to_string());
+        self
+    }
+}
+
+struct TypedAttachmentTracker {
+    expected_documents: usize,
+    expected_images: usize,
+    stable_probes: usize,
+}
+
+impl TypedAttachmentTracker {
+    fn new(expectations: &AttachmentExpectations) -> Self {
+        Self {
+            expected_documents: expectations.document_names.len(),
+            expected_images: expectations.image_count,
+            stable_probes: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        probe: &TypedAttachmentProbe,
+        _expectations: &AttachmentExpectations,
+    ) -> Result<bool, String> {
+        if probe.provider_error {
+            return Err("provider_error".to_string());
+        }
+        if probe.uploading {
+            self.stable_probes = 0;
+            return Ok(false);
+        }
+        let docs_ok = probe.document_count == self.expected_documents;
+        let images_ok = probe.image_count == self.expected_images && probe.image_loaded;
+        if docs_ok && images_ok {
+            self.stable_probes += 1;
+            return Ok(self.stable_probes >= ATTACHMENT_REQUIRED_STABLE_PROBES);
+        }
+        self.stable_probes = 0;
+        Ok(false)
+    }
+}
+
+struct AttachmentVerificationTracker {
+    expected_count: usize,
+    stable_complete_probes: usize,
+}
+
+impl AttachmentVerificationTracker {
+    fn new(expected_count: usize) -> Self {
+        Self {
+            expected_count,
+            stable_complete_probes: 0,
+        }
+    }
+
+    fn observe(&mut self, probe: AttachmentProbe) -> Result<bool, String> {
+        if probe.expected_count != self.expected_count {
+            return Err("附件 DOM probe 回報的預期數量不一致".to_string());
+        }
+        if probe.has_error {
+            return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        let ready = probe.complete
+            && !probe.uploading
+            && probe.observed_count == self.expected_count
+            && probe.missing_count == 0
+            && probe.unexpected_count == 0;
+        if !ready {
+            self.stable_complete_probes = 0;
+            return Ok(false);
+        }
+        self.stable_complete_probes += 1;
+        Ok(self.stable_complete_probes >= ATTACHMENT_REQUIRED_STABLE_PROBES)
+    }
+}
+
+fn build_attachment_probe_script(
+    provider: Provider,
+    expected_file_names: &[String],
+) -> Result<String, String> {
+    let expected_names = serde_json::to_string(expected_file_names)
+        .map_err(|_| "無法建立附件驗證 probe".to_string())?;
+    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
+        "[class*=\"group/composer-attachment\"]"
+    } else {
+        "[class*=\"attachment\"]"
+    })
+    .map_err(|_| "無法建立附件 class probe".to_string())?;
+    let script = r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+        if (!composer) {
+            return {
+                expected_count: expectedNames.length,
+                observed_count: 0,
+                missing_count: expectedNames.length,
+                unexpected_count: 0,
+                uploading: false,
+                has_error: true,
+                complete: false
+            };
+        }
+        const root = composer.closest('[data-testid*="composer"]') ||
+            composer.closest('form') ||
+            composer.parentElement?.parentElement?.parentElement ||
+            composer.parentElement ||
+            document.body;
+        const candidateSelector = [
+            '[data-testid*="attachment"]',
+            '[data-testid*="file-chip"]',
+            '[data-testid*="file-pill"]',
+            '[data-testid*="file-preview"]',
+            '[data-testid*="file-thumbnail"]',
+            __ATTACHMENT_CLASS_SELECTOR__,
+            '[class*="file-tile"]',
+            '[class*="file-chip"]',
+            '[class*="file-pill"]',
+            '[class*="file-preview"]',
+            '[class*="file-thumbnail"]',
+            '[aria-label*="attachment" i]'
+        ].join(',');
+        const textFor = (el) => [
+            el.innerText,
+            el.textContent,
+            el.getAttribute('aria-label'),
+            el.getAttribute('title')
+        ].filter(Boolean).join(' ').trim();
+        const candidates = Array.from(root.querySelectorAll(candidateSelector)).filter(isVisible);
+        const leaves = candidates.filter((candidate) =>
+            !candidates.some((other) => other !== candidate && candidate.contains(other))
+        );
+        const filteredLeaves = leaves.filter((l) => {
+            const ariaLabel = (l.getAttribute('aria-label') || '').toLowerCase();
+            return !ariaLabel.startsWith('移除') && !ariaLabel.startsWith('remove');
+        });
+        const expectedCounts = new Map();
+        for (const name of expectedNames) {
+            expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
+        }
+        const matchesExpected = (text, name) => {
+            if (text.includes(name)) return true;
+            const dot = name.lastIndexOf('.');
+            if (dot < 0) return false;
+            const escape = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
+        };
+        const observedCounts = new Map();
+        let unmatchedVisibleCandidates = 0;
+        for (const candidate of filteredLeaves) {
+            const text = textFor(candidate);
+            const matches = Array.from(expectedCounts.keys())
+                .filter((name) => matchesExpected(text, name))
+                .sort((left, right) => right.length - left.length);
+            if (matches.length > 0) {
+                const name = matches[0];
+                observedCounts.set(name, (observedCounts.get(name) || 0) + 1);
+            } else {
+                unmatchedVisibleCandidates += 1;
+            }
+        }
+        if (observedCounts.size === 0) {
+            const rootText = root.innerText || root.textContent || '';
+            for (const [name] of expectedCounts) {
+                let count = 0;
+                let offset = 0;
+                while (name && (offset = rootText.indexOf(name, offset)) !== -1) {
+                    count += 1;
+                    offset += name.length;
+                }
+                if (count > 0) observedCounts.set(name, count);
+            }
+            unmatchedVisibleCandidates = 0;
+        }
+        let missingCount = 0;
+        let unexpectedCount = unmatchedVisibleCandidates;
+        let observedCount = unmatchedVisibleCandidates;
+        for (const [name, expected] of expectedCounts) {
+            const observed = observedCounts.get(name) || 0;
+            observedCount += observed;
+            missingCount += Math.max(0, expected - observed);
+            unexpectedCount += Math.max(0, observed - expected);
+        }
+        const uploadingState = Array.from(root.querySelectorAll(
+            '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i], [data-testid*="progress" i]'
+        )).some(isVisible);
+        const uploadingText = filteredLeaves.some((candidate) =>
+            /uploading|upload in progress|上傳中|正在上傳|上传中|正在上传/i.test(textFor(candidate))
+        );
+        const errorState = Array.from(root.querySelectorAll(
+            '[data-state="error"], [data-status="error"], [data-testid*="upload-error" i], [aria-label*="upload failed" i]'
+        )).some(isVisible);
+        const errorText = filteredLeaves.some((candidate) =>
+            /upload failed|failed to upload|上傳失敗|上传失败/i.test(textFor(candidate))
+        );
+        const uploading = uploadingState || uploadingText;
+        const hasError = errorState || errorText;
+        const complete = missingCount === 0 &&
+            unexpectedCount === 0 &&
+            observedCount === expectedNames.length &&
+            !uploading &&
+            !hasError;
+        return {
+            expected_count: expectedNames.length,
+            observed_count: observedCount,
+            missing_count: missingCount,
+            unexpected_count: unexpectedCount,
+            uploading,
+            has_error: hasError,
+            complete
+        };
+    }"#
+    .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        provider.composer_selectors_json(),
+    );
+    Ok(script)
+}
+
+fn verify_attachment_completion(
     config_path: &str,
     provider: Provider,
-    path: &str,
+    expected_file_names: &[String],
     verbose: bool,
 ) -> Result<(), String> {
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path);
-    let file_stem = Path::new(path)
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_name);
-    let file_name_json = serde_json::to_string(file_name)
-        .map_err(|e| format!("Failed to serialize file name: {}", e))?;
-    let file_stem_json = serde_json::to_string(file_stem)
-        .map_err(|e| format!("Failed to serialize file stem: {}", e))?;
-    let js = r#"() => {
-        const fileName = __FILE_NAME__;
-        const fileStem = __FILE_STEM__;
-        const text = document.body.innerText || '';
-        return text.includes(fileName) || text.includes(fileStem);
-    }"#
-    .replace("__FILE_NAME__", &file_name_json)
-    .replace("__FILE_STEM__", &file_stem_json);
-
-    for _ in 0..30 {
-        let check_res = call_mcp_tool(
+    if expected_file_names.is_empty() {
+        return Ok(());
+    }
+    let script = build_attachment_probe_script(provider, expected_file_names)?;
+    let verify_timeout = attachment_verify_timeout_for_count(expected_file_names.len());
+    let deadline = McpOperationDeadline::from_timeout(verify_timeout)
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+    let mut tracker = AttachmentVerificationTracker::new(expected_file_names.len());
+    let mut last_probe = None;
+    loop {
+        let response = call_mcp_tool_with_deadline(
             config_path,
             "evaluate_script",
-            serde_json::json!({ "function": js }),
-        )?;
-        if parse_script_result(&check_res)
-            .ok()
-            .and_then(|p| p.as_bool())
-            .unwrap_or(false)
-        {
+            serde_json::json!({ "function": script }),
+            Some(deadline),
+        )
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let value = parse_script_result(&response)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let probe: AttachmentProbe = serde_json::from_value(value)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if verbose && last_probe.as_ref() != Some(&probe) {
+            println!("Attachment probe: {:?}", probe);
+            last_probe = Some(probe.clone());
+        }
+        if tracker.observe(probe)? {
             if verbose {
                 println!(
-                    "{} accepted attachment '{}'",
+                    "{} verified {} attachment(s).",
                     provider.display_name(),
-                    file_name
+                    expected_file_names.len()
                 );
             }
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(500));
+        let remaining = deadline
+            .phase_timeout(verify_timeout, "attachment verification poll")
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
+            return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+        }
+        thread::sleep(ATTACHMENT_VERIFY_POLL_INTERVAL);
     }
+}
 
-    Err(format!(
-        "Timed out waiting for {} to show attachment '{}'",
-        provider.display_name(),
-        file_name
-    ))
+/// Build a JS probe that counts document chips by filename and image previews
+/// by non-zero natural dimensions.  Image previews in ChatGPT do not expose
+/// their original filename, so we count visible ``<img>`` elements inside the
+/// composer root whose naturalWidth/naturalHeight are positive.
+fn build_typed_attachment_probe_script(
+    provider: Provider,
+    expected_document_names: &[String],
+) -> Result<String, String> {
+    let expected_names = serde_json::to_string(expected_document_names)
+        .map_err(|_| "無法建立 typed 附件驗證 probe".to_string())?;
+    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
+        "[class*=\"group/composer-attachment\"]"
+    } else {
+        "[class*=\"attachment\"]"
+    })
+    .map_err(|_| "無法建立附件 class probe".to_string())?;
+    let script = r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const composer = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
+        if (!composer) {
+            return { document_count: 0, image_count: 0, image_loaded: false, uploading: false, provider_error: false };
+        }
+        const root = composer.closest('[data-testid*="composer"]') ||
+            composer.closest('form') ||
+            composer.parentElement?.parentElement?.parentElement ||
+            composer.parentElement ||
+            document.body;
+        // ChatGPT file attachments use class "group/file-tile" (and legacy
+        // data-testid/class patterns).  Each tile's textContent contains the
+        // filename.  Image tiles contain an <img> with positive natural
+        // dimensions but no filename text.
+        const docSelector = [
+            '[class*="file-tile"]',
+            '[data-testid*="file-chip"]',
+            '[data-testid*="file-pill"]',
+            '[data-testid*="file-preview"]',
+            '[data-testid*="file-thumbnail"]',
+            '[class*="file-chip"]',
+            '[class*="file-pill"]',
+            '[class*="file-preview"]',
+            '[class*="file-thumbnail"]',
+            __ATTACHMENT_CLASS_SELECTOR__
+        ].join(',');
+        const allTiles = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
+        // Only keep tiles that are leaf-level (no child tile inside them).
+        const docCandidates = allTiles.filter((t) =>
+            !allTiles.some((o) => o !== t && t.contains(o))
+        ).filter((l) => {
+            const ariaLabel = (l.getAttribute('aria-label') || '').toLowerCase();
+            return !ariaLabel.startsWith('移除') && !ariaLabel.startsWith('remove');
+        });
+        const textFor = (el) => [
+            el.innerText, el.textContent,
+            el.getAttribute('aria-label'), el.getAttribute('title')
+        ].filter(Boolean).join(' ').trim();
+        const expectedCounts = new Map();
+        for (const name of expectedNames) {
+            expectedCounts.set(name, (expectedCounts.get(name) || 0) + 1);
+        }
+        const matchesExpected = (text, name) => {
+            if (text.includes(name)) return true;
+            const dot = name.lastIndexOf('.');
+            if (dot < 0) return false;
+            const escape = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
+        };
+        const observedCounts = new Map();
+        let documentCount = 0;
+        // A tile counts as a document if its text contains one of the
+        // expected filenames.  Otherwise it's an image tile.
+        for (const candidate of docCandidates) {
+            const text = textFor(candidate);
+            const matches = Array.from(expectedCounts.keys())
+                .filter((name) => matchesExpected(text, name))
+                .sort((a, b) => b.length - a.length);
+            if (matches.length > 0) {
+                const name = matches[0];
+                const prev = observedCounts.get(name) || 0;
+                observedCounts.set(name, prev + 1);
+                documentCount += 1;
+            }
+        }
+        // Count image previews: visible <img> inside the composer root with
+        // positive natural dimensions.  These are the ChatGPT image-attachment
+        // thumbnails that do not expose a filename.
+        const imgCandidates = Array.from(root.querySelectorAll('img')).filter(isVisible);
+        let imageCount = 0;
+        let imageLoaded = false;
+        for (const img of imgCandidates) {
+            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                imageCount += 1;
+                imageLoaded = true;
+            }
+        }
+        const uploadingState = Array.from(root.querySelectorAll(
+            '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i]'
+        )).some(isVisible);
+        const uploadingText = docCandidates.some((c) =>
+            /uploading|upload in progress|上傳中|正在上傳/i.test(textFor(c))
+        );
+        const errorState = Array.from(root.querySelectorAll(
+            '[data-state="error"], [data-status="error"], [data-testid*="upload-error" i]'
+        )).some(isVisible);
+        const errorText = docCandidates.some((c) =>
+            /upload failed|failed to upload|上傳失敗/i.test(textFor(c))
+        );
+        return {
+            document_count: documentCount,
+            image_count: imageCount,
+            image_loaded: imageLoaded,
+            uploading: uploadingState || uploadingText,
+            provider_error: errorState || errorText
+        };
+    }"#
+    .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
+    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json());
+    Ok(script)
+}
+
+/// Verify a mixed (document + image) attachment upload using typed evidence:
+/// document chips matched by filename, image previews matched by count
+/// delta and non-zero natural dimensions.  Returns a sanitized summary.
+fn verify_typed_attachment_completion(
+    config_path: &str,
+    provider: Provider,
+    expectations: &AttachmentExpectations,
+    verbose: bool,
+) -> Result<AttachmentProbeSummary, String> {
+    if expectations.document_names.is_empty() && expectations.image_count == 0 {
+        return Ok(AttachmentProbeSummary {
+            mode: "typed_mixed_v1",
+            failure_stage: None,
+            failure_reason: None,
+            expected_documents: 0,
+            observed_documents: 0,
+            expected_images: 0,
+            observed_images: 0,
+            missing_documents: 0,
+            unexpected_documents: 0,
+            uploading: false,
+            provider_error: false,
+        });
+    }
+    let script = build_typed_attachment_probe_script(provider, &expectations.document_names)?;
+    let total_count = expectations.document_names.len() + expectations.image_count;
+    let verify_timeout = attachment_verify_timeout_for_count(total_count);
+    let deadline = McpOperationDeadline::from_timeout(verify_timeout)
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+    let mut tracker = TypedAttachmentTracker::new(expectations);
+    loop {
+        let response = call_mcp_tool_with_deadline(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": script }),
+            Some(deadline),
+        )
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let value = parse_script_result(&response)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        let probe: TypedAttachmentProbe = serde_json::from_value(value)
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        match tracker.observe(&probe, expectations) {
+            Ok(true) => {
+                if verbose {
+                    println!(
+                        "{} verified {} document(s) and {} image(s).",
+                        provider.display_name(),
+                        expectations.document_names.len(),
+                        expectations.image_count
+                    );
+                }
+                return Ok(AttachmentProbeSummary::new(expectations, &probe));
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                let _summary = AttachmentProbeSummary::new(expectations, &probe)
+                    .with_failure("verification", &reason);
+                return Err(format!(
+                    "{}:{}",
+                    ATTACHMENT_VERIFICATION_FAILURE_CODE, reason
+                ));
+            }
+        }
+        let remaining = deadline
+            .phase_timeout(verify_timeout, "typed attachment verification poll")
+            .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+        if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
+            return Err(format!(
+                "{}:verification_timeout",
+                ATTACHMENT_VERIFICATION_FAILURE_CODE
+            ));
+        }
+        thread::sleep(ATTACHMENT_VERIFY_POLL_INTERVAL);
+    }
 }
 
 fn upload_attachments_via_file_chooser(
@@ -3863,22 +8910,55 @@ fn upload_attachments_via_file_chooser(
     file_paths: &[String],
     verbose: bool,
 ) -> Result<(), String> {
-    for (path, verify_filename) in image_paths
-        .iter()
-        .map(|path| (path, false))
-        .chain(file_paths.iter().map(|path| (path, true)))
-    {
+    let total = image_paths.len() + file_paths.len();
+    for (index, path) in image_paths.iter().chain(file_paths.iter()).enumerate() {
         let canonical_path = std::fs::canonicalize(path)
-            .map_err(|e| format!("Failed to resolve file '{}': {}", path, e))?;
+            .map_err(|_| "Failed to resolve an attachment for native upload".to_string())?;
         let file_path = canonical_path.to_string_lossy().to_string();
 
-        let snapshot = take_snapshot_text(config_path)?;
+        if provider == Provider::ChatGpt {
+            let is_image = index < image_paths.len();
+            let token = uuid::Uuid::new_v4().to_string();
+            let token_json =
+                serde_json::to_string(&token).map_err(|_| "Upload token failed".to_string())?;
+            let marker = format!(
+                "() => {{ window.__ask_bridge_upload_token = {}; return true; }}",
+                token_json
+            );
+            call_mcp_tool(
+                config_path,
+                "evaluate_script",
+                serde_json::json!({ "function": marker }),
+            )?;
+            let output = Command::new("node")
+                .arg("-e")
+                .arg(include_str!("chatgpt_upload.js"))
+                .arg(&token)
+                .arg(&file_path)
+                .arg(if is_image { "image" } else { "document" })
+                .output()
+                .map_err(|_| "ChatGPT native upload helper unavailable".to_string())?;
+            if !output.status.success() {
+                if verbose {
+                    eprintln!(
+                        "ChatGPT upload diagnostic: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                return Err("ChatGPT native file upload failed".to_string());
+            }
+            continue;
+        }
+
+        let snapshot = take_snapshot_text(config_path)
+            .map_err(|_| "Native attachment upload menu was unavailable".to_string())?;
         let menu_uid = match provider {
             Provider::Gemini => {
                 find_snapshot_uid(&snapshot, &["上傳與工具"], &["更多", "雲端", "drive"])
                     .or_else(|| find_snapshot_uid(&snapshot, &["upload"], &["drive"]))
             }
-            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"]),
+            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["新增檔案和更多內容"], &[])
+                .or_else(|| find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"])),
             Provider::Claude => find_snapshot_uid(&snapshot, &["attach"], &["settings", "menu"])
                 .or_else(|| find_snapshot_uid(&snapshot, &["upload"], &["drive"])),
         }
@@ -3896,14 +8976,18 @@ fn upload_attachments_via_file_chooser(
                 "uid": menu_uid,
                 "includeSnapshot": false
             }),
-        )?;
+        )
+        .map_err(|_| "Native attachment upload menu did not open".to_string())?;
         thread::sleep(Duration::from_millis(500));
 
-        let snapshot = take_snapshot_text(config_path)?;
+        let snapshot = take_snapshot_text(config_path)
+            .map_err(|_| "Native attachment upload chooser was unavailable".to_string())?;
         let upload_uid = match provider {
             Provider::Gemini => find_snapshot_uid(&snapshot, &["上傳檔案"], &["雲端", "drive"])
                 .or_else(|| find_snapshot_uid(&snapshot, &["upload", "file"], &["drive"])),
-            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"]),
+            Provider::ChatGpt => find_snapshot_uid(&snapshot, &["新增相片與檔案"], &[])
+                .or_else(|| find_snapshot_uid(&snapshot, &["上傳檔案"], &["雲端"]))
+                .or_else(|| find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"])),
             Provider::Claude => {
                 find_snapshot_uid(&snapshot, &["upload", "file"], &["drive", "connect"])
                     .or_else(|| find_snapshot_uid(&snapshot, &["file"], &["drive", "connect"]))
@@ -3913,9 +8997,10 @@ fn upload_attachments_via_file_chooser(
 
         if verbose {
             println!(
-                "Uploading attachment '{}' to {}...",
-                file_path,
-                provider.display_name()
+                "Uploading attachment {}/{} to {} with the native file chooser...",
+                index + 1,
+                total,
+                provider.display_name(),
             );
         }
         call_mcp_tool(
@@ -3926,15 +9011,43 @@ fn upload_attachments_via_file_chooser(
                 "filePath": file_path,
                 "includeSnapshot": false
             }),
-        )?;
-        if verify_filename {
-            wait_for_attachment_indicator(config_path, provider, path, verbose)?;
-        } else {
-            thread::sleep(Duration::from_millis(800));
-        }
+        )
+        .map_err(|_| "Native attachment upload did not start".to_string())?;
     }
 
     Ok(())
+}
+
+fn run_native_then_fallback<Native, Fallback>(
+    native: Native,
+    fallback: Fallback,
+) -> Result<(), String>
+where
+    Native: FnOnce() -> Result<(), String>,
+    Fallback: FnOnce() -> Result<(), String>,
+{
+    match native() {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fallback()?;
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentUploadPolicy {
+    NativeOnly,
+    NativeThenDataTransferFallback,
+    DataTransferOnly,
+}
+
+fn document_upload_policy(provider: Provider) -> DocumentUploadPolicy {
+    match provider {
+        Provider::ChatGpt => DocumentUploadPolicy::NativeOnly,
+        Provider::Claude => DocumentUploadPolicy::NativeThenDataTransferFallback,
+        Provider::Gemini => DocumentUploadPolicy::DataTransferOnly,
+    }
 }
 
 /// Map a file extension to a MIME type. Covers common image and document formats.
@@ -4020,7 +9133,7 @@ fn mime_type_for_extension(ext: &str) -> &'static str {
 /// Upload local image and/or document files to the provider prompt composer using the
 /// best available provider-specific upload mechanism.
 /// Returns an error string if any attachment fails to upload.
-fn upload_attachments_to_provider(
+fn upload_attachments_via_data_transfer(
     config_path: &str,
     provider: Provider,
     image_paths: &[String],
@@ -4032,37 +9145,11 @@ fn upload_attachments_to_provider(
         return Ok(());
     }
 
-    let data_transfer_image_paths: &[String] = if provider == Provider::Gemini
-        && !image_paths.is_empty()
-    {
-        match upload_attachments_via_file_chooser(config_path, provider, image_paths, &[], verbose)
-        {
-            Ok(()) => &[],
-            Err(e) => {
-                if verbose {
-                    eprintln!(
-                        "Warning: {} image file chooser upload failed, trying DataTransfer fallback: {}",
-                        provider.display_name(),
-                        e
-                    );
-                }
-                image_paths
-            }
-        }
-    } else {
-        image_paths
-    };
-
-    let data_transfer_total = data_transfer_image_paths.len() + file_paths.len();
-    if data_transfer_total == 0 {
-        return Ok(());
-    }
-
     if verbose {
         println!(
             "Attaching {} attachment(s) ({} image(s), {} file(s)) to the prompt...",
-            data_transfer_total,
-            data_transfer_image_paths.len(),
+            total,
+            image_paths.len(),
             file_paths.len()
         );
     }
@@ -4071,9 +9158,8 @@ fn upload_attachments_to_provider(
     // We pass raw base64 + mime and decode in JS to avoid `fetch(data:...)` which ChatGPT's
     // Content-Security-Policy blocks (results in "Failed to fetch").
     let mut files_json = Vec::new();
-    for path in data_transfer_image_paths.iter().chain(file_paths.iter()) {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+    for path in image_paths.iter().chain(file_paths.iter()) {
+        let bytes = std::fs::read(path).map_err(|_| "Failed to read an attachment".to_string())?;
         let ext = Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -4094,7 +9180,7 @@ fn upload_attachments_to_provider(
     }
 
     let files_json_str = serde_json::to_string(&files_json)
-        .map_err(|e| format!("Failed to serialize attachment data: {}", e))?;
+        .map_err(|_| "Failed to serialize attachment data".to_string())?;
     let composer_selectors = provider.composer_selectors_json();
     // Build JS without raw strings to avoid r#"..."# termination conflicts
     let js = "() => {\n".to_string()
@@ -4173,9 +9259,11 @@ fn upload_attachments_to_provider(
         config_path,
         "evaluate_script",
         serde_json::json!({ "function": js }),
-    )?;
+    )
+    .map_err(|_| "Failed to initiate attachment upload script".to_string())?;
 
-    let start_parsed = parse_script_result(&start_res)?;
+    let start_parsed = parse_script_result(&start_res)
+        .map_err(|_| "Failed to initiate attachment upload script".to_string())?;
     if !start_parsed.as_bool().unwrap_or(false) {
         return Err("Failed to initiate attachment upload script".to_string());
     }
@@ -4189,7 +9277,8 @@ fn upload_attachments_to_provider(
             config_path,
             "evaluate_script",
             serde_json::json!({ "function": "() => window.__upload_images_status || 'pending'" }),
-        )?;
+        )
+        .map_err(|_| "Attachment upload status was unavailable".to_string())?;
         if let Some(s) = parse_script_result(&check_res)
             .ok()
             .and_then(|p| p.as_str().map(|r| r.to_string()))
@@ -4200,7 +9289,7 @@ fn upload_attachments_to_provider(
     }
 
     if status.starts_with("error:") {
-        return Err(format!("Attachment upload failed: {}", status));
+        return Err("Attachment upload failed".to_string());
     }
     if status == "pending" {
         return Err("Timed out waiting for attachments to upload".to_string());
@@ -4210,34 +9299,1238 @@ fn upload_attachments_to_provider(
         println!("Attachments attached successfully ({})", status);
     }
 
-    // Give the UI a moment to render the attachments before typing the prompt
-    thread::sleep(Duration::from_millis(800));
+    Ok(())
+}
 
-    if provider == Provider::Gemini {
-        // Gemini renders image attachments as thumbnails without a stable filename in
-        // the accessible text. Text/document chips do expose their filename, so keep
-        // the stricter post-upload check for `--file` attachments only.
-        for path in file_paths {
-            if let Err(e) = wait_for_attachment_indicator(config_path, provider, path, verbose) {
-                if verbose {
-                    eprintln!(
-                        "Warning: {} DataTransfer upload was not detected, trying file chooser fallback: {}",
-                        provider.display_name(),
-                        e
-                    );
-                }
-                return upload_attachments_via_file_chooser(
+/// Upload every attachment and then require an exact, healthy filename
+/// multiset to remain unchanged across two probes before the prompt may be
+/// typed or submitted.
+fn upload_attachments_to_provider(
+    config_path: &str,
+    provider: Provider,
+    image_paths: &[String],
+    file_paths: &[String],
+    summary: &AttachmentSummary,
+    verbose: bool,
+) -> Result<Option<AttachmentProbeSummary>, String> {
+    if summary.count() != image_paths.len() + file_paths.len() {
+        return Err("附件摘要數量不一致".to_string());
+    }
+
+    // Typed mixed-attachment upload sequence (verified_mixed_attachment_upload_v1):
+    // 1. Upload documents first (native chooser / fallback).
+    // 2. If images are present, upload them via DataTransfer after documents
+    //    are stable.
+    // 3. Verify the full mixed set with the typed verifier (document filename
+    //    multiset + image preview delta + natural dimensions).  If only
+    //    documents are present, the legacy filename-multiset verifier is
+    //    reused for backward compatibility.
+    let has_images = !image_paths.is_empty();
+    let expectations = AttachmentExpectations::new(file_paths, image_paths)
+        .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+
+    // 1. Documents first.
+    match document_upload_policy(provider) {
+        DocumentUploadPolicy::NativeOnly => {
+            for path in file_paths {
+                upload_attachments_via_file_chooser(
                     config_path,
                     provider,
-                    image_paths,
-                    file_paths,
+                    &[],
+                    std::slice::from_ref(path),
                     verbose,
-                );
+                )?;
             }
+        }
+        DocumentUploadPolicy::NativeThenDataTransferFallback => {
+            for path in file_paths {
+                run_native_then_fallback(
+                    || {
+                        upload_attachments_via_file_chooser(
+                            config_path,
+                            provider,
+                            &[],
+                            std::slice::from_ref(path),
+                            verbose,
+                        )
+                    },
+                    || {
+                        upload_attachments_via_data_transfer(
+                            config_path,
+                            provider,
+                            &[],
+                            std::slice::from_ref(path),
+                            verbose,
+                        )
+                    },
+                )?;
+            }
+        }
+        DocumentUploadPolicy::DataTransferOnly => {
+            upload_attachments_via_data_transfer(config_path, provider, &[], file_paths, verbose)?;
         }
     }
 
+    // 2. If there are images, upload them via DataTransfer after documents.
+    if has_images {
+        match provider {
+            Provider::Gemini => {
+                run_native_then_fallback(
+                    || {
+                        upload_attachments_via_file_chooser(
+                            config_path,
+                            provider,
+                            image_paths,
+                            &[],
+                            verbose,
+                        )
+                    },
+                    || {
+                        upload_attachments_via_data_transfer(
+                            config_path,
+                            provider,
+                            image_paths,
+                            &[],
+                            verbose,
+                        )
+                    },
+                )?;
+            }
+            Provider::ChatGpt => {
+                upload_attachments_via_file_chooser(
+                    config_path,
+                    provider,
+                    image_paths,
+                    &[],
+                    verbose,
+                )?;
+            }
+            Provider::Claude => {
+                upload_attachments_via_data_transfer(
+                    config_path,
+                    provider,
+                    image_paths,
+                    &[],
+                    verbose,
+                )?;
+            }
+        }
+        // 3. Typed verification for the mixed set.
+        let typed_summary =
+            verify_typed_attachment_completion(config_path, provider, &expectations, verbose)?;
+        Ok(Some(typed_summary))
+    } else {
+        // Documents-only: use the legacy filename-multiset verifier.
+        verify_attachment_completion(config_path, provider, &summary.file_names, verbose)?;
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatGptStateOwnerRelation {
+    Marker,
+    Descendant,
+}
+
+impl ChatGptStateOwnerRelation {
+    fn from_projection(value: &str) -> Result<Self, String> {
+        match value {
+            "marker" => Ok(Self::Marker),
+            "descendant" => Ok(Self::Descendant),
+            _ => Err("reasoning slider state owner relation is invalid".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatGptFocusOwnerRelation {
+    StateOwner,
+    Descendant,
+}
+
+impl ChatGptFocusOwnerRelation {
+    fn from_projection(value: &str) -> Result<Self, String> {
+        match value {
+            "state_owner" => Ok(Self::StateOwner),
+            "descendant" => Ok(Self::Descendant),
+            _ => Err("reasoning slider focus owner relation is invalid".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatGptRoleEvidence {
+    Slider,
+    NativeRange,
+    Missing,
+    Conflict,
+}
+
+impl ChatGptRoleEvidence {
+    fn from_projection(value: &str) -> Result<Self, String> {
+        match value {
+            "slider" => Ok(Self::Slider),
+            "native_range" => Ok(Self::NativeRange),
+            "missing" => Ok(Self::Missing),
+            "conflict" => Ok(Self::Conflict),
+            _ => Err("reasoning slider role evidence is invalid".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatGptSliderState {
+    min: i64,
+    max: i64,
+    now: i64,
+    matched: bool,
+    announcement_present: bool,
+    focused: bool,
+    marker_present: bool,
+    marker_count: usize,
+    role_slider: bool,
+    state_owner_relation: Option<ChatGptStateOwnerRelation>,
+    focus_owner_relation: Option<ChatGptFocusOwnerRelation>,
+    role_evidence: ChatGptRoleEvidence,
+    ordinal_present: bool,
+    ordinal_current: Option<i64>,
+    ordinal_total: Option<i64>,
+    ordinal_consistent: bool,
+    ordinal_conflict: bool,
+    semantic_effort: Option<ReasoningEffort>,
+    semantic_conflict: bool,
+    /// v6: number of lock ticks reported by the resolver (`None` when the
+    /// resolver could not enumerate a lock map at all).
+    tick_count: Option<i64>,
+    /// v6: whether the resolver enumerated a usable lock map (root + ticks).
+    lock_map_present: bool,
+    /// v6: absolute slider values whose tick carries `data-locked="true"`.
+    locked_positions: Vec<i64>,
+    /// v6: current position is locked (root mark, lock map membership or an
+    /// upgrade hint in the announcement).
+    current_locked: bool,
+    /// v6: an announcement exists but carries no recognizable effort label.
+    semantic_unknown: bool,
+}
+
+/// Labeled ordered domains are bounded; anything outside this span is treated
+/// as third-party UI contract drift and fails closed.
+const MIN_LABELED_DOMAIN_SPAN: i64 = 2;
+const MAX_LABELED_DOMAIN_SPAN: i64 = 8;
+
+impl ChatGptSliderState {
+    fn has_ordinal_evidence(&self) -> bool {
+        self.ordinal_present || self.ordinal_current.is_some() || self.ordinal_total.is_some()
+    }
+
+    fn requires_bounded_ordinal(&self) -> bool {
+        self.marker_present || self.has_ordinal_evidence()
+    }
+
+    fn span(&self) -> i64 {
+        self.max - self.min + 1
+    }
+
+    /// v6 label-driven domain validation. The domain size is a consistency
+    /// check, never a hard-coded three-state profile: what must hold is that
+    /// the announced ordinal matches the announced span, that any lock map is
+    /// complete, and that lock evidence agrees with the current value.
+    fn validate_ordered_domain(&self) -> Result<(), String> {
+        if !self.marker_present || self.marker_count != 1 {
+            return Err("Model switch failed: reasoning slider marker is missing".to_string());
+        }
+        if self.state_owner_relation.is_none() || self.focus_owner_relation.is_none() {
+            return Err(
+                "Model switch failed: reasoning slider control bundle is invalid".to_string(),
+            );
+        }
+        if self.role_evidence == ChatGptRoleEvidence::Conflict {
+            return Err(
+                "Model switch failed: reasoning slider role conflicts with its control".to_string(),
+            );
+        }
+        let span = self.span();
+        if !(MIN_LABELED_DOMAIN_SPAN..=MAX_LABELED_DOMAIN_SPAN).contains(&span)
+            || self.now < self.min
+            || self.now > self.max
+        {
+            return Err(
+                "Model switch failed: reasoning slider state profile is invalid".to_string(),
+            );
+        }
+        if self.ordinal_present
+            && (self.ordinal_conflict
+                || !self.ordinal_consistent
+                || self.ordinal_total != Some(span)
+                || self.ordinal_current != Some(self.now - self.min + 1))
+        {
+            return Err("Model switch failed: reasoning slider ordinal conflict".to_string());
+        }
+        if self.semantic_conflict {
+            return Err("Model switch failed: reasoning slider semantic conflict".to_string());
+        }
+        if self.lock_map_present {
+            let tick_count = self.tick_count.unwrap_or(-1);
+            if tick_count != span {
+                return Err(format!(
+                    "Model switch failed: reasoning slider lock map has {} ticks for {} positions",
+                    tick_count, span
+                ));
+            }
+            if self
+                .locked_positions
+                .iter()
+                .any(|position| *position < self.min || *position > self.max)
+            {
+                return Err(
+                    "Model switch failed: reasoning slider lock map is out of range".to_string(),
+                );
+            }
+            if self.current_locked != self.locked_positions.contains(&self.now) {
+                return Err(
+                    "Model switch failed: reasoning slider lock evidence conflicts".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn same_observable_state(&self, other: &Self) -> bool {
+        self.min == other.min
+            && self.max == other.max
+            && self.now == other.now
+            && self.matched == other.matched
+            && self.announcement_present == other.announcement_present
+            && self.focused == other.focused
+            && self.marker_present == other.marker_present
+            && self.marker_count == other.marker_count
+            && self.role_slider == other.role_slider
+            && self.state_owner_relation == other.state_owner_relation
+            && self.focus_owner_relation == other.focus_owner_relation
+            && self.role_evidence == other.role_evidence
+            && self.ordinal_present == other.ordinal_present
+            && self.ordinal_current == other.ordinal_current
+            && self.ordinal_total == other.ordinal_total
+            && self.ordinal_consistent == other.ordinal_consistent
+            && self.ordinal_conflict == other.ordinal_conflict
+            && self.semantic_effort == other.semantic_effort
+            && self.semantic_conflict == other.semantic_conflict
+            && self.tick_count == other.tick_count
+            && self.lock_map_present == other.lock_map_present
+            && self.locked_positions == other.locked_positions
+            && self.current_locked == other.current_locked
+            && self.semantic_unknown == other.semantic_unknown
+    }
+
+    /// Cross-read stability predicate for the accepted selection.
+    ///
+    /// Plan line 64: the domain window (`min`/`max`) is deliberately excluded
+    /// because the live page can re-render its span between two reads (F2)
+    /// while the selected value, its direct label and the lock state stay
+    /// identical. Every individual read is still validated by
+    /// `validate_ordered_domain`, so `now` always falls inside that read's own
+    /// `[min, max]`.
+    fn same_target_observation(&self, other: &Self) -> bool {
+        self.now == other.now
+            && self.semantic_effort == other.semantic_effort
+            && self.matched
+            && other.matched
+            && !self.semantic_unknown
+            && !other.semantic_unknown
+            && !self.current_locked
+            && !other.current_locked
+    }
+}
+
+/// Records the directly observed page label per `(min, max)` window and
+/// per-position value.
+///
+/// The verified receipt reports how many distinct positions carried a
+/// recognizable label *inside the exact window that carried the accepted
+/// selection* (plan B-01). Reads taken while the page was re-rendering under a
+/// different window are still validated for movement, but they never inflate
+/// the count.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChatGptLabeledPositionLedger {
+    windows: BTreeMap<(i64, i64), BTreeMap<i64, ReasoningEffort>>,
+}
+
+impl ChatGptLabeledPositionLedger {
+    fn observe(&mut self, state: &ChatGptSliderState) -> Result<(), String> {
+        state.validate_ordered_domain()?;
+        let Some(effort) = state.semantic_effort else {
+            return Ok(());
+        };
+        let window = self.windows.entry((state.min, state.max)).or_default();
+        if let Some(existing) = window.get(&state.now)
+            && *existing != effort
+        {
+            return Err(
+                "Model switch failed: reasoning slider semantic calibration conflict".to_string(),
+            );
+        }
+        if window
+            .iter()
+            .any(|(position, value)| *position != state.now && *value == effort)
+        {
+            return Err(
+                "Model switch failed: reasoning slider duplicate semantic labels".to_string(),
+            );
+        }
+        window.insert(state.now, effort);
+        Ok(())
+    }
+
+    /// Distinct labeled positions observed inside the given window.
+    fn window_count(&self, min: i64, max: i64) -> u8 {
+        self.windows
+            .get(&(min, max))
+            .map(|window| u8::try_from(window.len()).unwrap_or(u8::MAX))
+            .unwrap_or(0)
+    }
+}
+
+fn chatgpt_reasoning_control_bundle_resolver_js() -> &'static str {
+    include_str!("chatgpt_control_bundle_resolver.js")
+}
+
+fn build_chatgpt_model_selection_script(target_json: &str) -> String {
+    let template = r##"() => {
+    window.__switch_model_status = 'pending';
+    (async () => {
+        try {
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const norm = (value) => (value || '').toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '');
+            const aliases = {
+                '中等': '中',
+                '中等推理': '中',
+                '高推理': '高',
+                '即時推理': '即時',
+                'instant': '即時',
+                'fast': '即時',
+                'light': '即時',
+                'low': '即時',
+                'medium': '中',
+                'standard': '中',
+                'thinking': '中',
+                'high': '高',
+                'heavy': '高',
+                'extended': '高'
+            };
+            const canonical = (value) => {
+                const normalized = norm(value)
+                    .replace(/^(已選取|已選|selected|currentlyselected)/, '')
+                    .replace(/(已選取|已選|selected|currentlyselected)$/, '');
+                return aliases[normalized] || normalized;
+            };
+            const target = canonical(__TARGET_MODEL__);
+            if (!target) {
+                window.__switch_model_status = 'error: empty target';
+                return;
+            }
+            const isVisible = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+            };
+            const isVisibleOrOwned = (element) => isVisible(element) ||
+                isVisible(element.closest('[role="menuitemradio"], [role="radio"], label'));
+            const labelValues = (element) => [
+                element?.getAttribute('aria-label'),
+                element?.getAttribute('title'),
+                element?.innerText,
+                element?.textContent
+            ].filter(Boolean).map((value) => value.trim()).filter(Boolean);
+            const labelOf = (element) => labelValues(element).join(' ');
+            const matchesTarget = (element) => labelValues(element).some((value) =>
+                canonical(value) === target
+            );
+            const hasCheckedEvidence = (element) => {
+                if (!element) return false;
+                if (element.matches(':checked')) return true;
+                if (element.getAttribute('aria-checked') === 'true') return true;
+                if (element.getAttribute('aria-selected') === 'true') return true;
+                if (element.getAttribute('data-state') === 'checked') return true;
+                const nested = element.querySelector('input[type="radio"], [role="radio"]');
+                return Boolean(nested && (
+                    nested.matches(':checked') ||
+                    nested.getAttribute('aria-checked') === 'true' ||
+                    nested.getAttribute('data-state') === 'checked'
+                ));
+            };
+            const closeMenus = async () => {
+                document.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Escape', keyCode: 27, bubbles: true
+                }));
+                await sleep(350);
+            };
+            await closeMenus();
+            let pill = null;
+            for (let attempt = 0; attempt < 20; attempt++) {
+                pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
+                if (pill && isVisible(pill)) break;
+                await sleep(250);
+            }
+            if (!pill || !isVisible(pill)) {
+                window.__switch_model_status = 'error: composer pill not found';
+                return;
+            }
+            // React's composer control may attach its menu opener to the
+            // pointer sequence.  These events only open the menu; all model
+            // and slider selections remain verified below.
+            pill.dispatchEvent(new PointerEvent('pointerdown', {
+                bubbles: true, pointerType: 'mouse', isPrimary: true
+            }));
+            pill.dispatchEvent(new PointerEvent('pointerup', {
+                bubbles: true, pointerType: 'mouse', isPrimary: true
+            }));
+            pill.click();
+            await sleep(800);
+
+            const radioCandidates = () => Array.from(document.querySelectorAll(
+                '[role="menuitemradio"], [role="radio"], input[type="radio"]'
+            ));
+            const matchingRadio = () => radioCandidates().find((item) =>
+                isVisibleOrOwned(item) && matchesTarget(item)
+            );
+            const radio = matchingRadio();
+            if (radio) {
+                radio.click();
+                await sleep(500);
+                const selected = radioCandidates().find((item) =>
+                    matchesTarget(item) && hasCheckedEvidence(item)
+                );
+                if (!selected) {
+                    window.__switch_model_status = 'error: model radio selection was not verified';
+                    return;
+                }
+                await closeMenus();
+                window.__switch_model_status = 'success:legacy_menu_v1';
+                return;
+            }
+
+            const resolveReasoningControlBundle = __CONTROL_BUNDLE_RESOLVER__;
+            let bundle = resolveReasoningControlBundle(target);
+            let reasoningTriggerCount = 0;
+            let reasoningOpenAttempts = 0;
+            if (!bundle.found) {
+                const triggers = Array.from(document.querySelectorAll(
+                    '[aria-expanded], [role="menuitem"], button'
+                )).filter((item) =>
+                    isVisibleOrOwned(item) && item.getAttribute('role') !== 'slider' &&
+                    /reasoning|推理強度|思考強度/i.test(labelValues(item).join(' '))
+                );
+                reasoningTriggerCount = triggers.length;
+                for (const trigger of triggers) {
+                    if (trigger.getAttribute('aria-expanded') === 'true') continue;
+                    reasoningOpenAttempts += 1;
+                    trigger.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));
+                    trigger.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));
+                    trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    trigger.click();
+                    await sleep(700);
+                    bundle = resolveReasoningControlBundle(target);
+                    if (bundle.found) break;
+                }
+            }
+            if (bundle.found) {
+                if (bundle.bundle_error) {
+                    window.__switch_model_status = 'error: ' + bundle.bundle_error;
+                    return;
+                }
+                window.__switch_model_status = 'slider_ready';
+                return;
+            }
+
+            const visited = new Set();
+            for (let depth = 0; depth < 6; depth++) {
+                const all = Array.from(document.querySelectorAll(
+                    '[role="menuitem"], [role="menuitemradio"]'
+                ));
+                const leaves = all.filter((item) => item.getAttribute('aria-haspopup') !== 'menu');
+                const match = leaves.find((item) =>
+                    isVisibleOrOwned(item) && matchesTarget(item)
+                );
+                if (match) {
+                    match.click();
+                    await sleep(500);
+                    const verified = Array.from(document.querySelectorAll(
+                        '[role="menuitem"], [role="menuitemradio"], [role="option"]'
+                    )).some((item) => matchesTarget(item) && hasCheckedEvidence(item));
+                    if (!verified) {
+                        window.__switch_model_status = 'error: legacy menu selection was not verified';
+                        return;
+                    }
+                    await closeMenus();
+                    window.__switch_model_status = 'success:legacy_menu_v1';
+                    return;
+                }
+                const triggers = all.filter((item) => item.getAttribute('aria-haspopup') === 'menu');
+                const trigger = triggers.find((item) => {
+                    const key = canonical(labelOf(item));
+                    return key && !visited.has(key);
+                });
+                if (!trigger) break;
+                visited.add(canonical(labelOf(trigger)));
+                trigger.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));
+                trigger.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));
+                trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                trigger.click();
+                await sleep(750);
+            }
+            await closeMenus();
+            window.__switch_model_status = 'error: model not found in verified selectors' +
+                ' (radios=' + radioCandidates().length +
+                ', slider=' + (bundle.found ? 1 : 0) +
+                ', reasoning_triggers=' + reasoningTriggerCount +
+                ', reasoning_attempts=' + reasoningOpenAttempts + ')';
+        } catch (error) {
+            window.__switch_model_status = 'error: ' + error.message;
+        }
+    })();
+    return true;
+}"##;
+    template.replace("__TARGET_MODEL__", target_json).replace(
+        "__CONTROL_BUNDLE_RESOLVER__",
+        chatgpt_reasoning_control_bundle_resolver_js(),
+    )
+}
+
+fn build_chatgpt_slider_state_script(target_json: &str) -> String {
+    let mut template = r##"() => {
+    const resolveReasoningControlBundle = __CONTROL_BUNDLE_RESOLVER__;
+    return resolveReasoningControlBundle(__TARGET_MODEL__);
+}"##
+    .to_string();
+    template = template.replace("__TARGET_MODEL__", target_json);
+    template.replace(
+        "__CONTROL_BUNDLE_RESOLVER__",
+        chatgpt_reasoning_control_bundle_resolver_js(),
+    )
+}
+
+fn parse_chatgpt_slider_state(value: &Value) -> Result<ChatGptSliderState, String> {
+    if value.get("found").and_then(Value::as_bool) != Some(true) {
+        return Err("reasoning slider disappeared".to_string());
+    }
+    if let Some(error) = value.get("bundle_error").and_then(Value::as_str) {
+        return Err(format!("Model switch failed: {}", error));
+    }
+    let marker_present = value
+        .get("marker_present")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "reasoning slider marker evidence is unavailable".to_string())?;
+    let marker_count = value
+        .get("marker_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "reasoning slider marker count is unavailable".to_string())?;
+    let role_evidence = value
+        .get("role_evidence")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "reasoning slider role evidence is unavailable".to_string())
+        .and_then(ChatGptRoleEvidence::from_projection)?;
+    let state_owner_relation = match value.get("state_owner_relation") {
+        Some(Value::String(relation)) => {
+            Some(ChatGptStateOwnerRelation::from_projection(relation)?)
+        }
+        None | Some(Value::Null) if !marker_present => None,
+        None | Some(Value::Null) => {
+            return Err("reasoning slider state owner relation is unavailable".to_string());
+        }
+        Some(_) => return Err("reasoning slider state owner relation is invalid".to_string()),
+    };
+    let focus_owner_relation = match value.get("focus_owner_relation") {
+        Some(Value::String(relation)) => {
+            Some(ChatGptFocusOwnerRelation::from_projection(relation)?)
+        }
+        None | Some(Value::Null) if !marker_present => None,
+        None | Some(Value::Null) => {
+            return Err("reasoning slider focus owner relation is unavailable".to_string());
+        }
+        Some(_) => return Err("reasoning slider focus owner relation is invalid".to_string()),
+    };
+    let min = value
+        .get("min")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "reasoning slider minimum is unavailable".to_string())?;
+    let max = value
+        .get("max")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "reasoning slider maximum is unavailable".to_string())?;
+    let now = value
+        .get("now")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "reasoning slider value is unavailable".to_string())?;
+    let span = max - min + 1;
+    if min < 0
+        || max < min
+        || !(MIN_LABELED_DOMAIN_SPAN..=MAX_LABELED_DOMAIN_SPAN).contains(&span)
+        || now < min
+        || now > max
+    {
+        return Err(format!(
+            "reasoning slider domain span {} is outside the supported {}-{} range",
+            span, MIN_LABELED_DOMAIN_SPAN, MAX_LABELED_DOMAIN_SPAN
+        ));
+    }
+    if value.get("focused").and_then(Value::as_bool) != Some(true) {
+        return Err("reasoning slider could not be focused".to_string());
+    }
+    let optional_integer = |key: &str| -> Result<Option<i64>, String> {
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(raw) => raw
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| format!("reasoning slider {} is not an integer", key)),
+        }
+    };
+    let semantic_effort = match value.get("semantic_effort") {
+        None | Some(Value::Null) => None,
+        Some(raw) => {
+            let label = raw
+                .as_str()
+                .ok_or_else(|| "reasoning slider semantic effort is invalid".to_string())?;
+            Some(
+                ReasoningEffort::from_label(label)
+                    .ok_or_else(|| "reasoning slider semantic effort is unknown".to_string())?,
+            )
+        }
+    };
+    let focused = value
+        .get("focused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tick_count = optional_integer("tick_count")?;
+    let lock_map_present = value
+        .get("lock_map_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let locked_positions = match value.get("locked_positions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_i64()
+                    .ok_or_else(|| "reasoning slider locked position is not an integer".to_string())
+            })
+            .collect::<Result<Vec<i64>, String>>()?,
+        Some(_) => {
+            return Err("reasoning slider locked positions are invalid".to_string());
+        }
+    };
+    Ok(ChatGptSliderState {
+        min,
+        max,
+        now,
+        matched: value
+            .get("matched")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        announcement_present: value
+            .get("announcement_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        focused,
+        marker_present,
+        marker_count,
+        role_slider: role_evidence == ChatGptRoleEvidence::Slider,
+        state_owner_relation,
+        focus_owner_relation,
+        role_evidence,
+        ordinal_present: value
+            .get("ordinal_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        ordinal_current: optional_integer("ordinal_current")?,
+        ordinal_total: optional_integer("ordinal_total")?,
+        ordinal_consistent: value
+            .get("ordinal_consistent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        ordinal_conflict: value
+            .get("ordinal_conflict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        semantic_effort,
+        semantic_conflict: value
+            .get("semantic_conflict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        tick_count,
+        lock_map_present,
+        locked_positions,
+        current_locked: value
+            .get("current_locked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        semantic_unknown: value
+            .get("semantic_unknown")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn read_chatgpt_slider_state(
+    config_path: &str,
+    target_json: &str,
+) -> Result<ChatGptSliderState, String> {
+    let response = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({
+            "function": build_chatgpt_slider_state_script(target_json)
+        }),
+    )?;
+    let value = parse_script_result(&response)?;
+    parse_chatgpt_slider_state(&value)
+}
+
+fn press_provider_key(config_path: &str, key: &str) -> Result<(), String> {
+    call_mcp_tool(
+        config_path,
+        "press_key",
+        serde_json::json!({
+            "key": key,
+            "includeSnapshot": false
+        }),
+    )?;
     Ok(())
+}
+
+fn build_chatgpt_reopen_slider_script() -> String {
+    let template = r##"() => {
+    window.__reopen_model_status = 'pending';
+    (async () => {
+        try {
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const isVisible = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+            };
+            const resolveReasoningControlBundle = __CONTROL_BUNDLE_RESOLVER__;
+            const pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
+            if (!pill || !isVisible(pill)) {
+                window.__reopen_model_status = 'error: composer pill not found';
+                return;
+            }
+            pill.dispatchEvent(new PointerEvent('pointerdown', {
+                bubbles: true, pointerType: 'mouse', isPrimary: true
+            }));
+            pill.dispatchEvent(new PointerEvent('pointerup', {
+                bubbles: true, pointerType: 'mouse', isPrimary: true
+            }));
+            pill.click();
+            for (let attempt = 0; attempt < 20; attempt++) {
+                const bundle = resolveReasoningControlBundle(null);
+                if (bundle.found) {
+                    if (bundle.bundle_error) {
+                        window.__reopen_model_status = 'error: ' + bundle.bundle_error;
+                        return;
+                    }
+                    window.__reopen_model_status = 'success';
+                    return;
+                }
+                await sleep(250);
+            }
+            window.__reopen_model_status = 'error: reasoning slider did not reopen';
+        } catch (error) {
+            window.__reopen_model_status = 'error: ' + error.message;
+        }
+    })();
+    return true;
+}"##;
+    template.replace(
+        "__CONTROL_BUNDLE_RESOLVER__",
+        chatgpt_reasoning_control_bundle_resolver_js(),
+    )
+}
+
+fn reopen_chatgpt_slider(config_path: &str) -> Result<(), String> {
+    let start_res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": build_chatgpt_reopen_slider_script() }),
+    )?;
+    if !parse_script_result(&start_res)?.as_bool().unwrap_or(false) {
+        return Err("Model switch failed: could not reopen reasoning slider".to_string());
+    }
+
+    let mut wait_cycles = 0;
+    let mut status = String::from("pending");
+    while status == "pending" && wait_cycles < 60 {
+        thread::sleep(Duration::from_millis(200));
+        let check_res = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": "() => window.__reopen_model_status || 'pending'" }),
+        )?;
+        if let Some(value) = parse_script_result(&check_res)
+            .ok()
+            .and_then(|parsed| parsed.as_str().map(str::to_string))
+        {
+            status = value;
+        }
+        wait_cycles += 1;
+    }
+    if status != "success" {
+        return Err(format!(
+            "Model switch failed: reasoning slider reopen status {}",
+            status
+        ));
+    }
+    Ok(())
+}
+
+/// Bounded stability window used after the target position was reached.
+const SELECTION_STABILITY_MAX_READS: usize = 5;
+
+/// Minimal page surface the label-driven selector needs. Production uses the
+/// MCP-backed page below; tests drive the same algorithm with a simulated
+/// page so movement, lock and drift rules are covered without a browser.
+trait ChatGptSliderPage {
+    fn read_slider(&mut self) -> Result<ChatGptSliderState, String>;
+    fn press_key(&mut self, key: &str) -> Result<(), String>;
+    fn reopen_slider(&mut self) -> Result<(), String>;
+    fn settle(&mut self);
+}
+
+struct LiveChatGptSliderPage<'a> {
+    config_path: &'a str,
+    target_json: &'a str,
+}
+
+impl ChatGptSliderPage for LiveChatGptSliderPage<'_> {
+    fn read_slider(&mut self) -> Result<ChatGptSliderState, String> {
+        read_chatgpt_slider_state(self.config_path, self.target_json)
+    }
+
+    fn press_key(&mut self, key: &str) -> Result<(), String> {
+        press_provider_key(self.config_path, key)
+    }
+
+    fn reopen_slider(&mut self) -> Result<(), String> {
+        reopen_chatgpt_slider(self.config_path)
+    }
+
+    fn settle(&mut self) {
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Every read the selector acts on must carry an announcement, and the read
+/// must describe a legal labeled ordered domain. Unknown labels are skippable
+/// but never selectable (plan step 4).
+fn observe_visited_position(
+    ledger: &mut ChatGptLabeledPositionLedger,
+    state: &ChatGptSliderState,
+) -> Result<(), String> {
+    if !state.announcement_present {
+        return Err(
+            "Model switch failed: reasoning slider announcement was not verified".to_string(),
+        );
+    }
+    ledger.observe(state)
+}
+
+fn label_matches_target(state: &ChatGptSliderState, target: ReasoningEffort) -> bool {
+    state.matched
+        && state.semantic_effort == Some(target)
+        && !state.semantic_unknown
+        && !state.current_locked
+}
+
+/// Re-reads the slider (which re-focuses the thumb, F1), presses one key and
+/// reads again. Callers validate the exact +/-1 transition.
+fn press_slider_key_and_read(
+    page: &mut impl ChatGptSliderPage,
+    ledger: &mut ChatGptLabeledPositionLedger,
+    key: &str,
+) -> Result<ChatGptSliderState, String> {
+    let focus_read = page.read_slider()?;
+    observe_visited_position(ledger, &focus_read)?;
+    page.press_key(key)?;
+    page.settle();
+    let next = page.read_slider()?;
+    observe_visited_position(ledger, &next)?;
+    Ok(next)
+}
+
+/// Walks the slider to the labeled position whose direct label equals `target`
+/// and returns the read that carried the match. Movement is label-driven: the
+/// domain size only bounds the walk, it never maps a label to an index.
+fn walk_chatgpt_labeled_domain(
+    page: &mut impl ChatGptSliderPage,
+    target: ReasoningEffort,
+    ledger: &mut ChatGptLabeledPositionLedger,
+    mut state: ChatGptSliderState,
+) -> Result<ChatGptSliderState, String> {
+    observe_visited_position(ledger, &state)?;
+
+    // Step 1: reach `min`. A locked starting position is allowed (F-05);
+    // ArrowLeft still leaves it.
+    let mut left_steps = 0usize;
+    while state.now > state.min {
+        if left_steps >= usize::try_from(MAX_LABELED_DOMAIN_SPAN).unwrap_or(8) {
+            return Err(
+                "Model switch failed: reasoning slider did not reach its minimum".to_string(),
+            );
+        }
+        let previous = state;
+        let next = press_slider_key_and_read(page, ledger, "ArrowLeft")?;
+        if next.now != previous.now - 1 {
+            return Err(
+                "Model switch failed: reasoning slider left movement was not exactly one state"
+                    .to_string(),
+            );
+        }
+        state = next;
+        left_steps += 1;
+    }
+
+    // Step 2: the minimum itself may already carry the target (R3).
+    if label_matches_target(&state, target) {
+        return Ok(state);
+    }
+
+    // Step 3: walk right, never entering a locked position.
+    loop {
+        if state.now >= state.max {
+            return Err(
+                "Model switch failed: reasoning target was not found in the labeled domain"
+                    .to_string(),
+            );
+        }
+        if state.lock_map_present && state.locked_positions.contains(&(state.now + 1)) {
+            return Err(
+                "Model switch failed: reasoning target is not in the unlocked slider domain"
+                    .to_string(),
+            );
+        }
+        let previous = state;
+        let next = press_slider_key_and_read(page, ledger, "ArrowRight")?;
+        if next.now != previous.now + 1 {
+            return Err(
+                "Model switch failed: reasoning slider right movement was not exactly one state"
+                    .to_string(),
+            );
+        }
+        if next.current_locked {
+            return Err(
+                "Model switch failed: reasoning slider reached a locked position".to_string(),
+            );
+        }
+        state = next;
+        if label_matches_target(&state, target) {
+            return Ok(state);
+        }
+    }
+}
+
+fn select_chatgpt_labeled_ordered_control(
+    page: &mut impl ChatGptSliderPage,
+    target: ReasoningEffort,
+    state: ChatGptSliderState,
+) -> Result<ModelSelectionOutcome, String> {
+    let mut ledger = ChatGptLabeledPositionLedger::default();
+    let mut hit = walk_chatgpt_labeled_domain(page, target, &mut ledger, state)?;
+
+    // Step 6: bounded stability window. The page may re-render its span
+    // between reads (F2), so only the value, the direct label and the lock
+    // state must agree; every individual read still validates its own domain.
+    let mut stable = false;
+    let mut relocated = false;
+    let mut previous: Option<ChatGptSliderState> = None;
+    for _ in 0..SELECTION_STABILITY_MAX_READS {
+        let read = page.read_slider()?;
+        observe_visited_position(&mut ledger, &read)?;
+        if read.now != hit.now || !label_matches_target(&read, target) {
+            if relocated {
+                return Err(
+                    "Model switch failed: reasoning slider target was not stable across reads"
+                        .to_string(),
+                );
+            }
+            relocated = true;
+            // Re-anchor by label, not by value: a re-render may shift the
+            // window (F2) so the same position can carry a different value.
+            hit = walk_chatgpt_labeled_domain(page, target, &mut ledger, read)?;
+            previous = Some(hit.clone());
+            continue;
+        }
+        if let Some(last) = previous
+            && last.same_target_observation(&read)
+            && (last.min != read.min || last.max != read.max || last.same_observable_state(&read))
+        {
+            stable = true;
+            break;
+        }
+        previous = Some(read);
+    }
+    if !stable {
+        return Err(
+            "Model switch failed: reasoning slider target was not stable across reads".to_string(),
+        );
+    }
+
+    // Step 7: close and reopen the menu; the labeled position must persist.
+    page.press_key("Escape")?;
+    page.settle();
+    page.reopen_slider()?;
+    let mut reopen_stable = false;
+    let mut reopen_previous: Option<ChatGptSliderState> = None;
+    for _ in 0..SELECTION_STABILITY_MAX_READS {
+        let read = page.read_slider()?;
+        observe_visited_position(&mut ledger, &read)?;
+        if read.now != hit.now || !label_matches_target(&read, target) {
+            return Err(
+                "Model switch failed: reasoning slider target did not persist after reopen"
+                    .to_string(),
+            );
+        }
+        if let Some(last) = reopen_previous
+            && last.same_target_observation(&read)
+            && (last.min != read.min || last.max != read.max || last.same_observable_state(&read))
+        {
+            reopen_stable = true;
+            break;
+        }
+        reopen_previous = Some(read);
+    }
+    if !reopen_stable {
+        return Err(
+            "Model switch failed: reopened reasoning slider target was not stable".to_string(),
+        );
+    }
+    page.press_key("Escape")?;
+
+    // Step 8: the receipt counts only reads taken in the exact window that
+    // carried the accepted selection (B-01); the hit read is one of them.
+    let direct_semantic_count = ledger.window_count(hit.min, hit.max);
+    Ok(ModelSelectionOutcome {
+        contract: ModelSelectionContract::ReasoningLabeledOrderedControlV4,
+        evidence: ModelSelectionEvidence::LabeledEffortPositionMapV1,
+        direct_semantic_count: Some(direct_semantic_count),
+        position_count: u8::try_from(hit.span()).ok(),
+    })
+}
+
+/// Best-effort menu cleanup after a failed model selection. The failed
+/// receipt is already written by the caller; this helper only closes the menu,
+/// reports warnings, and never changes the original failure semantics.
+fn best_effort_close_reasoning_menu(config_path: &str, target_json: &str) {
+    let mut page = LiveChatGptSliderPage {
+        config_path,
+        target_json,
+    };
+    match page.read_slider() {
+        Ok(mut state) => {
+            let max_steps =
+                usize::try_from(state.span().clamp(1, MAX_LABELED_DOMAIN_SPAN)).unwrap_or(1);
+            let mut steps = 0usize;
+            while state.current_locked && steps < max_steps {
+                let before = state.now;
+                if let Err(error) = page.press_key("ArrowLeft") {
+                    eprintln!(
+                        "Warning: reasoning slider cleanup key press failed: {}",
+                        error
+                    );
+                    break;
+                }
+                page.settle();
+                match page.read_slider() {
+                    Ok(next) => {
+                        if next.now >= before {
+                            break;
+                        }
+                        state = next;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: reasoning slider cleanup re-read failed: {}",
+                            error
+                        );
+                        break;
+                    }
+                }
+                steps += 1;
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: reasoning slider cleanup could not re-read the slider: {}",
+                error
+            );
+        }
+    }
+    if let Err(error) = page.press_key("Escape") {
+        eprintln!(
+            "Warning: reasoning slider cleanup could not close the menu: {}",
+            error
+        );
+    }
+}
+
+fn select_chatgpt_accessible_label(
+    config_path: &str,
+    target_json: &str,
+    mut state: ChatGptSliderState,
+) -> Result<ModelSelectionOutcome, String> {
+    if !state.announcement_present {
+        return Err(
+            "Model switch failed: reasoning slider announcement was not verified".to_string(),
+        );
+    }
+    if state.semantic_conflict {
+        return Err("Model switch failed: reasoning slider semantic labels conflict".to_string());
+    }
+
+    let left_attempts = (state.max - state.min + 1) as usize;
+    for _ in 0..=left_attempts {
+        if state.now == state.min {
+            break;
+        }
+        press_provider_key(&config_path, "ArrowLeft")?;
+        thread::sleep(Duration::from_millis(500));
+        state = read_chatgpt_slider_state(config_path, target_json)?;
+    }
+    if state.now != state.min {
+        return Err("Model switch failed: reasoning slider did not reach its minimum".to_string());
+    }
+
+    loop {
+        if state.matched {
+            let verified = read_chatgpt_slider_state(config_path, target_json)?;
+            if verified.now == state.now && verified.matched && !verified.semantic_conflict {
+                press_provider_key(&config_path, "Escape")?;
+                return Ok(ModelSelectionOutcome {
+                    contract: ModelSelectionContract::ReasoningSliderV1,
+                    evidence: ModelSelectionEvidence::AccessibleLabelV1,
+                    direct_semantic_count: None,
+                    position_count: None,
+                });
+            }
+            state = verified;
+        }
+        if state.now >= state.max {
+            break;
+        }
+        let previous = state.now;
+        press_provider_key(&config_path, "ArrowRight")?;
+        thread::sleep(Duration::from_millis(500));
+        state = read_chatgpt_slider_state(config_path, target_json)?;
+        if state.now <= previous {
+            return Err("Model switch failed: reasoning slider did not advance".to_string());
+        }
+    }
+    Err("Model switch failed: reasoning target was not found in slider announcement".to_string())
 }
 
 /// Switch the selected provider to the specified model. The page must already be
@@ -4247,7 +10540,7 @@ fn switch_model(
     provider: Provider,
     model: &str,
     verbose: bool,
-) -> Result<(), String> {
+) -> Result<ModelSelectionOutcome, String> {
     if model.trim().is_empty() {
         return Err("Empty model name".to_string());
     }
@@ -4263,75 +10556,7 @@ fn switch_model(
     }
 
     let js = match provider {
-        Provider::ChatGpt => {
-            // The script opens the composer pill menu, walks visible leaves and submenu
-            // triggers, and clicks the first leaf whose normalized label matches.
-            "() => {\n".to_string()
-                + "    window.__switch_model_status = 'pending';\n"
-                + "    (async () => {\n"
-                + "    try {\n"
-                + "        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n"
-                + "        const norm = (s) => (s || '').toLowerCase().replace(/[\\s.\\-_]/g, '');\n"
-                + &format!("        const target = norm({});\n", target_json)
-                + "        if (!target) { window.__switch_model_status = 'error: empty target'; return; }\n"
-                + "        const visited = new Set();\n"
-                + "        const closeMenus = async () => {\n"
-                + "            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
-                + "            await sleep(400);\n"
-                + "        };\n"
-                + "        await closeMenus();\n"
-                + "        let pill = null;\n"
-                + "        for (let i = 0; i < 20; i++) {\n"
-                + "            pill = document.querySelector('button.__composer-pill');\n"
-                + "            if (pill) break;\n"
-                + "            await sleep(250);\n"
-                + "        }\n"
-                + "        if (!pill) { window.__switch_model_status = 'error: composer pill not found'; return; }\n"
-                + "        pill.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));\n"
-                + "        pill.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }));\n"
-                + "        pill.click();\n"
-                + "        await sleep(800);\n"
-                + "        let clicked = false;\n"
-                + "        let chosen = '';\n"
-                + "        for (let depth = 0; depth < 6 && !clicked; depth++) {\n"
-                + "            const all = Array.from(document.querySelectorAll('[role=\"menuitem\"], [role=\"menuitemradio\"]'));\n"
-                + "            const leaves = all.filter((it) => it.getAttribute('aria-haspopup') !== 'menu');\n"
-                + "            for (const it of leaves) {\n"
-                + "                const t = norm(it.innerText);\n"
-                + "                if (t && t === target) {\n"
-                + "                    it.click();\n"
-                + "                    clicked = true;\n"
-                + "                    chosen = it.innerText;\n"
-                + "                    break;\n"
-                + "                }\n"
-                + "            }\n"
-                + "            if (clicked) break;\n"
-                + "            const trigs = all.filter((it) => it.getAttribute('aria-haspopup') === 'menu');\n"
-                + "            const trig = trigs.find((it) => {\n"
-                + "                const k = norm(it.innerText) + '|' + (it.getAttribute('aria-label') || '');\n"
-                + "                return !visited.has(k);\n"
-                + "            });\n"
-                + "            if (!trig) break;\n"
-                + "            visited.add(norm(trig.innerText) + '|' + (trig.getAttribute('aria-label') || ''));\n"
-                + "            trig.dispatchEvent(new MouseEvent('pointerenter', { bubbles: true }));\n"
-                + "            trig.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));\n"
-                + "            trig.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));\n"
-                + "            trig.click();\n"
-                + "            await sleep(750);\n"
-                + "        }\n"
-                + "        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));\n"
-                + "        if (!clicked) {\n"
-                + "            window.__switch_model_status = 'error: model not found in menu';\n"
-                + "            return;\n"
-                + "        }\n"
-                + "        window.__switch_model_status = 'success:' + chosen;\n"
-                + "    } catch (e) {\n"
-                + "        window.__switch_model_status = 'error: ' + e.message;\n"
-                + "    }\n"
-                + "    })();\n"
-                + "    return true;\n"
-                + "}"
-        }
+        Provider::ChatGpt => build_chatgpt_model_selection_script(&target_json),
         Provider::Gemini => {
             let template = r#"() => {
                 window.__switch_model_status = 'pending';
@@ -4481,6 +10706,44 @@ fn switch_model(
         return Err("Timed out waiting for model switch".to_string());
     }
 
+    let outcome = if provider == Provider::ChatGpt {
+        if status == "slider_ready" {
+            let state = read_chatgpt_slider_state(&config_path, &target_json)?;
+            if state.requires_bounded_ordinal() {
+                let target = ReasoningEffort::from_label(model.trim()).ok_or_else(|| {
+                    "Model switch failed: reasoning target has no bounded ordinal mapping"
+                        .to_string()
+                })?;
+                select_chatgpt_labeled_ordered_control(
+                    &mut LiveChatGptSliderPage {
+                        config_path: &config_path,
+                        target_json: &target_json,
+                    },
+                    target,
+                    state,
+                )?
+            } else {
+                select_chatgpt_accessible_label(&config_path, &target_json, state)?
+            }
+        } else if status == "success:legacy_menu_v1" {
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::LegacyMenuV1,
+                evidence: ModelSelectionEvidence::CheckedStateV1,
+                direct_semantic_count: None,
+                position_count: None,
+            }
+        } else {
+            return Err("Model switch failed: selector contract was not verified".to_string());
+        }
+    } else {
+        ModelSelectionOutcome {
+            contract: ModelSelectionContract::LegacyMenuV1,
+            evidence: ModelSelectionEvidence::CheckedStateV1,
+            direct_semantic_count: None,
+            position_count: None,
+        }
+    };
+
     if verbose {
         println!("Model switched successfully ({})", status);
     }
@@ -4488,7 +10751,7 @@ fn switch_model(
     // Give the UI a moment to settle after switching models
     thread::sleep(Duration::from_millis(500));
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
@@ -4521,6 +10784,53 @@ fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
 
     if status == "pending" {
         return Err("Timed out waiting for send button to activate and submit".to_string());
+    }
+
+    Ok(status)
+}
+
+fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, PromptSubmissionFailure> {
+    let mut status = String::from("pending");
+    let deadline = McpOperationDeadline::from_timeout(Duration::from_secs(100))
+        .map_err(PromptSubmissionFailure::unknown)?;
+
+    // The page verifier allows 90 seconds for ChatGPT to materialize a large
+    // prompt with attachments. Leave a small margin for the final status poll.
+    while status == "pending" && Instant::now() < deadline.expires_at {
+        thread::sleep(Duration::from_millis(500));
+        let check_res = call_mcp_tool_with_deadline(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({
+                "function": "() => window.__submit_status || 'pending'"
+            }),
+            Some(deadline),
+        )
+        .map_err(PromptSubmissionFailure::unknown)?;
+        if let Some(next_status) = parse_script_result(&check_res)
+            .ok()
+            .and_then(|parsed| parsed.as_str().map(str::to_string))
+        {
+            status = next_status;
+        }
+    }
+
+    if let Some(message) = status.strip_prefix("safe:") {
+        return Err(PromptSubmissionFailure::safe(message.trim()));
+    }
+    if let Some(message) = status.strip_prefix("unknown:") {
+        return Err(PromptSubmissionFailure::unknown(message.trim()));
+    }
+    if let Some(message) = status.strip_prefix("error:") {
+        // Legacy/unclassified page status is fail-closed because the click
+        // may already have happened.
+        return Err(PromptSubmissionFailure::unknown(message.trim()));
+    }
+
+    if status == "pending" {
+        return Err(PromptSubmissionFailure::unknown(
+            "Timed out waiting for ChatGPT to render the submitted prompt",
+        ));
     }
 
     Ok(status)
@@ -4593,7 +10903,7 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             };
-            const composer = document.querySelector('#prompt-textarea');
+            const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
             const composerRect = composer ? composer.getBoundingClientRect() : null;
             const isNearComposer = (el) => {
                 if (!composerRect) return true;
@@ -4641,7 +10951,7 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
 
 fn wait_for_chatgpt_agent_selection(config_path: &str) -> Result<(), String> {
     let js = r#"() => {
-            const composer = document.querySelector('#prompt-textarea');
+            const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
             if (!composer) {
                 return { ok: false, error: 'composer not found' };
             }
@@ -4684,6 +10994,7 @@ fn submit_regular_prompt(
     config_path: &str,
     provider: Provider,
     prompt: &str,
+    _verbose: bool,
 ) -> Result<String, String> {
     let prompt_json = serde_json::to_string(prompt)
         .map_err(|e| format!("Failed to serialize prompt text: {}", e))?;
@@ -4849,7 +11160,7 @@ fn submit_chatgpt_agent_prompt(
             (async () => {
                 try {
                     const sendSelectors = __SEND_SELECTORS__;
-                    const el = document.querySelector('#prompt-textarea');
+                    const el = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
                     if (!el) {
                         window.__submit_status = 'error: composer not found';
                         return;
@@ -4972,19 +11283,557 @@ fn submit_chatgpt_agent_prompt(
     wait_for_submit_status(config_path)
 }
 
+fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String> {
+    let prompt_json =
+        serde_json::to_string(prompt).map_err(|_| "Failed to serialize prompt text".to_string())?;
+    let user_selector_json = serde_json::to_string(Provider::ChatGpt.user_selector())
+        .map_err(|_| "Failed to serialize ChatGPT user message selector".to_string())?;
+    let send_selectors_json = Provider::ChatGpt.send_button_selectors_json();
+    let echo_verifier = include_str!("chatgpt_prompt_echo_verifier.js");
+
+    Ok(r#"() => {
+        const prompt = __PROMPT__;
+        const userSelector = __USER_SELECTOR__;
+        const sendSelectors = __SEND_SELECTORS__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const verifyPromptEcho = __PROMPT_ECHO_VERIFIER__;
+        const normalize = (value) => String(value || '')
+            .normalize('NFC')
+            .replace(/[\u200B-\u200D\uFEFF]/g, '')
+            .replace(/\s+/gu, ' ')
+            .trim();
+        const readText = (element) => typeof element.value === 'string'
+            ? element.value
+            : (element.innerText || element.textContent || '');
+        const isVisibleAndEnabled = (element) => {
+            if (!element || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const expectedText = normalize(prompt);
+        const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(isVisibleAndEnabled);
+        const initialUserCount = document.querySelectorAll(userSelector).length;
+
+        window.__submit_status = 'pending';
+        (async () => {
+            let submitClicked = false;
+            try {
+                if (!composer || !expectedText) {
+                    window.__submit_status = 'safe: ChatGPT composer or prompt was empty';
+                    return;
+                }
+                if (!normalize(readText(composer)).includes(expectedText)) {
+                    window.__submit_status = 'safe: prompt text was not present in the ChatGPT composer';
+                    return;
+                }
+
+                let button = null;
+                for (let attempt = 0; attempt < 150; attempt += 1) {
+                    button = sendSelectors
+                        .map((selector) => document.querySelector(selector))
+                        .find(isVisibleAndEnabled);
+                    if (button) break;
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                if (!button) {
+                    window.__submit_status = 'safe: ChatGPT send button did not become active';
+                    return;
+                }
+                button.click();
+                submitClicked = true;
+
+                for (let attempt = 0; attempt < 900; attempt += 1) {
+                    const messages = Array.from(document.querySelectorAll(userSelector));
+                    if (messages.length > initialUserCount + 1) {
+                        window.__submit_status = 'unknown: unexpected ChatGPT user message count after submit';
+                        return;
+                    }
+                    const latestMessage = messages[messages.length - 1];
+                    const latestText = normalize(latestMessage ? readText(latestMessage) : '');
+                    const echo = verifyPromptEcho(prompt, latestText);
+                    if (messages.length === initialUserCount + 1 && echo.verified) {
+                        window.__submit_status = 'success:' + JSON.stringify({
+                            clicked: true,
+                            user_message_verified: true,
+                            verification: 'semantic_projection_v2',
+                            anchor_matches: echo.anchor_matches,
+                            anchor_required: echo.anchor_required
+                        });
+                        return;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                window.__submit_status = 'unknown: ChatGPT did not render the submitted prompt in the conversation';
+            } catch (error) {
+                window.__submit_status = (submitClicked ? 'unknown: ' : 'safe: ') +
+                    'ChatGPT submission verification failed';
+            }
+        })();
+        return true;
+    }"#
+    .replace("__PROMPT__", &prompt_json)
+    .replace("__PROMPT_ECHO_VERIFIER__", echo_verifier.trim())
+    .replace("__USER_SELECTOR__", &user_selector_json)
+    .replace("__SEND_SELECTORS__", send_selectors_json)
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        Provider::ChatGpt.composer_selectors_json(),
+    ))
+}
+
+fn insert_chatgpt_prompt_text(
+    config_path: &str,
+    prompt: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    let token = Uuid::new_v4().to_string();
+    let token_json = serde_json::to_string(&token)
+        .map_err(|_| "Failed to serialize prompt token".to_string())?;
+    let marker_js = format!(
+        "() => {{ window.__ask_bridge_prompt_input_token = {}; return true; }}",
+        token_json
+    );
+    let marked = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": marker_js }),
+    )?;
+    if !parse_script_result(&marked)?.as_bool().unwrap_or(false) {
+        return Err("Failed to mark the owned ChatGPT page for prompt input".to_string());
+    }
+
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(include_str!("chatgpt_prompt_input.js"))
+        .arg(&token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "ChatGPT native prompt input helper unavailable".to_string())?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ChatGPT prompt input pipe unavailable".to_string())?
+        .write_all(prompt.as_bytes());
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("ChatGPT prompt input could not be sent: {}", error));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "ChatGPT native prompt input did not finish".to_string())?;
+    if !output.status.success() || output.stdout.as_slice() != b"prompt-inserted\n" {
+        if verbose {
+            let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !diagnostic.is_empty() {
+                eprintln!("ChatGPT prompt input diagnostic: {}", diagnostic);
+            }
+        }
+        return Err("ChatGPT native prompt input failed".to_string());
+    }
+    Ok(())
+}
+
+fn submit_chatgpt_regular_prompt(
+    config_path: &str,
+    prompt: &str,
+    verbose: bool,
+) -> Result<String, PromptSubmissionFailure> {
+    insert_chatgpt_prompt_text(config_path, prompt, verbose)
+        .map_err(PromptSubmissionFailure::safe)?;
+    let submit_js =
+        build_chatgpt_prompt_submission_script(prompt).map_err(PromptSubmissionFailure::safe)?;
+    let started = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": submit_js }),
+    )
+    .map_err(PromptSubmissionFailure::unknown)?;
+    if !parse_script_result(&started)
+        .map_err(PromptSubmissionFailure::unknown)?
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(PromptSubmissionFailure::unknown(
+            "Failed to start verified ChatGPT prompt submission",
+        ));
+    }
+
+    wait_for_chatgpt_submit_status(config_path)
+}
+
 fn submit_prompt_to_provider(
     config_path: &str,
     provider: Provider,
     prompt: &str,
     verbose: bool,
-) -> Result<String, String> {
+) -> Result<String, PromptSubmissionFailure> {
     if provider == Provider::ChatGpt
         && let Some(parts) = parse_chatgpt_agent_prompt(prompt)
     {
-        return submit_chatgpt_agent_prompt(config_path, &parts, verbose);
+        // Agent-mention mode predates the click-aware verifier.  Until it is
+        // migrated to the same page-side contract, any failure after durable
+        // intent stays conservatively unknown.
+        return submit_chatgpt_agent_prompt(config_path, &parts, verbose)
+            .map_err(PromptSubmissionFailure::unknown);
+    }
+    if provider == Provider::ChatGpt {
+        return submit_chatgpt_regular_prompt(config_path, prompt, verbose);
     }
 
-    submit_regular_prompt(config_path, provider, prompt)
+    submit_regular_prompt(config_path, provider, prompt, verbose)
+        .map_err(PromptSubmissionFailure::unknown)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResponseBaseline {
+    initial_user_count: usize,
+    initial_assistant_count: usize,
+    ownership_token: String,
+}
+
+fn establish_response_baseline(
+    config_path: &str,
+    provider: Provider,
+) -> Result<ResponseBaseline, String> {
+    let ownership_token = Uuid::new_v4().to_string();
+    let token_json = serde_json::to_string(&ownership_token)
+        .map_err(|_| "Failed to serialize response ownership token".to_string())?;
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|_| "Failed to serialize assistant selector".to_string())?;
+    let user_selector = serde_json::to_string(provider.user_selector())
+        .map_err(|_| "Failed to serialize user selector".to_string())?;
+    let home_url_json = serde_json::to_string(provider.home_url())
+        .map_err(|_| "Failed to serialize provider URL".to_string())?;
+    let script = r#"() => {
+            const stopSelectors = __STOP_SELECTORS__;
+            const isVisibleControl = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            window.__ask_bridge_response_owner_v1 = __TOKEN__;
+            return {
+                ownership_token_set: window.__ask_bridge_response_owner_v1 === __TOKEN__,
+                provider_url_owned: window.location.origin === new URL(__PROVIDER_HOME_URL__).origin,
+                generation_control_visible: Boolean(stopSelectors
+                    .map((selector) => document.querySelector(selector))
+                    .find(isVisibleControl)),
+                user_count: document.querySelectorAll(__USER_SELECTOR__).length,
+                assistant_count: document.querySelectorAll(__ASSISTANT_SELECTOR__).length
+            };
+        }"#
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
+    .replace("__TOKEN__", &token_json)
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__PROVIDER_HOME_URL__", &home_url_json);
+    let result = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({"function": script}),
+    )?;
+    let value = parse_script_result(&result)?;
+    if !value["ownership_token_set"].as_bool().unwrap_or(false) {
+        return Err("Failed to establish response page ownership".to_string());
+    }
+    if !value["provider_url_owned"].as_bool().unwrap_or(false) {
+        return Err("Provider page changed before prompt submission".to_string());
+    }
+    if value["generation_control_visible"]
+        .as_bool()
+        .unwrap_or(true)
+    {
+        return Err("Provider was already generating before prompt submission".to_string());
+    }
+    let initial_user_count = value["user_count"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "Response baseline returned an invalid user count".to_string())?;
+    let initial_assistant_count = value["assistant_count"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| "Response baseline returned an invalid assistant count".to_string())?;
+    Ok(ResponseBaseline {
+        initial_user_count,
+        initial_assistant_count,
+        ownership_token,
+    })
+}
+
+fn build_response_probe_script(
+    provider: Provider,
+    baseline: &ResponseBaseline,
+) -> Result<String, String> {
+    let token_json = serde_json::to_string(&baseline.ownership_token)
+        .map_err(|_| "Failed to serialize response ownership token".to_string())?;
+    let home_url_json = serde_json::to_string(provider.home_url())
+        .map_err(|_| "Failed to serialize provider URL".to_string())?;
+    let assistant_selector = serde_json::to_string(provider.assistant_selector())
+        .map_err(|_| "Failed to serialize assistant selector".to_string())?;
+    let user_selector = serde_json::to_string(provider.user_selector())
+        .map_err(|_| "Failed to serialize user selector".to_string())?;
+    Ok(r#"() => {
+            const stopSelectors = __STOP_SELECTORS__;
+            const assistantSelector = __ASSISTANT_SELECTOR__;
+            const userSelector = __USER_SELECTOR__;
+            const minimumImageDimension = __MINIMUM_IMAGE_DIMENSION__;
+            const isVisibleControl = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const isLargeLoadedImage = (img) => {
+                const src = img.currentSrc || img.src || '';
+                if (!img.complete || img.naturalWidth < minimumImageDimension || img.naturalHeight < minimumImageDimension) return false;
+                if (src.includes('avatar') || src.includes('profile')) return false;
+                return src.startsWith('http') || src.startsWith('blob:') || src.startsWith('data:image/');
+            };
+            const domSignature = (element) => {
+                if (!element) return '';
+                const source = element.innerHTML || '';
+                let hash = 2166136261;
+                for (let index = 0; index < source.length; index += 1) {
+                    hash ^= source.charCodeAt(index);
+                    hash = Math.imul(hash, 16777619);
+                }
+                return `${source.length}:${(hash >>> 0).toString(16)}`;
+            };
+            const conversationId = (() => {
+                const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
+                return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
+            })();
+            const messages = Array.from(document.querySelectorAll(assistantSelector));
+            const userMessages = Array.from(document.querySelectorAll(userSelector));
+            const latest = messages[messages.length - 1] || null;
+            const turn = latest
+                ? (latest.closest('section[data-turn="assistant"][data-turn-id]') ||
+                    latest.closest('[data-turn="assistant"][data-turn-id]') ||
+                    latest.closest('[data-turn-key]') || latest)
+                : null;
+            const turnId = turn?.getAttribute('data-turn-id') ||
+                turn?.getAttribute('data-turn-key') ||
+                latest?.getAttribute('data-chatgpt-selection-message-id') || '';
+            const artifactIds = turn
+                ? Array.from(turn.querySelectorAll('[id^="image-"]'))
+                    .map((element) => element.id)
+                    .filter(Boolean)
+                    .filter((id, index, all) => all.indexOf(id) === index)
+                    .sort()
+                : [];
+            const loadedImages = latest
+                ? Array.from(latest.querySelectorAll('img')).filter(isLargeLoadedImage)
+                : [];
+            const generationControl = stopSelectors
+                .map((selector) => document.querySelector(selector))
+                .find(isVisibleControl);
+            const latestText = latest ? (latest.textContent || '') : '';
+            const providerFailureVisible = Boolean(latest && /(?:content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i.test(latestText));
+            let providerUrlOwned = false;
+            try {
+                providerUrlOwned = window.location.origin === new URL(__PROVIDER_HOME_URL__).origin;
+            } catch (_) {
+                providerUrlOwned = false;
+            }
+            return {
+                ownership_token_matches: window.__ask_bridge_response_owner_v1 === __TOKEN__,
+                provider_url_owned: providerUrlOwned,
+                url: window.location.href,
+                conversation_id: conversationId,
+                turn_id: turnId,
+                artifact_ids: artifactIds,
+                user_count: userMessages.length,
+                assistant_count: messages.length,
+                generation_control_visible: Boolean(generationControl),
+                content_present: Boolean(latest && (((latest.textContent || '').trim().length > 0) || loadedImages.length > 0)),
+                content_text_length: latest ? (latest.textContent || '').trim().length : 0,
+                provider_failure_visible: providerFailureVisible,
+                loaded_large_image_count: loadedImages.length,
+                dom_signature: domSignature(latest)
+            };
+        }"#
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace(
+        "__MINIMUM_IMAGE_DIMENSION__",
+        &GENERATED_IMAGE_MIN_DIMENSION.to_string(),
+    )
+    .replace("__PROVIDER_HOME_URL__", &home_url_json)
+    .replace("__TOKEN__", &token_json))
+}
+
+fn execute_verified_prompt_submission<Baseline, Upload, BeforeSubmit, Submit>(
+    receipt_path: Option<&Path>,
+    upload_and_verify: Upload,
+    before_submit: BeforeSubmit,
+    submit: Submit,
+) -> Result<(Baseline, String), String>
+where
+    Upload: FnOnce() -> Result<(), String>,
+    BeforeSubmit: FnOnce() -> Result<Baseline, String>,
+    Submit: FnOnce() -> Result<String, PromptSubmissionFailure>,
+{
+    if upload_and_verify().is_err() {
+        if let Some(path) = receipt_path {
+            record_session_receipt_event(path, SessionReceiptEvent::AttachmentsFailed)
+                .map_err(|_| "附件驗證失敗，且無法安全保存 receipt".to_string())?;
+        }
+        return Err(ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string());
+    }
+    if let Some(path) = receipt_path {
+        record_session_receipt_event(path, SessionReceiptEvent::AttachmentsVerified)
+            .map_err(|_| "附件已驗證，但無法安全保存 receipt；prompt 未送出".to_string())?;
+    }
+
+    let baseline = before_submit()?;
+    if let Some(path) = receipt_path {
+        record_session_receipt_event(path, SessionReceiptEvent::PromptIntentRecorded)
+            .map_err(|_| "無法保存 prompt submit intent；prompt 未送出".to_string())?;
+    }
+    let status = match submit() {
+        Ok(status) => status,
+        Err(error) => {
+            if let Some(path) = receipt_path {
+                record_prompt_submission_failure(path, error.disposition).map_err(|_| {
+                    "prompt submission 失敗，且無法安全保存 failure receipt；遠端狀態未知"
+                        .to_string()
+                })?;
+            }
+            return Err(error.message);
+        }
+    };
+    if let Some(path) = receipt_path {
+        record_session_receipt_event(path, SessionReceiptEvent::PromptSubmitted).map_err(|_| {
+            "prompt 已可能送出，但無法保存 submitted receipt；遠端狀態未知".to_string()
+        })?;
+    }
+    Ok((baseline, status))
+}
+
+fn list_pages(config_path: &str) -> Result<Vec<Page>, String> {
+    let list_res = call_mcp_tool(config_path, "list_pages", serde_json::json!({}))?;
+    let text = list_res
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|array| array.first())
+        .and_then(|object| object.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Invalid list_pages response structure: {:?}", list_res))?;
+    Ok(parse_pages(text))
+}
+
+/// Build the `new_page` args for the safe isolated new-tab path.
+///
+/// Headless mode opens the tab in the background so Chrome does not steal
+/// macOS foreground focus; visible mode opens it in the foreground.
+fn isolated_new_page_args(url: &str, headless: bool) -> Value {
+    serde_json::json!({
+        "url": url,
+        "background": headless
+    })
+}
+
+fn ensure_isolated_provider_tab(
+    config_path: &str,
+    provider: Provider,
+    session_id: &str,
+    attachment_summary: &AttachmentSummary,
+    expected_output_type: ExpectedOutputType,
+    headless: bool,
+    verbose: bool,
+) -> Result<PathBuf, String> {
+    let session_id = validate_session_id(session_id)?;
+    clear_owned_page();
+    let existing_pages = list_pages(config_path)?;
+    let existing_ids: std::collections::HashSet<usize> =
+        existing_pages.iter().map(|page| page.id).collect();
+
+    if verbose {
+        println!(
+            "Opening an isolated {} tab; preserving {} existing tab(s)...",
+            provider.display_name(),
+            existing_pages.len()
+        );
+    }
+    // Use the raw call while the new page is not owned yet. Once the new page
+    // id is established, call_mcp_tool enforces the exact binding.
+    call_mcp_tool_raw(
+        config_path,
+        "new_page",
+        isolated_new_page_args(&provider.home_url(), headless),
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut candidate_id: Option<usize> = None;
+    while Instant::now() < deadline {
+        let pages = list_pages(config_path)?;
+        if candidate_id.is_none() {
+            let new_ids: Vec<usize> = pages
+                .iter()
+                .filter(|page| !existing_ids.contains(&page.id))
+                .map(|page| page.id)
+                .collect();
+            if new_ids.len() > 1 {
+                return Err(
+                    "isolated_new_tab_v1 找到多個未預期的新 page ID；停止以避免誤選分頁"
+                        .to_string(),
+                );
+            }
+            candidate_id = new_ids.first().copied();
+        }
+
+        let Some(page_id) = candidate_id else {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        };
+        let Some(page) = pages.iter().find(|page| page.id == page_id) else {
+            return Err("owned page 在分頁清單中消失；停止，不重用其他分頁".to_string());
+        };
+        if !provider.owns_url(&page.url) {
+            thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+
+        call_mcp_tool_raw(
+            config_path,
+            "select_page",
+            serde_json::json!({
+                "pageId": page_id,
+                "bringToFront": !headless
+            }),
+        )?;
+        bind_owned_page(&session_id, page_id)?;
+        let receipt_path = write_session_receipt(
+            &session_id,
+            attachment_summary.count(),
+            attachment_summary.total_bytes,
+            expected_output_type,
+        )
+        .inspect_err(|_| clear_owned_page())?;
+        if verbose {
+            println!(
+                "Owned {} page ID {} for session {}.",
+                provider.display_name(),
+                page_id,
+                session_id
+            );
+        }
+        return Ok(receipt_path);
+    }
+
+    Err(format!(
+        "Timeout waiting for an exact new {} page; no existing tab was reused",
+        provider.display_name()
+    ))
 }
 
 fn ensure_provider_tab(
@@ -5277,6 +12126,35 @@ fn check_login_status(
     Ok(signals.state(provider))
 }
 
+fn wait_for_chatgpt_composer(config_path: &str) -> Result<(), String> {
+    let script = format!(
+        "() => {{ const selectors = {}; const visible = (el) => {{ if (!el) return false; const rect = el.getBoundingClientRect(); const style = getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'; }}; return selectors.some((selector) => visible(document.querySelector(selector))); }}",
+        Provider::ChatGpt.composer_selectors_json()
+    );
+    let mut consecutive_ready = 0;
+    for _ in 0..60 {
+        let ready = call_mcp_tool(
+            config_path,
+            "evaluate_script",
+            serde_json::json!({ "function": script }),
+        )
+        .ok()
+        .and_then(|response| parse_script_result(&response).ok())
+        .and_then(|value| value.as_bool())
+            == Some(true);
+        if ready {
+            consecutive_ready += 1;
+            if consecutive_ready >= 6 {
+                return Ok(());
+            }
+        } else {
+            consecutive_ready = 0;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err("ChatGPT composer did not become ready".to_string())
+}
+
 fn wait_for_login_completion(
     config_path: &str,
     provider: Provider,
@@ -5456,6 +12334,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(Commands::Capabilities { json }) = &cli.command {
+        print_capabilities(*json).map_err(|error| format!("Capabilities failed: {}", error))?;
+        return Ok(());
+    }
+
     let provider = match resolve_provider(cli.provider) {
         Ok(provider) => provider,
         Err(e) => {
@@ -5464,10 +12347,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let safe_session_id = if cli.new_tab_preserve_existing {
+        Some(
+            cli.session_id
+                .as_deref()
+                .ok_or_else(|| "--new-tab-preserve-existing 必須搭配 --session-id".to_string())
+                .and_then(validate_session_id)?,
+        )
+    } else {
+        None
+    };
+    if safe_session_id.is_some() && cli.command.is_some() {
+        return Err(
+            "--new-tab-preserve-existing 只支援直接送出 prompt；subcommand 不會啟用安全分頁模式"
+                .into(),
+        );
+    }
+    // Keep the lease alive for the entire invocation, including attachment
+    // upload and response polling. Unlocking earlier would let another
+    // process steal the selected page between two MCP calls.
+    let _provider_lease = if let Some(session_id) = safe_session_id.as_deref() {
+        Some(acquire_provider_lease(provider, session_id)?)
+    } else {
+        None
+    };
+
     if let Err(e) = validate_provider_feature_support(provider, &cli) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
+    let attachment_summary = match summarize_attachments(&cli.images, &cli.files) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+        }
+    };
 
     if !command_verbose {
         // SAFETY: Called before spawning other threads and before loading MCP config.
@@ -5558,13 +12473,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Error rendering Markdown: {}", e);
                                 std::process::exit(1);
                             }
-                            if let Err(e) = download_images_from_latest_message(
+                            let image_result = download_images_from_latest_message(
                                 &config_path,
                                 page_provider,
                                 cli.image_output.as_deref(),
+                                None,
                                 command_verbose,
-                            ) {
-                                eprintln!("Error downloading images: {}", e);
+                            );
+                            match image_result {
+                                Ok(0) if cli.image_output.is_some() => {
+                                    eprintln!("Error downloading images: no generated image found");
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error downloading images: {}", e);
+                                    if cli.image_output.is_some() {
+                                        std::process::exit(1);
+                                    }
+                                }
+                                Ok(_) => {}
                             }
                         }
                         Err(e) => {
@@ -5626,13 +12553,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("Error rendering Markdown: {}", e);
                             std::process::exit(1);
                         }
-                        if let Err(e) = download_images_from_latest_message(
+                        let image_result = download_images_from_latest_message(
                             &config_path,
                             page_provider,
                             cli.image_output.as_deref(),
+                            None,
                             command_verbose,
-                        ) {
-                            eprintln!("Error downloading images: {}", e);
+                        );
+                        match image_result {
+                            Ok(0) if cli.image_output.is_some() => {
+                                eprintln!("Error downloading images: no generated image found");
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("Error downloading images: {}", e);
+                                if cli.image_output.is_some() {
+                                    std::process::exit(1);
+                                }
+                            }
+                            Ok(_) => {}
                         }
                     }
                     Err(e) => {
@@ -5681,9 +12620,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
+            Commands::SessionProbe { json } => {
+                let provider_name = match provider {
+                    Provider::ChatGpt => "chatgpt",
+                    Provider::Gemini => "gemini",
+                    Provider::Claude => "claude",
+                };
+                let (authenticated, state) =
+                    match ensure_provider_tab(&config_path, provider, false, is_headless, false) {
+                        Ok(()) => match check_login_status(&config_path, provider, false) {
+                            Ok(LoginState::LoggedIn) => (true, "logged_in"),
+                            Ok(LoginState::LoggedOut) => (false, "logged_out"),
+                            Ok(LoginState::Unknown) => (false, "unknown"),
+                            Err(_) => (false, "unknown"),
+                        },
+                        Err(_) => (false, "unknown"),
+                    };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "authenticated": authenticated,
+                            "state": state,
+                            "provider": provider_name,
+                        })
+                    );
+                } else if authenticated {
+                    println!("{} session probe: authenticated", provider.display_name());
+                } else {
+                    println!(
+                        "{} session probe: authentication not confirmed",
+                        provider.display_name()
+                    );
+                }
+                if !authenticated {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             Commands::Close => unreachable!("close command is handled before Chrome startup"),
             Commands::Config => unreachable!("config command is handled before Chrome startup"),
             Commands::Update => unreachable!("update command is handled before Chrome startup"),
+            Commands::Capabilities { .. } => {
+                unreachable!("capabilities is handled before Chrome startup")
+            }
             Commands::Dump => {
                 let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
                 println!("All pages: {:?}", list_res);
@@ -5797,16 +12777,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
 
-    if let Err(e) = ensure_provider_tab(
-        &config_path,
-        provider,
-        cli.new,
-        is_headless,
-        command_verbose,
-    ) {
-        eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
-        std::process::exit(1);
-    }
+    let expected_output_type = if cli.image_output.is_some() {
+        ExpectedOutputType::Image
+    } else {
+        ExpectedOutputType::Text
+    };
+
+    let receipt_path = if let Some(session_id) = safe_session_id.as_deref() {
+        match ensure_isolated_provider_tab(
+            &config_path,
+            provider,
+            session_id,
+            &attachment_summary,
+            expected_output_type,
+            is_headless,
+            command_verbose,
+        ) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        if let Err(error) = ensure_provider_tab(
+            &config_path,
+            provider,
+            cli.new,
+            is_headless,
+            command_verbose,
+        ) {
+            eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);
+            std::process::exit(1);
+        }
+        None
+    };
 
     // Show attached images in the terminal before sending
     if !cli.images.is_empty() {
@@ -5844,48 +12849,140 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => {}
     }
 
-    // Switch model if requested (before uploading attachments / typing the prompt)
-    if let Some(m) = &cli.model
-        && let Err(e) = switch_model(&config_path, provider, m, command_verbose)
+    if provider == Provider::ChatGpt {
+        wait_for_chatgpt_composer(&config_path)?;
+    }
+
+    // Switch model if requested (before uploading attachments / typing the prompt).
+    // Each --model value is applied in order, so e.g. `--model "GPT-5.5" --model "中等"`
+    // first selects the model, then the reasoning level.
+    let mut model_selection_outcome = None;
+    for m in &cli.model {
+        match switch_model(&config_path, provider, m, command_verbose) {
+            Ok(outcome) if provider == Provider::ChatGpt => {
+                model_selection_outcome = Some(outcome);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if provider == Provider::ChatGpt {
+                    if let Some(path) = receipt_path.as_deref()
+                        && let Err(receipt_error) = record_model_selection_failed(path)
+                    {
+                        eprintln!(
+                            "Error switching model '{}': {} (receipt failed: {})",
+                            m, MODEL_SELECTION_FAILURE_CODE, receipt_error
+                        );
+                        std::process::exit(1);
+                    }
+                    if let Ok(cleanup_json) = serde_json::to_string(m.trim()) {
+                        best_effort_close_reasoning_menu(&config_path, &cleanup_json);
+                    }
+                    eprintln!(
+                        "Error switching model '{}': {}: {}",
+                        m, MODEL_SELECTION_FAILURE_CODE, error
+                    );
+                } else {
+                    eprintln!("Error switching model '{}': {}", m, error);
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(outcome) = model_selection_outcome
+        && let Some(path) = receipt_path.as_deref()
+        && let Err(error) = record_model_selection_verified(path, outcome)
     {
-        eprintln!("Error switching model: {}", e);
+        eprintln!(
+            "Error recording {}: {}",
+            VERIFIED_MODEL_SELECTION_CAPABILITY, error
+        );
         std::process::exit(1);
     }
 
-    // Upload any attached images/files before counting messages (so the UI is ready)
-    if (!cli.images.is_empty() || !cli.files.is_empty())
-        && let Err(e) = upload_attachments_to_provider(
+    // --verify-attachments-only: upload and verify attachments, then exit
+    // without typing or submitting a prompt.  Receipt prompt_submission stays
+    // not_started.
+    if cli.verify_attachments_only {
+        match upload_attachments_to_provider(
             &config_path,
             provider,
             &cli.images,
             &cli.files,
+            &attachment_summary,
             command_verbose,
-        )
-    {
-        eprintln!("Error attaching images/files: {}", e);
-        std::process::exit(1);
+        ) {
+            Ok(summary) => {
+                if let Some(ref probe) = summary {
+                    if let Some(path) = receipt_path.as_deref() {
+                        // Drive the receipt state machine first so the
+                        // additive attachment_probe fields are preserved by
+                        // the subsequent write_attachment_probe_receipt call.
+                        let _ = record_session_receipt_event(
+                            path,
+                            SessionReceiptEvent::AttachmentsVerified,
+                        );
+                        let _ = write_attachment_probe_receipt(path, probe);
+                    }
+                    println!(
+                        "Attachments verified: {} document(s), {} image(s).",
+                        probe.expected_documents, probe.expected_images
+                    );
+                } else {
+                    // Documents-only path: still record the verified event.
+                    if let Some(path) = receipt_path.as_deref() {
+                        let _ = record_session_receipt_event(
+                            path,
+                            SessionReceiptEvent::AttachmentsVerified,
+                        );
+                    }
+                    println!("Attachments verified (documents only).");
+                }
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("Attachment verification failed: {}", error);
+                std::process::exit(1);
+            }
+        }
     }
 
-    // Get initial number of assistant messages before submitting the prompt
-    let assistant_selector = serde_json::to_string(provider.assistant_selector())
-        .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
-    let count_res = call_mcp_tool(
-        &config_path,
-        "evaluate_script",
-        serde_json::json!({
-            "function": format!("() => document.querySelectorAll({}).length", assistant_selector)
-        }),
-    )?;
-    let initial_assistant_count = parse_script_result(&count_res)
-        .ok()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
-
-    if command_verbose {
-        println!("Setting prompt text and submitting...");
-    }
-    let status = submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
-        .map_err(|e| format!("Text entry or submission failed: {}", e))?;
+    let submission_result = execute_verified_prompt_submission(
+        receipt_path.as_deref(),
+        || {
+            let probe_summary = upload_attachments_to_provider(
+                &config_path,
+                provider,
+                &cli.images,
+                &cli.files,
+                &attachment_summary,
+                command_verbose,
+            )?;
+            // Persist the additive attachment_probe receipt fields for typed
+            // mixed attachment diagnostics.  The receipt's
+            // attachment_verification/prompt_submission state machine is
+            // still driven by record_session_receipt_event below.
+            if let Some(probe) = probe_summary
+                && let Some(path) = receipt_path.as_deref()
+            {
+                let _ = write_attachment_probe_receipt(path, &probe);
+            }
+            Ok(())
+        },
+        || establish_response_baseline(&config_path, provider),
+        || {
+            if command_verbose {
+                println!("Setting prompt text and submitting...");
+            }
+            submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
+                .map_err(|error| error.with_context("Text entry or submission failed"))
+        },
+    );
+    let (response_baseline, status) = match submission_result {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(format!("Verified prompt submission failed: {}", error).into());
+        }
+    };
 
     if command_verbose {
         println!("Prompt submitted successfully: {}", status);
@@ -5896,16 +12993,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut last_markdown = String::new();
-    let mut finished = false;
-    let mut wait_cycles = 0;
-    let mut stable_done_checks = 0;
     let spinner_frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut spinner_idx = 0;
-
-    let max_wait_cycles: usize =
-        usize::try_from(cli.timeout.saturating_mul(10)).unwrap_or(usize::MAX);
-    while !finished && wait_cycles < max_wait_cycles {
-        // Max wait time: timeout seconds (timeout * 10 * 100ms)
+    let response_deadline = McpOperationDeadline::from_timeout(Duration::from_secs(cli.timeout))?;
+    let response_probe_script = build_response_probe_script(provider, &response_baseline)?;
+    let mut response_tracker = ResponseCompletionTracker::new(
+        expected_output_type,
+        response_baseline.initial_user_count,
+        response_baseline.initial_assistant_count,
+    );
+    let response_decision = loop {
         if is_terminal {
             let frame = spinner_frames[spinner_idx % spinner_frames.len()];
             print!(
@@ -5917,124 +13014,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             spinner_idx += 1;
         }
 
-        if wait_cycles % 5 == 0 {
-            let stop_selectors = provider.stop_button_selectors_json();
-            let assistant_selector = serde_json::to_string(provider.assistant_selector())
-                .map_err(|e| format!("Failed to serialize assistant selector: {}", e))?;
-            let response_check_js = r#"() => {
-                    const stopSelectors = __STOP_SELECTORS__;
-                    const isVisible = (el) => {
-                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
-                    const stopButton = stopSelectors.map((selector) => document.querySelector(selector)).find(isVisible);
-                    const messages = document.querySelectorAll(__ASSISTANT_SELECTOR__);
-                    const isNew = messages.length > __INITIAL_COUNT__;
-                    
-                    if (isVisible(stopButton)) {
-                        return { status: "generating", isNew: isNew };
-                    }
-                    
-                    if (isNew) {
-                        return { status: "done", isNew: isNew };
-                    }
-                    
-                    return { status: "waiting", isNew: isNew };
-                }"#
-            .replace("__STOP_SELECTORS__", stop_selectors)
-            .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
-            .replace("__INITIAL_COUNT__", &initial_assistant_count.to_string());
-            let check_res = match call_mcp_tool(
-                &config_path,
-                "evaluate_script",
-                serde_json::json!({
-                    "function": response_check_js
-                }),
-            ) {
-                Ok(res) => res,
-                Err(e) => {
-                    if command_verbose {
-                        eprintln!(
-                            "Warning: Failed to poll {} response: {}",
-                            provider.display_name(),
-                            e
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                    wait_cycles += 1;
-                    continue;
-                }
-            };
-
-            if let Ok(parsed) = parse_script_result(&check_res) {
-                let status = parsed["status"].as_str().unwrap_or("waiting");
-                let is_new = parsed["isNew"].as_bool().unwrap_or(false);
-
-                if status == "done" && is_new {
-                    stable_done_checks += 1;
-                    if stable_done_checks >= 3 {
-                        finished = true;
-                    }
-                } else {
-                    stable_done_checks = 0;
-                }
+        if Instant::now() >= response_deadline.expires_at {
+            break response_tracker.timeout();
+        }
+        let check_res = match call_mcp_tool_with_deadline(
+            &config_path,
+            "evaluate_script",
+            serde_json::json!({"function": response_probe_script.clone()}),
+            Some(response_deadline),
+        ) {
+            Ok(result) => result,
+            Err(_) if Instant::now() >= response_deadline.expires_at => {
+                break response_tracker.timeout();
             }
+            Err(_) => {
+                break response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed);
+            }
+        };
+        let probe = match parse_script_result(&check_res)
+            .ok()
+            .and_then(|value| serde_json::from_value::<ResponseDomProbe>(value).ok())
+        {
+            Some(probe) => probe,
+            None => {
+                break response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed);
+            }
+        };
+        match response_tracker.observe(probe) {
+            ResponseTrackerDecision::Pending => {}
+            terminal => break terminal,
         }
 
-        thread::sleep(Duration::from_millis(100));
-        wait_cycles += 1;
-    }
+        let remaining = response_deadline
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(RESPONSE_POLL_INTERVAL));
+    };
 
     if is_terminal {
         print!("\r\x1b[K");
         io::stdout().flush()?;
     }
 
-    if !finished {
-        eprintln!(
-            "\nWarning: Output stream did not complete within the timeout period ({} seconds).",
-            cli.timeout
-        );
+    let verified_response = match response_decision {
+        ResponseTrackerDecision::Completed(identity) => identity,
+        ResponseTrackerDecision::Unknown(code) => {
+            if let Some(path) = receipt_path.as_deref() {
+                record_session_response_outcome(path, ResponseCompletion::Unknown, 0, Some(code))
+                    .map_err(|_| "Response became unknown, but receipt audit failed")?;
+            }
+            return Err(format!("Provider response completion is unknown ({code})").into());
+        }
+        ResponseTrackerDecision::Pending => {
+            unreachable!("response wait must end in a terminal state")
+        }
+    };
+
+    let download_result = download_images_from_latest_message(
+        &config_path,
+        provider,
+        cli.image_output.as_deref(),
+        Some((&response_baseline, &verified_response)),
+        command_verbose,
+    );
+    let downloaded_image_count = if expected_output_type == ExpectedOutputType::Image {
+        match enforce_download_contract(expected_output_type, download_result) {
+            Ok(count) => count,
+            Err(code) => {
+                let completion = if code == ResponseFailureCode::ResponseIdentityChanged {
+                    ResponseCompletion::Unknown
+                } else {
+                    ResponseCompletion::Completed
+                };
+                if let Some(path) = receipt_path.as_deref() {
+                    record_session_response_outcome(path, completion, 0, Some(code))
+                        .map_err(|_| "Image download failed, and receipt audit also failed")?;
+                }
+                return Err(format!("Verified image response download failed ({code})").into());
+            }
+        }
+    } else {
+        match download_result {
+            Ok(count) => count,
+            Err(error) => {
+                if command_verbose {
+                    eprintln!("Warning: Optional image download failed: {}", error);
+                }
+                0
+            }
+        }
+    };
+    if let Some(path) = receipt_path.as_deref() {
+        record_session_response_outcome(
+            path,
+            ResponseCompletion::Completed,
+            downloaded_image_count,
+            None,
+        )
+        .map_err(|_| "Failed to persist final response receipt")?;
     }
 
-    if finished {
-        if command_verbose {
-            println!(
-                "Copying final response from {} toolbar...",
-                provider.display_name()
-            );
+    if command_verbose {
+        println!(
+            "Copying final response from {} toolbar...",
+            provider.display_name()
+        );
+    }
+    match copy_latest_markdown(&config_path, provider) {
+        Ok(content) => {
+            last_markdown = content;
         }
-        match copy_latest_markdown(&config_path, provider) {
-            Ok(content) => {
-                last_markdown = content;
-            }
-            Err(e) => {
-                eprintln!(
-                    "Error copying response from {} toolbar: {}",
-                    provider.display_name(),
-                    e
-                );
-            }
+        Err(e) => {
+            eprintln!(
+                "Error copying response from {} toolbar: {}",
+                provider.display_name(),
+                e
+            );
         }
     }
 
     if let Err(e) = render_markdown(&last_markdown, use_glow) {
         eprintln!("Error rendering Markdown: {}", e);
-    }
-
-    if finished {
-        let _ = download_images_from_latest_message(
-            &config_path,
-            provider,
-            cli.image_output.as_deref(),
-            command_verbose,
-        )
-        .map_err(|e| {
-            eprintln!("Error downloading images: {}", e);
-        });
     }
 
     // Print the URL link of the current conversation thread
@@ -6062,6 +13162,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Error writing output file: {}", e);
         } else if command_verbose {
             println!("Successfully wrote Markdown response to {}", output_path);
+        }
+    }
+
+    // WAVE-002: after a verified success, close the exact owned tab. This is a
+    // supporting, non-gating step: any failure is sanitised to a warning and
+    // never changes the success receipt, downloaded images, output files, or
+    // process exit success.
+    if let Some(path) = receipt_path.as_deref() {
+        if let Some(warning) = run_owned_tab_cleanup_warning(&config_path, Some(path)) {
+            eprintln!("{}", warning);
         }
     }
 

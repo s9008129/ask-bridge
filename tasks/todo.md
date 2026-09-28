@@ -356,3 +356,129 @@ pm test。
 - [x] Update release SOP and exact commands
 - [ ] Validate skill structure and Rust formatting
 - [ ] Summarize changes + verification story
+
+---
+
+# 2026-07-29 驗證附件上傳契約與 MCP 隱私修復（Checkpoint A）
+
+## 目標與驗收條件
+
+- [x] ChatGPT／Claude 文件先使用 native `upload_file`，只在 native chooser 不可用時使用 DataTransfer fallback。
+- [x] 附件送出前驗證預期檔名 multiset 與數量、無 uploading/error 狀態，並在 500ms 間隔下連續兩次穩定；60 秒逾時或錯誤時不得輸入或送出 prompt。
+- [x] `capabilities --json` 同時宣告 `isolated_new_tab_v1` 與 `verified_file_upload_v1`。
+- [x] schema-v2 session receipt 僅保存非敏感稽核欄位；真正 submit 前原子保存 `prompt_submission=intent_recorded`，成功 submit 後保存 `submitted`。
+- [x] config/session 目錄為 0700、檔案為 0600、拒絕 symlink，且 receipt 不含 prompt、內容、base64、完整路徑、檔名或帳號。
+- [x] 預設 MCP config 完全移除 `--logFile`，保留既有安全摘要診斷。
+- [x] 既有 raw MCP log 經 owner/type/symlink/open-handle 重驗後，chmod 0600 並移至唯一命名的 macOS Trash 路徑；若仍被開啟則不終止任何 process。
+- [x] failing-first tests 證明 native/fallback、穩定等待、fail-closed submit、receipt 狀態、capability、permissions 與 privacy canary。
+- [x] 通過 fmt、clippy、Rust/npm tests、check 與 release build；不執行真實 provider mutation。
+
+## Risk & Rollback
+
+- Risk level: high
+- Affected components: ChatGPT／Claude 附件 browser automation、所有 prompt submit 的 crash/retry 邊界、session receipt、MCP 啟動設定與本機 raw log。
+- Rollback strategy: 精準還原本次 ask-bridge source/test/task hunks，從 commit `100c6a4` 重建 release binary；app 端後續 capability gate 應 fail-closed，不得退回未驗證附件上傳。Trash 中的舊 raw log可移回原路徑復原。
+- Rollout plan: 先以純函式／mocked MCP tests 驗證，再跑完整離線 suite 與 release build；本 checkpoint 禁止真實 ChatGPT／Claude mutation。
+- Monitoring signals: 附件未穩定時 submit 呼叫數必須為 0；receipt 權限/shape 正確；新 MCP config 不含 `--logFile`；privacy canary 不出現在 config/receipt/diagnostics。
+
+## Dependencies & Environment
+
+- Rust/Cargo、Node.js/npm；不新增第三方 dependency。
+- Chrome provider UI 由 mocked MCP DOM probe 驗證，最長 production wait 60 秒、穩定間隔 500ms。
+- Provider denylist：本專案內 ask-bridge MUST NOT use Claude；禁止 Claude CLI/session/login/query/upload/mutation/live probe，只允許 pure function/mock/fixture 離線測試既有相容 API。
+- 現有安裝命令與 release binary canonical path 必須在安裝前比對。
+- `yt_down_txt` 既有 dirty worktree 與事故 artifacts 只讀，不修改、不 stage、不 stash、不 reset。
+
+## Working Notes
+
+- ask-bridge baseline HEAD 為 `100c6a4`，工作樹在本 checkpoint 開始時乾淨。
+- `yt_down_txt` dirty files：`semantic_extraction.py`、`semantic_extraction_service.py`、`tests/test_semantic_extraction.py`、`workflow_orchestrator.py`；另有未追蹤事故 artifacts，全部保持不變。
+- 現有 lessons 要求 Rust 安全邊界變更後依序執行 fmt、clippy、test、release build，且不能以 provider 原始輸出做診斷。
+- 使用者新增最高優先級 provider denylist；本 checkpoint 的所有 provider automation 驗證固定為 mocked/offline，不做任何 Claude live 行為。
+
+## Checklist
+
+- [x] 完整閱讀兩 repo 適用指引、lessons、handoff 與 ask-bridge skill。
+- [x] 定位附件上傳、prompt submit、capability、receipt 與 MCP config authoritative paths。
+- [x] 新增 failing-first tests並保存 pre-fix failure。
+- [x] 實作最小附件完成契約與 schema-v2 receipt。
+- [x] 移除預設 MCP raw log並安全處理既有 raw log。
+- [x] 執行 targeted 與完整驗證、release build、installed path/capability 檢查。
+- [x] 補 Results、精準 diff與未證實項目，等待 root checkpoint review。
+- [x] 修正 root review 發現的 nested timeout，讓 reset/connect/select/probe 共用單一 absolute deadline。
+- [x] 補 deterministic budget、ChatGPT document policy 與四種 fail-closed gate regression。
+- [x] 重跑 review-fix 後完整 gate、release install 與精準增量 diff。
+
+## Results
+
+- Failing-first：`cargo test attachment_probe_requires_two_stable_complete_observations -- --exact` 在 production 修復前 exit 101，49 個 compile errors明確指出缺少 verified capability、AttachmentProbe/tracker、schema-v2 receipt與無-log config signature。
+- `src/main.rs`：新增 exact filename-multiset structured DOM probe、500ms × 2 stable gate、60s deadline；文件 native chooser → per-file DataTransfer fallback；附件未 verified前不執行 prompt submit closure。
+- `src/main.rs`：receipt 升級 schema v2，pending/verified/failed與 not_started/intent_recorded/submitted狀態以 0600 atomic JSON持久化；0700目錄與 symlink拒絕；receipt只含計數、bytes、capability與狀態。
+- `src/main.rs`：MCP config不再產生 `--logFile`，on-disk config也已精準移除舊參數並修為0600；state/sessions目錄修為0700。
+- 舊 raw log在 uid=501、regular、非 symlink、`lsof`無開啟者的第二次 preflight後，先 chmod 0600再移至 `/Users/hsiaojohnny/.Trash/ask-bridge-chrome-devtools-mcp-20260729-160438.log`；286,272,639 bytes，可復原，原路徑不存在。
+- 驗證全綠：`cargo fmt --all -- --check`；`cargo clippy --all-targets -- -D warnings`；`cargo test`（76 passed）；`cargo check`；`npm test`（4 passed）；`cargo build --release`；`git diff --check`。
+- `make install`後 `/Users/hsiaojohnny/.local/bin/ask-bridge`與`ask`均指向本 repo release binary；installed `capabilities --json`為 schema 2，宣告 `isolated_new_tab_v1,verified_file_upload_v1`。
+- 精準 diff：4 個 tracked files；`src/main.rs` production `+818/-264`、tests `+419/-23`，另有 README `+6/-2`、lessons `+21`、本 task audit notes `+72`；未新增 dependency。
+- 未做真實 provider mutation/live probe；依專案 denylist未執行任何 Claude CLI/session/login/query/upload/mutation/live probe。DOM selector仍只由 pure/mock/offline tests驗證，需由使用者在 root最終放行後手動做受控 E2E。
+
+### Root review fix
+
+- Review failing-first：新增 regression 後執行 `cargo test mcp_connect_and_tool_share_one_deterministic_deadline`，production修正前 exit 101，4 個 compile errors指出缺少 absolute deadline與 document policy symbols。
+- `McpOperationDeadline`現在以單一 absolute deadline把 session reset、connect、owned-page select與 probe tool限制為各 phase cap和剩餘 budget的較小值；deadline耗盡即 reset/fail-closed，不 replay remote call。
+- 新增 pure/offline tests：synthetic `Instant`證明 connect消耗後 tool只取得剩餘 budget；ChatGPT document policy固定為 native-first＋DataTransfer fallback；uploading/missing/error/timeout均保持 submit closure呼叫 0 次。
+- Review-fix增量為 production `+85/-8`、tests `+124/-0`、lessons `+11`、todo `+11`，合計 `+231/-8`；完整 diff為 `+1336/-289`。
+- Review-fix 後完整驗證全綠：Rust 79 passed、Node 4 passed，fmt、clippy `-D warnings`、check、release build與diff-check皆成功；`make install`後 installed capability仍為 schema 2與兩項安全能力。
+
+---
+
+# 2026-08-02 以圖片產物契約判定 provider 回應完成
+
+## 目標與驗收條件
+
+- [x] 圖片工作在本次唯一新增 assistant、無生成控制項、最新回應至少一張已載入大尺寸圖片且 DOM 簽章連續穩定前，絕不判定完成。
+- [x] assistant 數量異常、owned page／provider URL／頁內 ownership token 改變時 fail closed 為 `unknown`，不得下載其他回應圖片。
+- [x] `--image-output` 的 timeout、零圖片與任何下載錯誤皆回傳非零；prompt 已送出後 receipt 保持可判定為 ambiguous。
+- [x] schema-v2 receipt additive 保存預期輸出種類、response completion enum、下載圖片數與固定 failure code；不保存 prompt、回覆、URL、檔名或 DOM。
+- [x] `capabilities --json` 宣告 `verified_image_response_completion_v1`，並提供 machine-readable 契約欄位。
+- [x] failing-first 與完整離線測試、fmt、clippy、check、release build 全部通過；不執行任何真實 provider mutation，且依 denylist 不使用 Claude live path。
+
+## Risk & Rollback
+
+- Risk level: medium-high
+- Affected components: provider response polling、generated-image extraction、same-run receipt audit、App/bridge capability compatibility。
+- Rollback strategy: revert `src/main.rs`、README 與 task/lesson 增量，並從既有已驗證 commit 重建 binary；App 端缺少新 capability 時必須 fail closed。
+- Monitoring signals: 圖片未落地時 completion 不得變成 completed；任一圖片輸出失敗 CLI 必須 non-zero；receipt 不得出現 privacy canary。
+
+## Dependencies & Environment
+
+- Rust/Cargo 與既有 `chrome-devtools-mcp`；不新增 dependency。
+- 所有 provider DOM 行為只以 pure state-machine／fixture 測試，不呼叫 ChatGPT/Gemini/Claude live query 或 upload。
+- Provider denylist: MUST NOT use Claude CLI/session/login/query/upload/mutation/live probe。
+
+## Working Notes
+
+- 現行 completion 只以「assistant count 增加、Stop control 連續約 1.5 秒不可見」判定；圖片可能稍後才載入。
+- 現行 image scan 將零圖片視為成功，main 也吞掉 download error，會形成遠端已生成但本機空輸出。
+- exact owned page 已由 process-local binding 在每次 page-bound MCP call 前重選；本次再加入頁內隨機 token、provider URL 與 response identity 驗證。
+
+## Checklist
+
+- [x] Review `AGENTS.md`、`tasks/lessons.md` 與既有 checkpoint notes。
+- [x] Locate response polling、download、receipt、capability authoritative paths。
+- [x] 新增 failing-first state-machine／download contract／receipt privacy tests並保存失敗證據。
+- [x] 實作最小 response completion state machine 與 browser probe。
+- [x] 將 strict image download與 receipt terminal audit 接入 runtime。
+- [x] 執行 targeted、full verification 與 release build。
+- [x] correctness/security/privacy review並補 Results／lesson tripwire。
+
+## Results
+
+- Failing-first：`cargo test image_completion_waits_for_loaded_artifact_after_assistant_and_stop_disappear -- --exact` 在 production symbols 加入前 exit 101，53 個 compile errors明確指出缺少 output type、completion tracker、download contract與 receipt fields。
+- `src/main.rs`：新增 pure `ResponseCompletionTracker`，文字與圖片使用不同 artifact gate；圖片需唯一 assistant delta、無可見生成控制項、至少一張 `256×256` 已載入候選圖與 500ms 間隔連續 3 次相同 DOM hash。
+- `src/main.rs`：送出前建立隨機 page-local ownership token並確認當下沒有生成控制項；輪詢與下載前後驗證 exact user/assistant delta、provider origin、conversation URL、token 與 DOM signature，任何人工導航／額外訊息／response identity 改變都停止為 `unknown`。
+- `src/main.rs`：`--image-output` 對 zero image、browser extraction／base64／filesystem error、timeout 一律 non-zero；下載函式回傳實際成功張數，不再由 main 吞掉 error。
+- `src/main.rs`：receipt schema 維持 v2並 additive 加入 `expected_output_type`、`response_completion`、`downloaded_image_count`、`response_failure_code`；legacy v2缺欄位可讀，既有 `attachment_probe` 在後續狀態轉移中保持不丟失。
+- `src/main.rs`／`README.md`：capability list與 human output加入 `verified_image_response_completion_v1`，文件說明 strict image artifact契約；`tasks/lessons.md`加入產物完成判斷 tripwire。
+- 驗證全綠：`cargo fmt --all -- --check`；`cargo clippy --all-targets -- -D warnings`；`cargo test`（92 passed）；`cargo check`；`npm test`（4 passed）；`cargo build --release`；`git diff --check`。
+- installed `/Users/hsiaojohnny/.local/bin/ask-bridge`與`ask`仍指向本 repo release binary；installed `capabilities --json`已回報四項能力與 strict image contract。
+- 未執行任何真實 provider query/upload/mutation/live probe；依 denylist 未使用 Claude CLI/session/login/query/upload/mutation/live probe。DOM selector與時序仍只由 pure/offline regression證實，受控真機 E2E留給使用者明確操作。

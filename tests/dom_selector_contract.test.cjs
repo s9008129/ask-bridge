@@ -1,0 +1,860 @@
+const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const { existsSync, readFileSync } = require('node:fs');
+const { test } = require('node:test');
+const { join } = require('node:path');
+
+const repoRoot = join(__dirname, '..');
+const chromeCandidates = [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Canary',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+];
+const chrome = chromeCandidates.find((candidate) => existsSync(candidate));
+
+const renderFixture = (fixture) => {
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    ['--headless=new', '--disable-gpu', '--no-sandbox', '--dump-dom', url],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'headless fixture did not return a result');
+  return JSON.parse(encoded);
+};
+
+const resolveControlBundle = (markup, target) => {
+  const resolverSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_control_bundle_resolver.js'),
+    'utf8',
+  );
+  return renderFixture(`<!doctype html>
+    <main>
+      ${markup}
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const resolveReasoningControlBundle = ${resolverSource};
+      document.querySelector('#result').textContent = JSON.stringify(
+        resolveReasoningControlBundle(${JSON.stringify(target)}),
+      );
+    </script>`);
+};
+
+test('ChatGPT assistant selector counts current and legacy semantic turns once', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  assert.match(
+    source,
+    /\[data-chatgpt-search-unit-key\$=":assistant"\], \.agent-turn:not\(:has\(\[data-chatgpt-search-unit-key\$=":assistant"\]\)\)/,
+    'the provider boundary must prefer the current keyed assistant unit',
+  );
+  assert.match(
+    source,
+    /\[data-message-author-role=\\?"assistant\\?"\]:not\(\.agent-turn \*\)/,
+    'the provider boundary must retain the legacy role fallback',
+  );
+
+  const fixture = `<!doctype html>
+    <main id="fixture"></main>
+    <pre id="result"></pre>
+    <script>
+      const canonicalSelector = '[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)';
+      const cases = [
+        ['current-nested', '<div class="agent-turn"><section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">nested</div></section></div>'],
+        ['current-only', '<section data-chatgpt-search-unit-key="turn:assistant">current</section>'],
+        ['current-role-child', '<section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">child</div></section>'],
+        ['agent-only', '<div class="agent-turn">agent</div>'],
+        ['role-only', '<div data-message-author-role="assistant">role</div>'],
+        ['siblings', '<div class="agent-turn">one</div><div class="agent-turn">two</div>'],
+        ['legacy-mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
+      ];
+      const result = {};
+      for (const [name, html] of cases) {
+        const host = document.createElement('section');
+        host.innerHTML = html;
+        result[name] = host.querySelectorAll(canonicalSelector).length;
+      }
+      document.querySelector('#result').textContent = JSON.stringify(result);
+    </script>`;
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    ['--headless=new', '--disable-gpu', '--no-sandbox', '--dump-dom', url],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'headless DOM fixture did not return a result');
+  assert.deepEqual(JSON.parse(encoded), {
+    'current-nested': 1,
+    'current-only': 1,
+    'current-role-child': 1,
+    'agent-only': 1,
+    'role-only': 1,
+    siblings: 2,
+    'legacy-mixed': 2,
+  });
+});
+
+
+test('ChatGPT prompt echo verifier tolerates rendered Markdown but rejects wrong or truncated turns', () => {
+  const verifierSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_prompt_echo_verifier.js'),
+    'utf8',
+  );
+  const verifyPromptEcho = Function(`return (${verifierSource});`)();
+  const digest = 'a'.repeat(64);
+  const body = Array.from(
+    { length: 72 },
+    (_, index) =>
+      `## 區段 ${index}\n- **關鍵資料 ${index}**：請保留 \`欄位_${index}\` 與原始數字 ${1000 + index}。\n`,
+  ).join('');
+  const expected =
+    `workflow prompt begins\n${body}\nsource.sha256: ${digest}\nworkflow prompt ends`;
+
+  // ChatGPT conversation rendering removes Markdown punctuation and list
+  // markers. The semantic content, source digest and overall message remain
+  // the same even though the DOM text is shorter than the composer source.
+  const rendered = expected
+    .replace(/^## /gm, '')
+    .replace(/^- /gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/\`/g, '')
+    .replace(/：/g, ' ');
+  const accepted = verifyPromptEcho(expected, rendered);
+  assert.equal(accepted.verified, true);
+  assert.equal(accepted.digest_ok, true);
+  assert.ok(accepted.anchor_matches >= accepted.anchor_required);
+
+  const wrongDigest = verifyPromptEcho(
+    expected,
+    rendered.replace(digest, 'b'.repeat(64)),
+  );
+  assert.equal(wrongDigest.verified, false);
+  assert.equal(wrongDigest.digest_ok, false);
+
+  const project = (value) => String(value || '')
+    .normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase('en-US')
+    .replace(/[\p{P}\p{S}\s]/gu, '');
+  const semantic = project(expected);
+  const left = semantic.slice(0, Math.floor(semantic.length * 0.2));
+  const right = semantic.slice(Math.floor(semantic.length * 0.8));
+  const corruptedMiddle = left +
+    'x'.repeat(semantic.length - left.length - right.length) +
+    right;
+  const corrupted = verifyPromptEcho(expected, corruptedMiddle);
+  assert.equal(corrupted.verified, false);
+  assert.ok(corrupted.anchor_matches < corrupted.anchor_required);
+
+  const truncated = verifyPromptEcho(expected, rendered.slice(0, Math.floor(rendered.length * 0.6)));
+  assert.equal(truncated.verified, false);
+  assert.equal(truncated.length_ratio_ok, false);
+});
+
+test('ChatGPT reasoning slider is selectable before prompt submission', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const resolverSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_control_bundle_resolver.js'),
+    'utf8',
+  );
+  assert.match(source, /data-model-reasoning-effort-slider/);
+  assert.match(source, /press_provider_key\(&config_path, "ArrowLeft"\)/);
+  assert.match(source, /press_provider_key\(&config_path, "ArrowRight"\)/);
+  assert.match(source, /include_str!\("chatgpt_control_bundle_resolver\.js"\)/);
+  assert.match(source, /model radio selection was not verified/);
+  assert.match(resolverSource, /semantic_effort/);
+  assert.match(resolverSource, /ordinal_conflict/);
+
+  const fixture = `<!doctype html>
+    <main>
+      <button class="__composer-pill" type="button">GPT-5.6 Sol</button>
+      <div id="menu" role="menu" hidden>
+        <div role="menuitemradio" aria-checked="true">GPT-5.6 Sol</div>
+        <div role="menuitem" aria-expanded="false" aria-label="推理強度">
+          推理強度
+          <div
+            data-model-reasoning-effort-slider
+            aria-valuemin="0"
+            aria-valuemax="2"
+            aria-valuenow="0"
+            aria-describedby="reasoning-announcement"
+            tabindex="0"
+          ></div>
+          <div id="reasoning-announcement"></div>
+        </div>
+      </div>
+      <div id="global-live" role="status">高</div>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const resolveReasoningControlBundle = ${resolverSource};
+      const menu = document.querySelector('#menu');
+      const slider = document.querySelector('[data-model-reasoning-effort-slider]');
+      const labels = ['', '', ''];
+      document.querySelector('.__composer-pill').addEventListener('click', () => {
+        menu.hidden = false;
+      });
+      document.querySelector('.__composer-pill').click();
+      slider.addEventListener('keydown', (event) => {
+        const now = Number(slider.getAttribute('aria-valuenow'));
+        const delta = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+        const next = Math.max(0, Math.min(2, now + delta));
+        if (delta !== 0) {
+          slider.setAttribute('aria-valuenow', String(next));
+          document.querySelector('#reasoning-announcement').textContent = labels[next];
+        }
+      });
+      const readState = () => resolveReasoningControlBundle('即時');
+      const press = (key) => {
+        slider.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+      };
+      const efforts = ['instant', 'medium', 'high'];
+      const ranks = { instant: 0, medium: 1, high: 2 };
+      const calibrate = (initialAnnouncement) => {
+        slider.setAttribute('aria-valuenow', '0');
+        document.querySelector('#reasoning-announcement').textContent = initialAnnouncement;
+        slider.focus();
+        const observations = [readState()];
+        while (observations.at(-1).now < 2) {
+          const previous = observations.at(-1);
+          press('ArrowRight');
+          const next = readState();
+          if (next.now !== previous.now + 1) return { accepted: false, observations };
+          observations.push(next);
+        }
+        const direct = observations.filter((state) => state.semantic_effort !== null);
+        for (const state of direct) {
+          if (ranks[state.semantic_effort] !== state.now) {
+            return { accepted: false, observations, rankConflict: true };
+          }
+        }
+        const directCount = direct.length;
+        return { accepted: true, observations, directCount };
+      };
+      const calibration = calibrate('');
+      let targetIndex = null;
+      let selected = false;
+      let stable = null;
+      let reopened = null;
+      let directCount = null;
+      if (calibration.accepted) {
+        targetIndex = ranks['instant'];
+        directCount = calibration.directCount;
+        let state = readState();
+        while (state.now > targetIndex) {
+          const previous = state;
+          press('ArrowLeft');
+          state = readState();
+          if (state.now !== previous.now - 1) break;
+        }
+        stable = readState();
+        menu.hidden = true;
+        document.querySelector('.__composer-pill').click();
+        reopened = readState();
+        selected = stable.now === targetIndex && reopened.now === targetIndex &&
+          stable.ordinal_conflict === false && reopened.ordinal_conflict === false;
+      }
+      const contradictoryCalibration = calibrate('高，第 1 項，共 3 項');
+      slider.setAttribute('aria-valuenow', '0');
+      document.querySelector('#reasoning-announcement').textContent = '第 2 項，共 3 項';
+      const ordinalConflictState = readState();
+      const initialState = calibration.observations[0];
+      document.querySelector('#result').textContent = JSON.stringify({
+        selectedLabel: selected ? '即時' : null,
+        selectionEvidence: selected ? 'ordered_bounded_effort_v1' : null,
+        directSemanticCount: selected ? directCount : null,
+        targetIndex: selected ? targetIndex : null,
+        roleEvidence: initialState.role_evidence,
+        semanticMissingAtTarget: initialState.semantic_effort === null,
+        globalLiveIgnored: initialState.announcement_present === false,
+        contradictoryLabelRejected: contradictoryCalibration.accepted === false,
+        rankConflictRejected: contradictoryCalibration.rankConflict === true,
+        ordinalConflictRejected: ordinalConflictState.ordinal_conflict === true,
+        promptStarted: false,
+        sliderPresent: Boolean(document.querySelector('[data-model-reasoning-effort-slider]')),
+      });
+    </script>`;
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    ['--headless=new', '--disable-gpu', '--no-sandbox', '--dump-dom', url],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'headless reasoning-slider fixture did not return a result');
+  const result = JSON.parse(encoded);
+  assert.deepEqual(result, {
+    selectedLabel: '即時',
+    selectionEvidence: 'ordered_bounded_effort_v1',
+    directSemanticCount: 0,
+    targetIndex: 0,
+    roleEvidence: 'missing',
+    semanticMissingAtTarget: true,
+    globalLiveIgnored: true,
+    contradictoryLabelRejected: true,
+    rankConflictRejected: true,
+    ordinalConflictRejected: true,
+    promptStarted: false,
+    sliderPresent: true,
+  });
+});
+
+test('ChatGPT reasoning control bundle resolves a roleless marker with a nested native range', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const resolverSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_control_bundle_resolver.js'),
+    'utf8',
+  );
+  assert.match(source, /state_owner_relation/);
+  assert.match(source, /focus_owner_relation/);
+  assert.match(source, /role_evidence/);
+
+  const fixture = `<!doctype html>
+    <main>
+      <div role="group" aria-label="推理強度">
+        <div
+          data-model-reasoning-effort-slider
+          aria-describedby="reasoning-announcement"
+        >
+          <input
+            type="range"
+            min="0"
+            max="2"
+            value="0"
+            aria-valuemin="0"
+            aria-valuemax="2"
+            aria-valuenow="0"
+            tabindex="0"
+          >
+        </div>
+        <div id="reasoning-announcement" role="status">第 1 項，共 3 項</div>
+      </div>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const resolveReasoningControlBundle = ${resolverSource};
+      document.querySelector('#result').textContent = JSON.stringify(
+        resolveReasoningControlBundle('即時'),
+      );
+    </script>`;
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    ['--headless=new', '--disable-gpu', '--no-sandbox', '--dump-dom', url],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'headless nested reasoning fixture did not return a result');
+  assert.deepEqual(JSON.parse(encoded), {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'native_range',
+    role_slider: false,
+    min: 0,
+    max: 2,
+    now: 0,
+    matched: false,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 1,
+    ordinal_total: 3,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: null,
+    semantic_conflict: false,
+    tick_count: null,
+    lock_map_present: false,
+    locked_positions: null,
+    current_locked: false,
+    semantic_unknown: true,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control exposes a labeled lock map for a four segment slider', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement reasoning-hint"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="false">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="3" aria-valuenow="2"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+            <span data-locked="true"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">高，第 3 項，共 4 項。</div>
+        <div id="reasoning-hint">使用左右方向鍵調整。</div>
+      </div>
+    </div>`,
+    '高',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 3,
+    now: 2,
+    matched: true,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 3,
+    ordinal_total: 4,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: 'high',
+    semantic_conflict: false,
+    tick_count: 4,
+    lock_map_present: true,
+    locked_positions: [3],
+    current_locked: false,
+    semantic_unknown: false,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control resolves a three segment lock map from the container announcement', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="false">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="2" aria-valuenow="1"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+            <span data-locked="false"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">中，第 2 項，共 3 項。</div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 2,
+    now: 1,
+    matched: true,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 2,
+    ordinal_total: 3,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: 'medium',
+    semantic_conflict: false,
+    tick_count: 3,
+    lock_map_present: true,
+    locked_positions: [],
+    current_locked: false,
+    semantic_unknown: false,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control reports a root-only lock marker without failing closed', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="true">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="3" aria-valuenow="3"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">Pro，第 4 項，共 4 項。</div>
+      </div>
+    </div>`,
+    '高',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 3,
+    now: 3,
+    matched: false,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 4,
+    ordinal_total: 4,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: null,
+    semantic_conflict: false,
+    tick_count: null,
+    lock_map_present: false,
+    locked_positions: null,
+    current_locked: true,
+    semantic_unknown: true,
+    focused: true,
+  });
+});
+
+const chatGptCopySelectorSource = () =>
+  readFileSync(join(repoRoot, 'src', 'chatgpt_copy_button_selector.js'), 'utf8');
+
+const chatGptAssistantSelector = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const fnStart = source.indexOf('fn assistant_selector');
+  assert.ok(fnStart > 0, 'assistant_selector must exist');
+  const providerStart = source.indexOf('Provider::ChatGpt =>', fnStart);
+  assert.ok(providerStart > fnStart, 'the ChatGPT assistant selector arm must exist');
+  const literal = source
+    .slice(providerStart, providerStart + 3000)
+    .match(/r##"([\s\S]*?)"##/);
+  assert.ok(literal, 'the ChatGPT assistant selector arm must be a raw string');
+  return literal[1];
+};
+const chatGptUserSelector =
+  '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)';
+
+// Mirrors the observed chatgpt.com transcript shape: one pair container holds
+// the user unit, the assistant unit and (once rendered) the assistant action
+// bar, while the user copy control lives inside the user unit only.
+const chatGptCopyFixture = ({ userCopyButtons, assistantActionBar = '', previousTurn = false }) => {
+  const userCopy =
+    userCopyButtons ||
+    '<span class="contents"><button id="user-copy" aria-label="複製訊息">複製訊息</button></span>';
+  const turn = (turnKey, unitKey, userMarkup, assistantMarkup, actionBar) => `
+    <div class="[&_[data-virtualized-turn-content]]:[content-visibility:visible]" data-turn-key="${turnKey}">
+      <div class="flex flex-col gap-1.5" data-content-search-turn-key="${unitKey}">
+        <div class="contents">
+          <div class="contents">
+            <div class="group flex flex-col pb-2 pt-2">
+              <div class="flex flex-col gap-3 browser:gap-1">
+                <div class="block-BQZwFn">
+                  <div class="group/user-message flex flex-col items-end gap-2" data-chatgpt-search-unit-key="${unitKey}:0:user" data-content-search-unit-key="${unitKey}:0:user">
+                    <div class="group/user-message flex w-full flex-col items-end justify-end gap-1">
+                      <div data-message-author-role="user">${userMarkup}</div>
+                      <div class="flex flex-row-reverse items-center gap-1">
+                        <div class="flex turn-action-controls items-center gap-0.5">${userCopy}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="block-BQZwFn">
+                  <div data-chatgpt-search-unit-key="${unitKey}:2:assistant" data-content-search-unit-key="${unitKey}:2:assistant">
+                    <div data-message-author-role="assistant">${assistantMarkup}</div>
+                  </div>
+                </div>
+              </div>
+              ${actionBar}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  return `<!doctype html>
+    <main id="thread">
+      ${previousTurn
+        ? turn(
+            'previous-turn-key',
+            'previous-turn',
+            '前一輪使用者訊息',
+            '前一輪助理回覆',
+            '<div class="mt-1.5 flex turn-action-controls"><span class="contents"><button id="previous-assistant-copy" aria-label="複製">複製</button></span></div>',
+          )
+        : ''}
+      ${turn('current-turn-key', 'current-turn', '早晨報告重點', '投資簡報 JSON', assistantActionBar)}
+    </main>
+    <pre id="result"></pre>
+    <script>
+      const clicks = [];
+      document.querySelectorAll('button').forEach((button) => {
+        button.addEventListener('click', () => clicks.push(button.id || button.getAttribute('aria-label') || button.textContent));
+      });
+      const selectLatestAssistantCopyButton = ${chatGptCopySelectorSource()};
+      const outcome = selectLatestAssistantCopyButton({
+        assistantSelector: ${JSON.stringify(chatGptAssistantSelector())},
+        userSelector: ${JSON.stringify(chatGptUserSelector)},
+      });
+      document.querySelector('#result').textContent = JSON.stringify({ outcome, clicks });
+    </script>`;
+};
+
+test('ChatGPT copy button selector fails closed instead of clicking the user turn copy control', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  assert.match(
+    source,
+    /include_str!\("chatgpt_copy_button_selector\.js"\)/,
+    'click_latest_copy_button must execute the shared selector module',
+  );
+
+  const result = renderFixture(chatGptCopyFixture({
+    userCopyButtons:
+      '<span class="contents"><button id="user-copy" aria-label="複製訊息">複製訊息</button></span>' +
+      '<span class="contents"><button id="user-copy-bare" aria-label="複製">複製</button></span>',
+  }));
+
+  assert.deepEqual(result.clicks, []);
+  assert.equal(result.outcome.ok, false);
+  assert.match(result.outcome.reason, /not found/i);
+});
+
+test('ChatGPT copy button selector prefers the assistant turn copy control beside the user turn', { skip: !chrome }, () => {
+  const result = renderFixture(chatGptCopyFixture({
+    assistantActionBar:
+      '<div class="mt-1.5 flex turn-action-controls min-h-5 min-w-0 max-w-full"><div class="flex min-h-5 min-w-0 flex-wrap items-center gap-0.5"><span class="contents"><button id="assistant-copy" aria-label="複製">複製</button></span></div></div>',
+  }));
+
+  assert.deepEqual(result.clicks, ['assistant-copy']);
+  assert.equal(result.outcome.ok, true);
+  assert.match(result.outcome.label, /複製/);
+});
+
+test('ChatGPT copy button selector never crosses into another turn copy control', { skip: !chrome }, () => {
+  const result = renderFixture(chatGptCopyFixture({ previousTurn: true }));
+
+  assert.deepEqual(result.clicks, []);
+  assert.equal(result.outcome.ok, false);
+});
+
+const chatGptStopSelectors = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const fnStart = source.indexOf('fn stop_button_selectors_json');
+  assert.ok(fnStart > 0, 'stop_button_selectors_json must exist');
+  const providerStart = source.indexOf('Provider::ChatGpt =>', fnStart);
+  assert.ok(providerStart > fnStart, 'the ChatGPT stop selector arm must exist');
+  const literal = source
+    .slice(providerStart, providerStart + 2000)
+    .match(/r##"([\s\S]*?)"##/);
+  assert.ok(literal, 'the ChatGPT stop selector arm must be a raw string array');
+  return JSON.parse(literal[1]);
+};
+
+const assistantTurnFixture = (inner) => `<!doctype html>
+    <main>
+      <div class="flex flex-col gap-1.5" data-content-search-turn-key="fallback-turn-0" data-turn-key="turn-1">
+        ${inner}
+      </div>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const selector = ${JSON.stringify('__SELECTOR__')};
+      const nodes = Array.from(document.querySelectorAll(selector));
+      const ids = nodes.map((node) => node.id).filter(Boolean).sort();
+      document.querySelector('#result').textContent = JSON.stringify({
+        count: nodes.length,
+        ids,
+        matchedGeneratedImage: nodes.some((node) => Boolean(node.querySelector('[data-testid="generated-image-gallery"]'))),
+      });
+    </script>`;
+
+const runAssistantTurnFixture = (inner) => {
+  const fixture = assistantTurnFixture(inner).replace(
+    JSON.stringify('__SELECTOR__'),
+    JSON.stringify(chatGptAssistantSelector()),
+  );
+  return renderFixture(fixture);
+};
+
+test('ChatGPT assistant selector recognises the generated image turn once', { skip: !chrome }, () => {
+  const userUnit =
+    '<div id="user-unit" class="group/user-message" data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="turn-1">' +
+    '<div class="flex flex-wrap"><img id="user-attachment" alt="\u4f7f\u7528\u8005\u9644\u4ef6" src="data:image/png;base64,iVBORw0KGgo="></div>' +
+    '</div>';
+  const imageTurn =
+    '<div id="image-message" data-chatgpt-search-message-ids="assistant-1">' +
+    '<div data-testid="generated-image-gallery">' +
+    '<button data-testid="generated-image-preview" aria-label="\u7522\u751f\u7684\u5716\u7247 1">' +
+    '<img alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></button>' +
+    '</div></div>';
+
+  const result = runAssistantTurnFixture(userUnit + imageTurn);
+
+  assert.equal(
+    result.matchedGeneratedImage,
+    true,
+    'the generated image message must count as the assistant response',
+  );
+  assert.deepEqual(result.ids, ['image-message'], 'only the generated image message may match');
+});
+
+test('ChatGPT assistant selector keeps one count when a keyed unit hosts the gallery', { skip: !chrome }, () => {
+  const unitWithGallery =
+    '<section id="assistant-unit" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant">' +
+    '<div data-testid="generated-image-gallery">' +
+    '<button data-testid="generated-image-preview"><img alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></button>' +
+    '</div>' +
+    '<div data-chatgpt-search-message-ids="assistant-1"></div>' +
+    '</section>';
+  const userUnit =
+    '<div id="user-unit" data-chatgpt-search-unit-key="fallback-turn-0:0:user"><p>prompt</p></div>';
+
+  const result = runAssistantTurnFixture(userUnit + unitWithGallery);
+
+  assert.equal(result.count, 1, 'a keyed assistant unit must not be double counted');
+  assert.deepEqual(result.ids, ['assistant-unit']);
+});
+
+test('ChatGPT stop control selectors cover the localized stop button', { skip: !chrome }, () => {
+  const selectors = chatGptStopSelectors();
+  assert.ok(
+    selectors.some((selector) => selector.includes('停止')),
+    'the stop selectors must cover the zh-TW generation control',
+  );
+
+  const result = renderFixture(`<!doctype html>
+    <main>
+      <button id="localized" aria-label="停止">停止</button>
+      <button id="english" aria-label="Stop generating">Stop generating</button>
+      <button id="decoy" aria-label="取消釘選對話">取消釘選對話</button>
+    </main>
+    <pre id="result"></pre>
+    <script>
+      const selectors = ${JSON.stringify(selectors)};
+      const matches = (id) => selectors.some((selector) => document.querySelector('#' + id).matches(selector));
+      document.querySelector('#result').textContent = JSON.stringify({
+        localized: matches('localized'),
+        english: matches('english'),
+        decoy: matches('decoy'),
+      });
+    </script>`);
+
+  assert.equal(result.localized, true, 'zh-TW 停止 must be recognized as the generation control');
+  assert.equal(result.english, true, 'the English stop label must keep matching');
+  assert.equal(result.decoy, false, 'non-stop controls must not match the stop selectors');
+});
+
+test('ChatGPT reasoning control reports the observed tick count when it disagrees with the slider span', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span data-locked="false">
+            <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0"></span>
+            <span data-locked="false"></span>
+            <span data-locked="true"></span>
+          </span>
+        </div>
+        <div id="reasoning-announcement">即時，第 1 項，共 3 項。</div>
+      </div>
+    </div>`,
+    '即時',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 2,
+    now: 0,
+    matched: true,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 1,
+    ordinal_total: 3,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: 'instant',
+    semantic_conflict: false,
+    tick_count: 2,
+    lock_map_present: true,
+    locked_positions: [1],
+    current_locked: false,
+    semantic_unknown: false,
+    focused: true,
+  });
+});
+
+test('ChatGPT reasoning control flags an unknown label and an upgrade-gated current position', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span role="slider" tabindex="-1" aria-valuemin="0" aria-valuemax="3" aria-valuenow="3"></span>
+        </div>
+        <div id="reasoning-announcement">Pro，第 4 個，共 4 個。需要升級。</div>
+      </div>
+    </div>`,
+    '高',
+  );
+  assert.deepEqual(result, {
+    found: true,
+    marker_present: true,
+    marker_count: 1,
+    state_owner_relation: 'descendant',
+    focus_owner_relation: 'state_owner',
+    role_evidence: 'slider',
+    role_slider: true,
+    min: 0,
+    max: 3,
+    now: 3,
+    matched: false,
+    announcement_present: true,
+    ordinal_present: true,
+    ordinal_current: 4,
+    ordinal_total: 4,
+    ordinal_consistent: true,
+    ordinal_conflict: false,
+    semantic_effort: null,
+    semantic_conflict: false,
+    tick_count: null,
+    lock_map_present: false,
+    locked_positions: null,
+    current_locked: true,
+    semantic_unknown: true,
+    focused: true,
+  });
+});
