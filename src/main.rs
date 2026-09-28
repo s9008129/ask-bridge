@@ -429,7 +429,9 @@ impl Provider {
                 r##"[
                     "[data-testid=\"stop-button\"]",
                     "#composer-stop-button",
-                    "button[aria-label=\"Stop generating\"]"
+                    "button[aria-label=\"Stop generating\"]",
+                    "button[aria-label*=\"Stop\"]",
+                    "button[aria-label*=\"停止\"]"
                 ]"##
             }
             Provider::Gemini => {
@@ -7525,71 +7527,15 @@ fn write_clipboard(content: &str) -> Result<(), String> {
 }
 
 fn click_latest_copy_button(config_path: &str, provider: Provider) -> Result<(), String> {
-    let response_selector = serde_json::to_string(provider.latest_response_selector())
-        .map_err(|e| format!("Failed to serialize response selector: {}", e))?;
-    let script = r#"() => {
-                const isVisible = (el) => {
-                    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-                    const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                };
-
-                const labelOf = (el) => [
-                    el.getAttribute('aria-label'),
-                    el.getAttribute('title'),
-                    el.getAttribute('data-testid'),
-                    el.textContent
-                ].filter(Boolean).join(' ');
-
-                const isCopyButton = (el) => {
-                    const label = labelOf(el);
-                    return /copy|複製|复制|コピー|복사/i.test(label)
-                        && !/prompt|提示詞|提示词|入力|table|表格/i.test(label);
-                };
-                const copyButtonScore = (el) => {
-                    const label = labelOf(el);
-                    if (!isCopyButton(el) || !isVisible(el)) return -1;
-                    if (el.closest('pre, code, [class*="code"], [data-testid*="code"]')) return -1;
-                    if (/copy-turn-action-button/i.test(label)) return 100;
-                    if (/response|回應|回答|reply/i.test(label)) return 90;
-                    if (el.closest('[data-turn-key], [data-chatgpt-search-unit-key$=":assistant"], model-response, response-container, [data-message-author-role="assistant"], .agent-turn, [data-is-streaming], .font-claude-response')) return 50;
-                    return 10;
-                };
-                const messages = Array.from(document.querySelectorAll(__RESPONSE_SELECTOR__));
-                const latest = messages[messages.length - 1];
-                if (!latest) return { ok: false, reason: "No assistant message found" };
-
-                latest.scrollIntoView({ block: 'center', inline: 'nearest' });
-                for (const type of ['pointerover', 'mouseover', 'mouseenter']) {
-                    latest.dispatchEvent(new MouseEvent(type, { bubbles: true, view: window }));
-                }
-
-                const scopes = [
-                    latest,
-                    latest.closest('article'),
-                    latest.closest('[data-testid^="conversation-turn"]'),
-                    latest.parentElement,
-                    latest.parentElement?.parentElement
-                ].filter(Boolean);
-
-                for (const scope of scopes) {
-                    const buttons = Array.from(scope.querySelectorAll('button'));
-                    const candidates = buttons
-                        .map((button) => ({ button, score: copyButtonScore(button) }))
-                        .filter((candidate) => candidate.score >= 0)
-                        .sort((a, b) => b.score - a.score);
-                    if (candidates.length > 0) {
-                        const button = candidates[0].button;
-                        button.click();
-                        return { ok: true, label: labelOf(button) };
-                    }
-                }
-
-                return { ok: false, reason: "Copy response button not found" };
-            }"#
-    .replace("__RESPONSE_SELECTOR__", &response_selector);
+    let selector_options = serde_json::json!({
+        "assistantSelector": provider.latest_response_selector(),
+        "userSelector": provider.user_selector(),
+    });
+    let script = format!(
+        "() => ({})({})",
+        include_str!("chatgpt_copy_button_selector.js"),
+        selector_options
+    );
     let res = call_mcp_tool(
         config_path,
         "evaluate_script",

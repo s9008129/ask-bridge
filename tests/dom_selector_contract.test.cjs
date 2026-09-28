@@ -535,6 +535,157 @@ test('ChatGPT reasoning control reports a root-only lock marker without failing 
   });
 });
 
+const chatGptCopySelectorSource = () =>
+  readFileSync(join(repoRoot, 'src', 'chatgpt_copy_button_selector.js'), 'utf8');
+
+const chatGptAssistantSelector =
+  '[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)';
+const chatGptUserSelector =
+  '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)';
+
+// Mirrors the observed chatgpt.com transcript shape: one pair container holds
+// the user unit, the assistant unit and (once rendered) the assistant action
+// bar, while the user copy control lives inside the user unit only.
+const chatGptCopyFixture = ({ userCopyButtons, assistantActionBar = '', previousTurn = false }) => {
+  const userCopy =
+    userCopyButtons ||
+    '<span class="contents"><button id="user-copy" aria-label="複製訊息">複製訊息</button></span>';
+  const turn = (turnKey, unitKey, userMarkup, assistantMarkup, actionBar) => `
+    <div class="[&_[data-virtualized-turn-content]]:[content-visibility:visible]" data-turn-key="${turnKey}">
+      <div class="flex flex-col gap-1.5" data-content-search-turn-key="${unitKey}">
+        <div class="contents">
+          <div class="contents">
+            <div class="group flex flex-col pb-2 pt-2">
+              <div class="flex flex-col gap-3 browser:gap-1">
+                <div class="block-BQZwFn">
+                  <div class="group/user-message flex flex-col items-end gap-2" data-chatgpt-search-unit-key="${unitKey}:0:user" data-content-search-unit-key="${unitKey}:0:user">
+                    <div class="group/user-message flex w-full flex-col items-end justify-end gap-1">
+                      <div data-message-author-role="user">${userMarkup}</div>
+                      <div class="flex flex-row-reverse items-center gap-1">
+                        <div class="flex turn-action-controls items-center gap-0.5">${userCopy}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="block-BQZwFn">
+                  <div data-chatgpt-search-unit-key="${unitKey}:2:assistant" data-content-search-unit-key="${unitKey}:2:assistant">
+                    <div data-message-author-role="assistant">${assistantMarkup}</div>
+                  </div>
+                </div>
+              </div>
+              ${actionBar}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  return `<!doctype html>
+    <main id="thread">
+      ${previousTurn
+        ? turn(
+            'previous-turn-key',
+            'previous-turn',
+            '前一輪使用者訊息',
+            '前一輪助理回覆',
+            '<div class="mt-1.5 flex turn-action-controls"><span class="contents"><button id="previous-assistant-copy" aria-label="複製">複製</button></span></div>',
+          )
+        : ''}
+      ${turn('current-turn-key', 'current-turn', '早晨報告重點', '投資簡報 JSON', assistantActionBar)}
+    </main>
+    <pre id="result"></pre>
+    <script>
+      const clicks = [];
+      document.querySelectorAll('button').forEach((button) => {
+        button.addEventListener('click', () => clicks.push(button.id || button.getAttribute('aria-label') || button.textContent));
+      });
+      const selectLatestAssistantCopyButton = ${chatGptCopySelectorSource()};
+      const outcome = selectLatestAssistantCopyButton({
+        assistantSelector: ${JSON.stringify(chatGptAssistantSelector)},
+        userSelector: ${JSON.stringify(chatGptUserSelector)},
+      });
+      document.querySelector('#result').textContent = JSON.stringify({ outcome, clicks });
+    </script>`;
+};
+
+test('ChatGPT copy button selector fails closed instead of clicking the user turn copy control', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  assert.match(
+    source,
+    /include_str!\("chatgpt_copy_button_selector\.js"\)/,
+    'click_latest_copy_button must execute the shared selector module',
+  );
+
+  const result = renderFixture(chatGptCopyFixture({
+    userCopyButtons:
+      '<span class="contents"><button id="user-copy" aria-label="複製訊息">複製訊息</button></span>' +
+      '<span class="contents"><button id="user-copy-bare" aria-label="複製">複製</button></span>',
+  }));
+
+  assert.deepEqual(result.clicks, []);
+  assert.equal(result.outcome.ok, false);
+  assert.match(result.outcome.reason, /not found/i);
+});
+
+test('ChatGPT copy button selector prefers the assistant turn copy control beside the user turn', { skip: !chrome }, () => {
+  const result = renderFixture(chatGptCopyFixture({
+    assistantActionBar:
+      '<div class="mt-1.5 flex turn-action-controls min-h-5 min-w-0 max-w-full"><div class="flex min-h-5 min-w-0 flex-wrap items-center gap-0.5"><span class="contents"><button id="assistant-copy" aria-label="複製">複製</button></span></div></div>',
+  }));
+
+  assert.deepEqual(result.clicks, ['assistant-copy']);
+  assert.equal(result.outcome.ok, true);
+  assert.match(result.outcome.label, /複製/);
+});
+
+test('ChatGPT copy button selector never crosses into another turn copy control', { skip: !chrome }, () => {
+  const result = renderFixture(chatGptCopyFixture({ previousTurn: true }));
+
+  assert.deepEqual(result.clicks, []);
+  assert.equal(result.outcome.ok, false);
+});
+
+const chatGptStopSelectors = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const fnStart = source.indexOf('fn stop_button_selectors_json');
+  assert.ok(fnStart > 0, 'stop_button_selectors_json must exist');
+  const providerStart = source.indexOf('Provider::ChatGpt =>', fnStart);
+  assert.ok(providerStart > fnStart, 'the ChatGPT stop selector arm must exist');
+  const literal = source
+    .slice(providerStart, providerStart + 2000)
+    .match(/r##"([\s\S]*?)"##/);
+  assert.ok(literal, 'the ChatGPT stop selector arm must be a raw string array');
+  return JSON.parse(literal[1]);
+};
+
+test('ChatGPT stop control selectors cover the localized stop button', { skip: !chrome }, () => {
+  const selectors = chatGptStopSelectors();
+  assert.ok(
+    selectors.some((selector) => selector.includes('停止')),
+    'the stop selectors must cover the zh-TW generation control',
+  );
+
+  const result = renderFixture(`<!doctype html>
+    <main>
+      <button id="localized" aria-label="停止">停止</button>
+      <button id="english" aria-label="Stop generating">Stop generating</button>
+      <button id="decoy" aria-label="取消釘選對話">取消釘選對話</button>
+    </main>
+    <pre id="result"></pre>
+    <script>
+      const selectors = ${JSON.stringify(selectors)};
+      const matches = (id) => selectors.some((selector) => document.querySelector('#' + id).matches(selector));
+      document.querySelector('#result').textContent = JSON.stringify({
+        localized: matches('localized'),
+        english: matches('english'),
+        decoy: matches('decoy'),
+      });
+    </script>`);
+
+  assert.equal(result.localized, true, 'zh-TW 停止 must be recognized as the generation control');
+  assert.equal(result.english, true, 'the English stop label must keep matching');
+  assert.equal(result.decoy, false, 'non-stop controls must not match the stop selectors');
+});
+
 test('ChatGPT reasoning control reports the observed tick count when it disagrees with the slider span', { skip: !chrome }, () => {
   const result = resolveControlBundle(
     `<div role="menu">
