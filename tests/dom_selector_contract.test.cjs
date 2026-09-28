@@ -44,35 +44,38 @@ const resolveControlBundle = (markup, target) => {
     </script>`);
 };
 
-test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome }, () => {
+test('ChatGPT assistant selector counts current and legacy semantic turns once', { skip: !chrome }, () => {
   const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
   assert.match(
     source,
-    /\.agent-turn, \[data-message-author-role=\\"assistant\\"\]:not\(\.agent-turn \*\)/,
-    'the provider boundary must use the canonical containment selector',
+    /\[data-chatgpt-search-unit-key\$=":assistant"\], \.agent-turn:not\(:has\(\[data-chatgpt-search-unit-key\$=":assistant"\]\)\)/,
+    'the provider boundary must prefer the current keyed assistant unit',
+  );
+  assert.match(
+    source,
+    /\[data-message-author-role=\\?"assistant\\?"\]:not\(\.agent-turn \*\)/,
+    'the provider boundary must retain the legacy role fallback',
   );
 
   const fixture = `<!doctype html>
     <main id="fixture"></main>
     <pre id="result"></pre>
     <script>
-      const oldSelector = '[data-message-author-role="assistant"], .agent-turn';
-      const canonicalSelector = '.agent-turn, [data-message-author-role="assistant"]:not(.agent-turn *)';
+      const canonicalSelector = '[data-chatgpt-search-unit-key$=":assistant"], .agent-turn:not(:has([data-chatgpt-search-unit-key$=":assistant"])), [data-message-author-role="assistant"]:not(.agent-turn *):not([data-chatgpt-search-unit-key$=":assistant"]):not([data-chatgpt-search-unit-key$=":assistant"] *)';
       const cases = [
-        ['nested', '<div class="agent-turn"><div data-message-author-role="assistant">nested</div></div>'],
+        ['current-nested', '<div class="agent-turn"><section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">nested</div></section></div>'],
+        ['current-only', '<section data-chatgpt-search-unit-key="turn:assistant">current</section>'],
+        ['current-role-child', '<section data-chatgpt-search-unit-key="turn:assistant"><div data-message-author-role="assistant">child</div></section>'],
         ['agent-only', '<div class="agent-turn">agent</div>'],
         ['role-only', '<div data-message-author-role="assistant">role</div>'],
         ['siblings', '<div class="agent-turn">one</div><div class="agent-turn">two</div>'],
-        ['mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
+        ['legacy-mixed', '<div data-message-author-role="assistant">old</div><div class="agent-turn"><div data-message-author-role="assistant">new</div></div>'],
       ];
       const result = {};
       for (const [name, html] of cases) {
         const host = document.createElement('section');
         host.innerHTML = html;
-        result[name] = {
-          old: host.querySelectorAll(oldSelector).length,
-          canonical: host.querySelectorAll(canonicalSelector).length,
-        };
+        result[name] = host.querySelectorAll(canonicalSelector).length;
       }
       document.querySelector('#result').textContent = JSON.stringify(result);
     </script>`;
@@ -84,14 +87,74 @@ test('ChatGPT assistant selector counts semantic turns once', { skip: !chrome },
   );
   const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
   assert.ok(encoded, 'headless DOM fixture did not return a result');
-  const counts = JSON.parse(encoded);
-  assert.deepEqual(counts, {
-    nested: { old: 2, canonical: 1 },
-    'agent-only': { old: 1, canonical: 1 },
-    'role-only': { old: 1, canonical: 1 },
-    siblings: { old: 2, canonical: 2 },
-    mixed: { old: 3, canonical: 2 },
+  assert.deepEqual(JSON.parse(encoded), {
+    'current-nested': 1,
+    'current-only': 1,
+    'current-role-child': 1,
+    'agent-only': 1,
+    'role-only': 1,
+    siblings: 2,
+    'legacy-mixed': 2,
   });
+});
+
+
+test('ChatGPT prompt echo verifier tolerates rendered Markdown but rejects wrong or truncated turns', () => {
+  const verifierSource = readFileSync(
+    join(repoRoot, 'src', 'chatgpt_prompt_echo_verifier.js'),
+    'utf8',
+  );
+  const verifyPromptEcho = Function(`return (${verifierSource});`)();
+  const digest = 'a'.repeat(64);
+  const body = Array.from(
+    { length: 72 },
+    (_, index) =>
+      `## 區段 ${index}\n- **關鍵資料 ${index}**：請保留 \`欄位_${index}\` 與原始數字 ${1000 + index}。\n`,
+  ).join('');
+  const expected =
+    `workflow prompt begins\n${body}\nsource.sha256: ${digest}\nworkflow prompt ends`;
+
+  // ChatGPT conversation rendering removes Markdown punctuation and list
+  // markers. The semantic content, source digest and overall message remain
+  // the same even though the DOM text is shorter than the composer source.
+  const rendered = expected
+    .replace(/^## /gm, '')
+    .replace(/^- /gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/\`/g, '')
+    .replace(/：/g, ' ');
+  const accepted = verifyPromptEcho(expected, rendered);
+  assert.equal(accepted.verified, true);
+  assert.equal(accepted.digest_ok, true);
+  assert.ok(accepted.anchor_matches >= accepted.anchor_required);
+
+  const wrongDigest = verifyPromptEcho(
+    expected,
+    rendered.replace(digest, 'b'.repeat(64)),
+  );
+  assert.equal(wrongDigest.verified, false);
+  assert.equal(wrongDigest.digest_ok, false);
+
+  const project = (value) => String(value || '')
+    .normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase('en-US')
+    .replace(/[\p{P}\p{S}\s]/gu, '');
+  const semantic = project(expected);
+  const left = semantic.slice(0, Math.floor(semantic.length * 0.2));
+  const right = semantic.slice(Math.floor(semantic.length * 0.8));
+  const corruptedMiddle = left +
+    'x'.repeat(semantic.length - left.length - right.length) +
+    right;
+  const corrupted = verifyPromptEcho(expected, corruptedMiddle);
+  assert.equal(corrupted.verified, false);
+  assert.ok(corrupted.anchor_matches < corrupted.anchor_required);
+
+  const truncated = verifyPromptEcho(expected, rendered.slice(0, Math.floor(rendered.length * 0.6)));
+  assert.equal(truncated.verified, false);
+  assert.equal(truncated.length_ratio_ok, false);
 });
 
 test('ChatGPT reasoning slider is selectable before prompt submission', { skip: !chrome }, () => {
@@ -470,6 +533,232 @@ test('ChatGPT reasoning control reports a root-only lock marker without failing 
     semantic_unknown: true,
     focused: true,
   });
+});
+
+const chatGptCopySelectorSource = () =>
+  readFileSync(join(repoRoot, 'src', 'chatgpt_copy_button_selector.js'), 'utf8');
+
+const chatGptAssistantSelector = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const fnStart = source.indexOf('fn assistant_selector');
+  assert.ok(fnStart > 0, 'assistant_selector must exist');
+  const providerStart = source.indexOf('Provider::ChatGpt =>', fnStart);
+  assert.ok(providerStart > fnStart, 'the ChatGPT assistant selector arm must exist');
+  const literal = source
+    .slice(providerStart, providerStart + 3000)
+    .match(/r##"([\s\S]*?)"##/);
+  assert.ok(literal, 'the ChatGPT assistant selector arm must be a raw string');
+  return literal[1];
+};
+const chatGptUserSelector =
+  '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)';
+
+// Mirrors the observed chatgpt.com transcript shape: one pair container holds
+// the user unit, the assistant unit and (once rendered) the assistant action
+// bar, while the user copy control lives inside the user unit only.
+const chatGptCopyFixture = ({ userCopyButtons, assistantActionBar = '', previousTurn = false }) => {
+  const userCopy =
+    userCopyButtons ||
+    '<span class="contents"><button id="user-copy" aria-label="複製訊息">複製訊息</button></span>';
+  const turn = (turnKey, unitKey, userMarkup, assistantMarkup, actionBar) => `
+    <div class="[&_[data-virtualized-turn-content]]:[content-visibility:visible]" data-turn-key="${turnKey}">
+      <div class="flex flex-col gap-1.5" data-content-search-turn-key="${unitKey}">
+        <div class="contents">
+          <div class="contents">
+            <div class="group flex flex-col pb-2 pt-2">
+              <div class="flex flex-col gap-3 browser:gap-1">
+                <div class="block-BQZwFn">
+                  <div class="group/user-message flex flex-col items-end gap-2" data-chatgpt-search-unit-key="${unitKey}:0:user" data-content-search-unit-key="${unitKey}:0:user">
+                    <div class="group/user-message flex w-full flex-col items-end justify-end gap-1">
+                      <div data-message-author-role="user">${userMarkup}</div>
+                      <div class="flex flex-row-reverse items-center gap-1">
+                        <div class="flex turn-action-controls items-center gap-0.5">${userCopy}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="block-BQZwFn">
+                  <div data-chatgpt-search-unit-key="${unitKey}:2:assistant" data-content-search-unit-key="${unitKey}:2:assistant">
+                    <div data-message-author-role="assistant">${assistantMarkup}</div>
+                  </div>
+                </div>
+              </div>
+              ${actionBar}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  return `<!doctype html>
+    <main id="thread">
+      ${previousTurn
+        ? turn(
+            'previous-turn-key',
+            'previous-turn',
+            '前一輪使用者訊息',
+            '前一輪助理回覆',
+            '<div class="mt-1.5 flex turn-action-controls"><span class="contents"><button id="previous-assistant-copy" aria-label="複製">複製</button></span></div>',
+          )
+        : ''}
+      ${turn('current-turn-key', 'current-turn', '早晨報告重點', '投資簡報 JSON', assistantActionBar)}
+    </main>
+    <pre id="result"></pre>
+    <script>
+      const clicks = [];
+      document.querySelectorAll('button').forEach((button) => {
+        button.addEventListener('click', () => clicks.push(button.id || button.getAttribute('aria-label') || button.textContent));
+      });
+      const selectLatestAssistantCopyButton = ${chatGptCopySelectorSource()};
+      const outcome = selectLatestAssistantCopyButton({
+        assistantSelector: ${JSON.stringify(chatGptAssistantSelector())},
+        userSelector: ${JSON.stringify(chatGptUserSelector)},
+      });
+      document.querySelector('#result').textContent = JSON.stringify({ outcome, clicks });
+    </script>`;
+};
+
+test('ChatGPT copy button selector fails closed instead of clicking the user turn copy control', { skip: !chrome }, () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  assert.match(
+    source,
+    /include_str!\("chatgpt_copy_button_selector\.js"\)/,
+    'click_latest_copy_button must execute the shared selector module',
+  );
+
+  const result = renderFixture(chatGptCopyFixture({
+    userCopyButtons:
+      '<span class="contents"><button id="user-copy" aria-label="複製訊息">複製訊息</button></span>' +
+      '<span class="contents"><button id="user-copy-bare" aria-label="複製">複製</button></span>',
+  }));
+
+  assert.deepEqual(result.clicks, []);
+  assert.equal(result.outcome.ok, false);
+  assert.match(result.outcome.reason, /not found/i);
+});
+
+test('ChatGPT copy button selector prefers the assistant turn copy control beside the user turn', { skip: !chrome }, () => {
+  const result = renderFixture(chatGptCopyFixture({
+    assistantActionBar:
+      '<div class="mt-1.5 flex turn-action-controls min-h-5 min-w-0 max-w-full"><div class="flex min-h-5 min-w-0 flex-wrap items-center gap-0.5"><span class="contents"><button id="assistant-copy" aria-label="複製">複製</button></span></div></div>',
+  }));
+
+  assert.deepEqual(result.clicks, ['assistant-copy']);
+  assert.equal(result.outcome.ok, true);
+  assert.match(result.outcome.label, /複製/);
+});
+
+test('ChatGPT copy button selector never crosses into another turn copy control', { skip: !chrome }, () => {
+  const result = renderFixture(chatGptCopyFixture({ previousTurn: true }));
+
+  assert.deepEqual(result.clicks, []);
+  assert.equal(result.outcome.ok, false);
+});
+
+const chatGptStopSelectors = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const fnStart = source.indexOf('fn stop_button_selectors_json');
+  assert.ok(fnStart > 0, 'stop_button_selectors_json must exist');
+  const providerStart = source.indexOf('Provider::ChatGpt =>', fnStart);
+  assert.ok(providerStart > fnStart, 'the ChatGPT stop selector arm must exist');
+  const literal = source
+    .slice(providerStart, providerStart + 2000)
+    .match(/r##"([\s\S]*?)"##/);
+  assert.ok(literal, 'the ChatGPT stop selector arm must be a raw string array');
+  return JSON.parse(literal[1]);
+};
+
+const assistantTurnFixture = (inner) => `<!doctype html>
+    <main>
+      <div class="flex flex-col gap-1.5" data-content-search-turn-key="fallback-turn-0" data-turn-key="turn-1">
+        ${inner}
+      </div>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const selector = ${JSON.stringify('__SELECTOR__')};
+      const nodes = Array.from(document.querySelectorAll(selector));
+      const ids = nodes.map((node) => node.id).filter(Boolean).sort();
+      document.querySelector('#result').textContent = JSON.stringify({
+        count: nodes.length,
+        ids,
+        matchedGeneratedImage: nodes.some((node) => Boolean(node.querySelector('[data-testid="generated-image-gallery"]'))),
+      });
+    </script>`;
+
+const runAssistantTurnFixture = (inner) => {
+  const fixture = assistantTurnFixture(inner).replace(
+    JSON.stringify('__SELECTOR__'),
+    JSON.stringify(chatGptAssistantSelector()),
+  );
+  return renderFixture(fixture);
+};
+
+test('ChatGPT assistant selector recognises the generated image turn once', { skip: !chrome }, () => {
+  const userUnit =
+    '<div id="user-unit" class="group/user-message" data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="turn-1">' +
+    '<div class="flex flex-wrap"><img id="user-attachment" alt="\u4f7f\u7528\u8005\u9644\u4ef6" src="data:image/png;base64,iVBORw0KGgo="></div>' +
+    '</div>';
+  const imageTurn =
+    '<div id="image-message" data-chatgpt-search-message-ids="assistant-1">' +
+    '<div data-testid="generated-image-gallery">' +
+    '<button data-testid="generated-image-preview" aria-label="\u7522\u751f\u7684\u5716\u7247 1">' +
+    '<img alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></button>' +
+    '</div></div>';
+
+  const result = runAssistantTurnFixture(userUnit + imageTurn);
+
+  assert.equal(
+    result.matchedGeneratedImage,
+    true,
+    'the generated image message must count as the assistant response',
+  );
+  assert.deepEqual(result.ids, ['image-message'], 'only the generated image message may match');
+});
+
+test('ChatGPT assistant selector keeps one count when a keyed unit hosts the gallery', { skip: !chrome }, () => {
+  const unitWithGallery =
+    '<section id="assistant-unit" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant">' +
+    '<div data-testid="generated-image-gallery">' +
+    '<button data-testid="generated-image-preview"><img alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></button>' +
+    '</div>' +
+    '<div data-chatgpt-search-message-ids="assistant-1"></div>' +
+    '</section>';
+  const userUnit =
+    '<div id="user-unit" data-chatgpt-search-unit-key="fallback-turn-0:0:user"><p>prompt</p></div>';
+
+  const result = runAssistantTurnFixture(userUnit + unitWithGallery);
+
+  assert.equal(result.count, 1, 'a keyed assistant unit must not be double counted');
+  assert.deepEqual(result.ids, ['assistant-unit']);
+});
+
+test('ChatGPT stop control selectors cover the localized stop button', { skip: !chrome }, () => {
+  const selectors = chatGptStopSelectors();
+  assert.ok(
+    selectors.some((selector) => selector.includes('停止')),
+    'the stop selectors must cover the zh-TW generation control',
+  );
+
+  const result = renderFixture(`<!doctype html>
+    <main>
+      <button id="localized" aria-label="停止">停止</button>
+      <button id="english" aria-label="Stop generating">Stop generating</button>
+      <button id="decoy" aria-label="取消釘選對話">取消釘選對話</button>
+    </main>
+    <pre id="result"></pre>
+    <script>
+      const selectors = ${JSON.stringify(selectors)};
+      const matches = (id) => selectors.some((selector) => document.querySelector('#' + id).matches(selector));
+      document.querySelector('#result').textContent = JSON.stringify({
+        localized: matches('localized'),
+        english: matches('english'),
+        decoy: matches('decoy'),
+      });
+    </script>`);
+
+  assert.equal(result.localized, true, 'zh-TW 停止 must be recognized as the generation control');
+  assert.equal(result.english, true, 'the English stop label must keep matching');
+  assert.equal(result.decoy, false, 'non-stop controls must not match the stop selectors');
 });
 
 test('ChatGPT reasoning control reports the observed tick count when it disagrees with the slider span', { skip: !chrome }, () => {
