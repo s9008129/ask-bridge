@@ -1876,9 +1876,14 @@ fn capabilities_value() -> Value {
             "post_selection_persistence": "close_reopen_state",
             "control_bundle": {
                 "marker": "data-model-reasoning-effort-slider",
+                "marker_candidates": [
+                    "data-model-reasoning-effort-slider",
+                    "data-reasoning-slider"
+                ],
                 "state_owner_relation": ["marker", "descendant"],
                 "focus_owner_relation": ["state_owner", "descendant"],
-                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+                "role_evidence": ["slider", "native_range", "missing", "conflict"],
+                "role_evidence_scope": "state_and_focus_owners"
             },
             "ordinal_profile": {
                 "min": 0,
@@ -1904,9 +1909,14 @@ fn capabilities_value() -> Value {
             "post_selection_persistence": "close_reopen_state",
             "control_bundle": {
                 "marker": "data-model-reasoning-effort-slider",
+                "marker_candidates": [
+                    "data-model-reasoning-effort-slider",
+                    "data-reasoning-slider"
+                ],
                 "state_owner_relation": ["marker", "descendant"],
                 "focus_owner_relation": ["state_owner", "descendant"],
-                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+                "role_evidence": ["slider", "native_range", "missing", "conflict"],
+                "role_evidence_scope": "state_and_focus_owners"
             },
             "calibration": {
                 "closed_set": ["instant", "medium", "high"],
@@ -1931,9 +1941,14 @@ fn capabilities_value() -> Value {
             "post_selection_persistence": "close_reopen_state",
             "control_bundle": {
                 "marker": "data-model-reasoning-effort-slider",
+                "marker_candidates": [
+                    "data-model-reasoning-effort-slider",
+                    "data-reasoning-slider"
+                ],
                 "state_owner_relation": ["marker", "descendant"],
                 "focus_owner_relation": ["state_owner", "descendant"],
-                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+                "role_evidence": ["slider", "native_range", "missing", "conflict"],
+                "role_evidence_scope": "state_and_focus_owners"
             },
             "calibration": {
                 "domain": "typed_ordered_three_state",
@@ -1973,9 +1988,14 @@ fn capabilities_value() -> Value {
             "post_selection_persistence": "close_reopen_state",
             "control_bundle": {
                 "marker": "data-model-reasoning-effort-slider",
+                "marker_candidates": [
+                    "data-model-reasoning-effort-slider",
+                    "data-reasoning-slider"
+                ],
                 "state_owner_relation": ["marker", "descendant"],
                 "focus_owner_relation": ["state_owner", "descendant"],
-                "role_evidence": ["slider", "native_range", "missing", "conflict"]
+                "role_evidence": ["slider", "native_range", "missing", "conflict"],
+                "role_evidence_scope": "state_and_focus_owners"
             },
             "labeled_position_map": {
                 "domain": "labeled_ordered_position_map",
@@ -4042,6 +4062,24 @@ mod tests {
             capabilities["verified_model_selection_v3"]["control_bundle"]["role_evidence"],
             serde_json::json!(["slider", "native_range", "missing", "conflict"])
         );
+        for capability in [
+            "verified_model_selection_v3",
+            "verified_model_selection_v4",
+            "verified_model_selection_v5",
+            "verified_model_selection_v6",
+        ] {
+            assert_eq!(
+                capabilities[capability]["control_bundle"]["marker_candidates"],
+                serde_json::json!([
+                    "data-model-reasoning-effort-slider",
+                    "data-reasoning-slider"
+                ])
+            );
+            assert_eq!(
+                capabilities[capability]["control_bundle"]["role_evidence_scope"],
+                serde_json::json!("state_and_focus_owners")
+            );
+        }
         assert_eq!(
             capabilities["verified_model_selection_v4"]["evidence"],
             serde_json::json!([
@@ -5015,6 +5053,7 @@ mod tests {
         let target_json = serde_json::to_string("即時").unwrap();
         let selection_script = build_chatgpt_model_selection_script(&target_json);
         assert!(selection_script.contains("data-model-reasoning-effort-slider"));
+        assert!(selection_script.contains("[data-reasoning-slider]"));
         assert!(selection_script.contains("aria-valuemin"));
         assert!(selection_script.contains("model radio selection was not verified"));
         assert!(selection_script.contains("legacy_menu_v1"));

@@ -930,3 +930,255 @@ test('ChatGPT reasoning control flags an unknown label and an upgrade-gated curr
     focused: true,
   });
 });
+
+test('ChatGPT reasoning control resolves the current data-reasoning-slider menuitem bundle', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu" data-state="open">
+      <div
+        role="menuitem"
+        aria-label="效能"
+        aria-describedby="reasoning-announcement reasoning-hint"
+        data-reasoning-slider
+      >
+        <span
+          role="slider"
+          tabindex="0"
+          aria-valuemin="0"
+          aria-valuemax="2"
+          aria-valuenow="1"
+          aria-hidden="true"
+        ></span>
+        <div id="reasoning-announcement">中，第 2 個，共 3 個。</div>
+        <div id="reasoning-hint">使用左右方向鍵調整效能</div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(
+    {
+      found: result.found,
+      marker_present: result.marker_present,
+      marker_count: result.marker_count,
+      state_owner_relation: result.state_owner_relation,
+      focus_owner_relation: result.focus_owner_relation,
+      role_evidence: result.role_evidence,
+      role_slider: result.role_slider,
+      min: result.min,
+      max: result.max,
+      now: result.now,
+      matched: result.matched,
+      announcement_present: result.announcement_present,
+      ordinal_current: result.ordinal_current,
+      ordinal_total: result.ordinal_total,
+      ordinal_consistent: result.ordinal_consistent,
+      ordinal_conflict: result.ordinal_conflict,
+      semantic_effort: result.semantic_effort,
+      semantic_conflict: result.semantic_conflict,
+      current_locked: result.current_locked,
+    },
+    {
+      found: true,
+      marker_present: true,
+      marker_count: 1,
+      state_owner_relation: 'descendant',
+      focus_owner_relation: 'state_owner',
+      role_evidence: 'slider',
+      role_slider: true,
+      min: 0,
+      max: 2,
+      now: 1,
+      matched: true,
+      announcement_present: true,
+      ordinal_current: 2,
+      ordinal_total: 3,
+      ordinal_consistent: true,
+      ordinal_conflict: false,
+      semantic_effort: 'medium',
+      semantic_conflict: false,
+      current_locked: false,
+    },
+  );
+  assert.equal(result.bundle_error, undefined, 'the current marker must not fail the bundle');
+});
+
+test('ChatGPT reasoning control still fails closed when the state owner is an interactive non slider', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu" data-state="open">
+      <div
+        role="menuitem"
+        aria-label="效能"
+        aria-describedby="reasoning-announcement"
+        data-reasoning-slider
+      >
+        <button aria-valuemin="0" aria-valuemax="2" aria-valuenow="1">中</button>
+        <div id="reasoning-announcement">中，第 2 個，共 3 個。</div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(
+    {
+      found: result.found,
+      marker_present: result.marker_present,
+      state_owner_relation: result.state_owner_relation,
+      focus_owner_relation: result.focus_owner_relation,
+      role_evidence: result.role_evidence,
+      role_slider: result.role_slider,
+    },
+    {
+      found: true,
+      marker_present: true,
+      state_owner_relation: 'descendant',
+      focus_owner_relation: 'state_owner',
+      role_evidence: 'conflict',
+      role_slider: false,
+    },
+  );
+});
+
+test('ChatGPT reasoning control still resolves the legacy data-model-reasoning-effort-slider marker', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu">
+      <div
+        role="menuitem"
+        aria-label="推理強度"
+        aria-expanded="false"
+        aria-describedby="reasoning-announcement"
+      >
+        推理強度
+        <div data-model-reasoning-effort-slider>
+          <span
+            role="slider"
+            tabindex="-1"
+            aria-valuemin="0"
+            aria-valuemax="2"
+            aria-valuenow="1"
+          ></span>
+        </div>
+        <div id="reasoning-announcement">中，第 2 個，共 3 個。</div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(
+    {
+      found: result.found,
+      marker_present: result.marker_present,
+      marker_count: result.marker_count,
+      state_owner_relation: result.state_owner_relation,
+      focus_owner_relation: result.focus_owner_relation,
+      role_evidence: result.role_evidence,
+      role_slider: result.role_slider,
+      min: result.min,
+      max: result.max,
+      now: result.now,
+      matched: result.matched,
+      semantic_effort: result.semantic_effort,
+    },
+    {
+      found: true,
+      marker_present: true,
+      marker_count: 1,
+      state_owner_relation: 'descendant',
+      focus_owner_relation: 'state_owner',
+      role_evidence: 'slider',
+      role_slider: true,
+      min: 0,
+      max: 2,
+      now: 1,
+      matched: true,
+      semantic_effort: 'medium',
+    },
+  );
+});
+
+test('ChatGPT reasoning control fails closed when legacy and current markers are nested together', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu" data-state="open">
+      <div data-model-reasoning-effort-slider>
+        <div
+          role="menuitem"
+          aria-label="效能"
+          aria-describedby="reasoning-announcement"
+          data-reasoning-slider
+        >
+          <span
+            role="slider"
+            tabindex="0"
+            aria-valuemin="0"
+            aria-valuemax="2"
+            aria-valuenow="1"
+          ></span>
+          <div id="reasoning-announcement">中，第 2 個，共 3 個。</div>
+        </div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(
+    {
+      found: result.found,
+      marker_count: result.marker_count,
+      bundle_error: result.bundle_error,
+    },
+    {
+      found: true,
+      marker_count: 2,
+      bundle_error: 'reasoning slider marker is ambiguous',
+    },
+  );
+});
+
+test('ChatGPT reasoning control resolves a roleless focusable owner inside the current marker bundle', { skip: !chrome }, () => {
+  const result = resolveControlBundle(
+    `<div role="menu" data-state="open">
+      <div
+        role="menuitem"
+        aria-label="效能"
+        aria-describedby="reasoning-announcement"
+        data-reasoning-slider
+      >
+        <span
+          role="slider"
+          aria-valuemin="0"
+          aria-valuemax="2"
+          aria-valuenow="1"
+        ></span>
+        <div tabindex="0"></div>
+        <div id="reasoning-announcement">中，第 2 個，共 3 個。</div>
+      </div>
+    </div>`,
+    '中',
+  );
+  assert.deepEqual(
+    {
+      found: result.found,
+      marker_present: result.marker_present,
+      state_owner_relation: result.state_owner_relation,
+      focus_owner_relation: result.focus_owner_relation,
+      role_evidence: result.role_evidence,
+      role_slider: result.role_slider,
+      min: result.min,
+      max: result.max,
+      now: result.now,
+      matched: result.matched,
+      semantic_effort: result.semantic_effort,
+      focused: result.focused,
+    },
+    {
+      found: true,
+      marker_present: true,
+      state_owner_relation: 'descendant',
+      focus_owner_relation: 'descendant',
+      role_evidence: 'slider',
+      role_slider: true,
+      min: 0,
+      max: 2,
+      now: 1,
+      matched: true,
+      semantic_effort: 'medium',
+      focused: true,
+    },
+  );
+  assert.equal(result.bundle_error, undefined, 'a roleless focusable owner must not fail the bundle');
+});

@@ -1,5 +1,10 @@
 ((targetEffort) => {
-    const markerSelector = '[data-model-reasoning-effort-slider]';
+    // The provider has shipped two marker spellings for the same reasoning
+    // control bundle: the legacy `[data-model-reasoning-effort-slider]`
+    // wrapper and the current `[data-reasoning-slider]` keyboard-control
+    // menuitem.  Both are accepted so a rolling UI change cannot silently
+    // drop the bundle; uniqueness is still enforced below.
+    const markerSelector = '[data-model-reasoning-effort-slider], [data-reasoning-slider]';
     const ordinalPattern = /第\s*(\d+)\s*(?:項|個)\s*(?:[，,、])?\s*(?:共|總共)\s*(\d+)\s*(?:項|個)|\bitem\s+(\d+)\s+of\s+(\d+)\b|\b(\d+)\s+of\s+(\d+)\b/i;
     const reasoningPattern = /reasoning|推理強度|思考強度/i;
     const interactiveRoles = new Set([
@@ -133,8 +138,12 @@
 
     const actualOwners = [stateOwner];
     if (focusOwner !== stateOwner) actualOwners.push(focusOwner);
-    const roleOwners = [marker, ...actualOwners].filter(Boolean)
-        .filter((owner, index, owners) => owners.indexOf(owner) === index);
+    // Role evidence only judges the elements that own the value state or the
+    // keyboard focus.  The marker is allowed to be an interactive *container*
+    // around the control (the current provider DOM nests the slider inside a
+    // `menuitem` wrapper); a container role must never turn a genuine slider
+    // into a conflict.  A marker that itself owns the value state is already
+    // part of `actualOwners` and stays subject to this check.
     const explicitRole = (element) => (element.getAttribute('role') || '').trim().toLowerCase();
     const implicitRole = (element) => {
         if (isNativeRange(element)) return 'slider';
@@ -143,7 +152,9 @@
         if (element.matches('input, select, textarea')) return 'textbox';
         return null;
     };
-    const ownerRoles = roleOwners.map((owner) => explicitRole(owner) || implicitRole(owner)).filter(Boolean);
+    const ownerRoles = actualOwners
+        .map((owner) => explicitRole(owner) || implicitRole(owner))
+        .filter(Boolean);
     const roleConflict = ownerRoles.some((role) => role !== 'slider' && interactiveRoles.has(role));
     const roleEvidence = roleConflict ? 'conflict' :
         actualOwners.some(isNativeRange) ? 'native_range' :

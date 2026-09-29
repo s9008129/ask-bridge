@@ -1,6 +1,6 @@
 [package]
 name = "ask-bridge"
-version = "0.2.10-preserve.1"
+version = "0.2.10-preserve.2"
 edition = "2024"
 
 [[bin]]

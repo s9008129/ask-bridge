@@ -9,6 +9,8 @@
 - macOS 背景冷啟動新增 `--no-startup-window`：Chrome 不建立初始瀏覽器視窗，避免建立視窗時自我 activate（`open -g -j` 無法抑制）；自動化分頁改由 CDP `background: true` 建立。
 - 新增 `background_launch_isolation_v1` 能力宣告（`launch_activation=suppressed`、`launch_visibility=hidden`、`mechanism=macos-launchservices-open-gj`、`scope=cold-start-only`）；`background_isolated_tab_v1` payload 新增 `new_page_background_flag=--background-tab`，整合工具可據此明確要求背景分頁。
 - 新增 Rust 單元測試：CDP `background` 由 `background_tab` 決定、`--background-tab` 與 `--headless` 解耦、隱藏啟動計畫使用 `open -g -j -n`、非 `.app` 執行檔被拒絕，以及 capability payload 契約。
+- 新增 `verified_model_selection_v3`–`v6` capability 的 `control_bundle.marker_candidates`（`data-model-reasoning-effort-slider`、`data-reasoning-slider`）與 `control_bundle.role_evidence_scope`（`state_and_focus_owners`）：宣告推理強度 slider 的 marker 候選拼法與 role 證據判定範圍；既有 `marker` 欄位保留不變。
+- 版本推進至 `0.2.10-preserve.2`（`Cargo.toml`／`Cargo.lock` 同步；`package.json`、`install.sh`、`install.ps1`、`scripts/ask.sh` 維持 `0.2.10`）。
 
 ### 🔧 修復 (Fixed)
 - 修正 macOS 冷啟動 managed Chrome 的搶前景問題：不再以 `Command::spawn` 直接啟動 Chrome 執行檔（此舉會觸發 macOS app activation，使 Chrome 成為 frontmost app），改以 LaunchServices `open -g -j -n -a` 搭配 `--no-startup-window` 隱藏啟動；`open` 失敗時直接回報錯誤，**不會**退回會搶前景的直 spawn。
@@ -16,6 +18,11 @@
 - 修正分頁層級的 activate 風險：`select_page` 的 `bringToFront` 與 `new_page` 的 `background` 改由 `--background-tab` 驅動，而非隱式綁定 `--headless`。
 - 修正 ChatGPT 登入偵測在「已登入」頁面誤判為 `Unknown` 的問題：`login_signals_js()` 的帳號選單探測原本取「第一個符合元素」，會被頁面上 0×0 的隱藏複製品（例如 `button[aria-label*="個人檔案"]`）鎖住，導致 `account=false`；`ask-bridge login --provider chatgpt` 因此每輪都判 `Unknown`，一路空等到 `--timeout`（CLI 預設 300 秒、GUI 900 秒）後失敗，`session-probe --json` 也回報 `authenticated=false, state=unknown`。現改為在既有 selector 清單中取「第一個可見」的符合元素（`firstVisible`），並保留原本的 selector 優先順序；同一個 probe 內的 composer 診斷訊號一併改用同一策略。
 - 補齊對應測試：Rust 端新增 `chatgpt_login_signals_prefer_the_visible_account_control`；Node DOM contract fixture 新增 `ChatGPT login signals read the visible account control, not hidden duplicates`，以 headless Chrome 驗證「隱藏複製品在前、可見元件在後 → `account=true`」、「只有隱藏複製品 → `account=false`」與「可見登入鈕＋隱藏複製品 → `auth_control=true`」。
+- 修正 ChatGPT 推理強度 slider marker 漂移導致的 `CHATGPT_MODEL_SELECTION_FAILED`（GUI 對話框「ChatGPT 模型／推理強度選擇未驗證，Prompt 未送出」）：ChatGPT 現行 DOM 已移除 `data-model-reasoning-effort-slider`，改將 slider 掛在 `role=menuitem` 鍵盤控制容器上的 `data-reasoning-slider`；resolver 現在同時接受兩種拼法（同一時刻仍要求唯一 bundle，新舊巢狀共存時維持 ambiguous fail-closed）。
+- 修正 role 證據誤判：`role_evidence` 的 conflict 只判定擁有讀值狀態／鍵盤焦點的 owner，marker 容器本身的 `role=menuitem` 不再讓合法 slider 被誤判為 `conflict`。
+- 補齊對應測試：Node DOM contract 新增「現行 `data-reasoning-slider` menuitem bundle 可解析」、「state owner 為非 slider 互動元件仍 fail-closed」、「legacy marker 相容」、「巢狀新舊 marker 共存時 ambiguous fail-closed」與「roleless focusable owner」；Rust capability 斷言擴及 v3–v6。
+- 修正「第 2 個（含）以後的附件永遠上傳失敗」（GUI 對話框「ask-bridge 尚未確認附件完成，Prompt 未送出」，session receipt 收斂為 `ATTACHMENT_VERIFICATION_FAILED`）：舊路徑每個檔案都先點「新增檔案和更多內容」開選單再 `DOM.setFileInputFiles`；ChatGPT 收下第 1 個檔案後會把該按鈕留在 `aria-expanded="true"`、popover 已卸載的 phantom-open 狀態，下一個檔案的單次點擊因此變成「關閉」，永遠等不到選單（`Attachment menu did not open`，約 26 秒後 exit 1）。文件與圖片現在都直接對 composer 常駐的 hidden `input[type=file]`（`附加檔案`／`附加相片或影片`）設定檔案、完全不碰選單；選單只在 input 尚未掛載時作為 fallback，並改為冪等的有界重試（`ensureMenuOpen`，最多 4 次點擊）以跨越 phantom-open；ownership token 與「chip 出現才回報成功」的驗證契約不變。
+- 補齊對應測試：新增 `tests/chatgpt_upload_contract.test.cjs`（5 個測試：直接路徑不得點選單、document／image selector 契約、fallback 會重新查詢 input、phantom-open 下仍有界重試、input 缺失時回報 `File input unavailable`）。
 
 ### ⚠️ 驗證狀態 (2026-09-29)
 - 離線測試通過：`cargo fmt --all -- --check`、`cargo test`（131 passed）、`cargo build --release`、capabilities payload 檢查。
@@ -29,6 +36,12 @@
 - 應用層按鈕路徑（`media_toolbox.chatgpt.ask_bridge_adapter.AskBridgeAdapter.start_login`）E2E 通過：`status=success`、`message=ChatGPT 登入完成，唯讀 session probe 已確認`、`retry_safety=safe`，耗時 3.45 秒。
 - 焦點契約未回歸：驗證期間 managed Chrome 的 `System Events visible=false`，從未成為 frontmost app。
 - 反向證據（離線 fixture）：只有隱藏 profile 複製品時 `account=false`、`stable=true`；頁面存在可見「登入」按鈕時 `auth_control=true` 且 `account=false`。
+
+### ⚠️ 附件上傳修復驗證 (2026-09-29)
+- 離線測試通過：`cargo fmt --all -- --check`、`cargo test --release`（132 passed）、`node --test tests/*.test.cjs`（30 passed，含新增 5 個上傳契約測試）。
+- **同一失敗命令的修復前後對照（實機，managed Chrome／CDP 9223）**：修復前 `ask-bridge … --verify-attachments-only` 於 26 秒後以 `ChatGPT upload diagnostic: Attachment menu did not open`、exit 1 結束；修復後同一命令連續 3 次 `Attachments verified (documents only)`、exit 0（3 個新分頁各 2 個 chip）；混合附件（1 文件 + 1 圖片）回報 `Attachments verified: 1 document(s), 1 image(s).`、exit 0。
+- **產品層真 UI 點擊 E2E**：yt_down_txt 工具箱以 Qt `QTest.mouseClick` 觸發「開始一鍵工作流」（offscreen，未搶佔前景），receipt 為 `attachment_verification=verified`（`attachment_count=2`）→ `prompt_submission=intent_recorded`、`model_selection=verified`、`failure_code=null`，`verdict=PASS_GATE`。
+- 證據：`yt_down_txt/.agent/tasks/T20260929-1900-02-attachment-verification-failed/`（修復前日誌、修復後 ×3、混合附件、chip 快照、CDP 診斷腳本與 receipt）。
 
 ---
 

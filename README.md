@@ -254,11 +254,16 @@ ask-bridge session-probe --provider chatgpt --json
 `verified_model_selection_v3`、`verified_model_selection_v4` 與
 `verified_model_selection_v5` 以辨識舊 consumer 與讀取既有 receipt。ChatGPT 會先驗證
 模型 radio 或舊式選單；遇到推理強度 slider 時，v6 會由 Rust runtime 與 Node DOM tests
-共用同一個純 `data-model-reasoning-effort-slider` control-bundle resolver。唯一 bundle
-必須具備整數 `aria-valuemin`／`aria-valuemax`／`aria-valuenow`（或 native range 的
-min／max／value）、唯一 focus/state owner，且位置數量（`max - min + 1`）必須落在 2 到 8
-之間；owner 可使用 `role=slider`、native range，或在行為證據完整時缺少
-role，但明確衝突的互動 role 會 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵
+共用同一個純 control-bundle resolver，同時接受兩個 marker 候選拼法
+（`data-model-reasoning-effort-slider` 與現行的 `data-reasoning-slider`；同一時刻必須
+恰好命中一個 bundle，新舊巢狀共存時視為 ambiguous 並 fail-closed；capability v3–v6 以
+`control_bundle.marker_candidates` 宣告候選、`role_evidence_scope` 宣告衝突判定範圍）。
+唯一 bundle 必須具備整數 `aria-valuemin`／`aria-valuemax`／`aria-valuenow`
+（或 native range 的 min／max／value）、唯一 focus/state owner，且位置數量
+（`max - min + 1`）必須落在 2 到 8 之間；owner 可使用 `role=slider`、native range，或在
+行為證據完整時缺少 role。role 衝突只檢查擁有讀值狀態／鍵盤焦點的 owner：marker 本身是
+互動容器（例如現行 DOM 的 `role=menuitem` 包裝）不算衝突，但 owner 是明確衝突的互動
+role 時 fail-closed。工具會以可信任的 ArrowLeft／ArrowRight 鍵
 逐格走訪，並以頁面公告的語意標籤驅動選取：每個走訪到的位置都必須有公告，無法辨識標籤
 的位置可略過但不可被選取，目標位置則必須由公告直接對應到目標推理等級；頁面標示
 `data-locked`（例如需要升級的 Pro 位置）不得選取，但可作為走訪的停止邊界。ordinal

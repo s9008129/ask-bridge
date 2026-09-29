@@ -1,6 +1,5 @@
 // Upload to the exact page marked by ask-bridge. Never infer ownership from tab order.
 const [token, filePath, kind] = process.argv.slice(1);
-const deadline = setTimeout(() => process.exit(1), 30000);
 
 async function call(ws, method, params = {}) {
     return new Promise((resolve, reject) => {
@@ -17,7 +16,72 @@ async function call(ws, method, params = {}) {
     });
 }
 
+const cdpFor = (ws) => ({ call: (method, params = {}) => call(ws, method, params) });
+
+const FILE_INPUT_SELECTOR = {
+    document: 'input[type="file"][aria-label="附加檔案"], input[type="file"]:not([accept])',
+    image: 'input[type="file"][aria-label="附加相片或影片"], input[type="file"][accept*="image/"]',
+};
+const MENU_BUTTON_LABELS = ['新增檔案和更多內容', 'Add files and more'];
+const MENU_OPEN_LABELS = ['新增相片與檔案', 'Add photos & files'];
+
+async function findFileInputNodeId(cdp, kind) {
+    const doc = await cdp.call('DOM.getDocument');
+    const input = await cdp.call('DOM.querySelector', {
+        nodeId: doc.root.nodeId,
+        selector: FILE_INPUT_SELECTOR[kind],
+    });
+    return input.nodeId;
+}
+
+async function isMenuOpen(cdp) {
+    const labels = JSON.stringify(MENU_OPEN_LABELS);
+    const check = await cdp.call('Runtime.evaluate', {
+        expression: `Array.from(document.querySelectorAll('button')).some(el => ${labels}.some(label => (el.innerText || '').includes(label)))`,
+        returnByValue: true,
+    });
+    return check.result?.value === true;
+}
+
+// Clicking the composer's attachment trigger toggles a popover.  After the
+// first native upload ChatGPT can leave the trigger in a "phantom open" state
+// (aria-expanded="true" with no rendered popover, observed 2026-09-29), so the
+// next single click closes instead of opens and can never recover by itself.
+// Retry until a *visible* menu is present; every attempt either opens the menu
+// or burns one phantom-open toggle.
+async function ensureMenuOpen(cdp, { maxClicks = 4, attempts = 12, pollMs = 250 } = {}) {
+    const labels = JSON.stringify(MENU_BUTTON_LABELS);
+    for (let click = 0; click < maxClicks; click++) {
+        if (await isMenuOpen(cdp)) return;
+        const clicked = await cdp.call('Runtime.evaluate', {
+            expression: `(() => { const button = Array.from(document.querySelectorAll('button')).find(el => ${labels}.includes(el.getAttribute('aria-label'))); if (!button) return false; button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', isPrimary: true })); button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', isPrimary: true })); button.click(); return true; })()`,
+            returnByValue: true,
+        });
+        if (clicked.result?.value !== true) throw new Error('Attachment menu unavailable');
+        for (let attempt = 0; attempt < attempts; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, pollMs));
+            if (await isMenuOpen(cdp)) return;
+        }
+    }
+    throw new Error('Attachment menu did not open');
+}
+
+// The composer always owns hidden file inputs, so set files directly and leave
+// the menu untouched; the menu click is only a fallback for a composer whose
+// input is not mounted yet.  Opening the menu before the first upload (the
+// pre-2026-09-29 path) is what desynchronised the trigger for every following
+// file and made ask-bridge report ATTACHMENT_VERIFICATION_FAILED.
+async function resolveFileInputNodeId(cdp, kind, menuOptions) {
+    const direct = await findFileInputNodeId(cdp, kind);
+    if (direct) return direct;
+    await ensureMenuOpen(cdp, menuOptions);
+    const inputNodeId = await findFileInputNodeId(cdp, kind);
+    if (!inputNodeId) throw new Error('File input unavailable');
+    return inputNodeId;
+}
+
 async function run() {
+    const deadline = setTimeout(() => process.exit(1), 30000);
     if (!token || !filePath || !['image', 'document'].includes(kind)) throw new Error('Invalid upload request');
     const pages = await (await fetch('http://127.0.0.1:9223/json/list')).json();
     let matches = 0;
@@ -34,33 +98,9 @@ async function run() {
             });
             if (marker.result?.value !== token) continue;
             matches++;
-            const isMenuOpen = async () => {
-                const check = await call(ws, 'Runtime.evaluate', {
-                    expression: `Array.from(document.querySelectorAll('button')).some(el => ['新增相片與檔案', 'Add photos & files'].some(label => (el.innerText || '').includes(label)))`,
-                    returnByValue: true,
-                });
-                return check.result?.value === true;
-            };
-            let menuReady = await isMenuOpen();
-            if (!menuReady) {
-                const clicked = await call(ws, 'Runtime.evaluate', {
-                    expression: `(() => { const button = Array.from(document.querySelectorAll('button')).find(el => ['新增檔案和更多內容', 'Add files and more'].includes(el.getAttribute('aria-label'))); if (!button) return false; button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'mouse', isPrimary: true })); button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'mouse', isPrimary: true })); button.click(); return true; })()`,
-                    returnByValue: true,
-                });
-                if (clicked.result?.value !== true) throw new Error('Attachment menu unavailable');
-                for (let attempt = 0; attempt < 20; attempt++) {
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    if (await isMenuOpen()) { menuReady = true; break; }
-                }
-            }
-            if (!menuReady) throw new Error('Attachment menu did not open');
-            const doc = await call(ws, 'DOM.getDocument');
-            const selector = kind === 'document'
-                ? 'input[type="file"][aria-label="附加檔案"], input[type="file"]:not([accept])'
-                : 'input[type="file"][aria-label="附加相片或影片"], input[type="file"][accept*="image/"]';
-            const input = await call(ws, 'DOM.querySelector', { nodeId: doc.root.nodeId, selector });
-            if (!input.nodeId) throw new Error('File input unavailable');
-            await call(ws, 'DOM.setFileInputFiles', { nodeId: input.nodeId, files: [filePath] });
+            const cdp = cdpFor(ws);
+            const inputNodeId = await resolveFileInputNodeId(cdp, kind);
+            await call(ws, 'DOM.setFileInputFiles', { nodeId: inputNodeId, files: [filePath] });
             const fileName = filePath.split(/[\\/]/).pop();
             const dot = fileName.lastIndexOf('.');
             const stem = dot < 0 ? fileName : fileName.slice(0, dot);
@@ -83,8 +123,12 @@ async function run() {
     clearTimeout(deadline);
 }
 
-run().catch((error) => {
-    const known = ['Invalid upload request', 'Attachment menu unavailable', 'Attachment menu did not open', 'File input unavailable', 'Uploaded file did not appear in composer', 'Owned ChatGPT page was not unique'];
-    console.error(known.find(message => error.message === message) || 'CDP upload operation failed');
-    process.exit(1);
-});
+module.exports = { ensureMenuOpen, findFileInputNodeId, isMenuOpen, resolveFileInputNodeId, FILE_INPUT_SELECTOR };
+
+if (process.env.ASK_BRIDGE_UPLOAD_NO_AUTORUN !== '1') {
+    run().catch((error) => {
+        const known = ['Invalid upload request', 'Attachment menu unavailable', 'Attachment menu did not open', 'File input unavailable', 'Uploaded file did not appear in composer', 'Owned ChatGPT page was not unique'];
+        console.error(known.find(message => error.message === message) || 'CDP upload operation failed');
+        process.exit(1);
+    });
+}
