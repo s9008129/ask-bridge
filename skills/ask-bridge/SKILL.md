@@ -311,7 +311,7 @@ ask-bridge --provider claude '證明這個數學問題。' --model Opus
 ask-bridge '請只根據本次輸入分析，不要沿用既有對話脈絡。' --new
 ```
 
-一般提問預設 `--headless=true`。macOS 冷啟動時會透過 LaunchServices（`open -g -j -n`）嘗試隱藏啟動，失敗時 fail-closed；⚠️ 實機驗證（2026-09-29）尚未通過：Chrome 仍會被帶到前景（修正待續）。需要觀察 Chrome 操作時使用：
+一般提問預設 `--headless=true`。macOS 冷啟動時會透過 LaunchServices（`open -g -j -n` 加 `--no-startup-window`）隱藏啟動，失敗時 fail-closed；實機驗證（2026-09-29 attempt-2）通過：冷啟動與 reuse 都不會把 Chrome 帶到前景。需要觀察 Chrome 操作時使用：
 
 ```sh
 ask-bridge '請回覆 ok' --headless=false

@@ -6,19 +6,20 @@
 
 ### 🚀 新增 (Added)
 - 新增 `--background-tab[=<BOOL>]` CLI flag，將「Chrome 可不可見」（`--headless`）與「自動化分頁是否走前景／背景」拆成兩條契約；未指定時沿用歷史預設（`background_tab = headless`），舊呼叫端行為不變。
+- macOS 背景冷啟動新增 `--no-startup-window`：Chrome 不建立初始瀏覽器視窗，避免建立視窗時自我 activate（`open -g -j` 無法抑制）；自動化分頁改由 CDP `background: true` 建立。
 - 新增 `background_launch_isolation_v1` 能力宣告（`launch_activation=suppressed`、`launch_visibility=hidden`、`mechanism=macos-launchservices-open-gj`、`scope=cold-start-only`）；`background_isolated_tab_v1` payload 新增 `new_page_background_flag=--background-tab`，整合工具可據此明確要求背景分頁。
 - 新增 Rust 單元測試：CDP `background` 由 `background_tab` 決定、`--background-tab` 與 `--headless` 解耦、隱藏啟動計畫使用 `open -g -j -n`、非 `.app` 執行檔被拒絕，以及 capability payload 契約。
 
 ### 🔧 修復 (Fixed)
-- 修正 macOS 冷啟動 managed Chrome 的啟動路徑（**搶前景問題尚未解除，見下方驗證狀態**）：不再以 `Command::spawn` 直接啟動 Chrome 執行檔（此舉會觸發 macOS app activation，使 Chrome 成為 frontmost app），改以 LaunchServices `open -g -j -n -a` 隱藏啟動；`open` 失敗時直接回報錯誤，**不會**退回會搶前景的直 spawn。
+- 修正 macOS 冷啟動 managed Chrome 的搶前景問題：不再以 `Command::spawn` 直接啟動 Chrome 執行檔（此舉會觸發 macOS app activation，使 Chrome 成為 frontmost app），改以 LaunchServices `open -g -j -n -a` 搭配 `--no-startup-window` 隱藏啟動；`open` 失敗時直接回報錯誤，**不會**退回會搶前景的直 spawn。
 - 修正「先啟動、後以 AppleScript 隱藏」的延遲補救鏈：AppleScript 隱藏迴圈降級為有界的 best-effort fallback（依賴 `System Events` Automation 權限），並改由 debug port 反查真正的 Chrome PID（`open` 不回報 child PID）。
 - 修正分頁層級的 activate 風險：`select_page` 的 `bringToFront` 與 `new_page` 的 `background` 改由 `--background-tab` 驅動，而非隱式綁定 `--headless`。
 
 ### ⚠️ 驗證狀態 (2026-09-29)
 - 離線測試通過：`cargo fmt --all -- --check`、`cargo test`（131 passed）、`cargo build --release`、capabilities payload 檢查。
-- **實機冷啟動焦點驗證未通過**：使用 `open -g -j -n` 後，managed Chrome 仍於啟動後約 0.5 秒成為 frontmost app（維持約 4.6 秒後才交還焦點）。本版尚未滿足「冷啟動不得搶前景」；`origin/main` 未更新，待修正後重驗。
-- AppleScript 備援隱藏目前因語法錯誤（`whose unix id <PID>` 缺少 `is`，osascript 回報 -2740）全數失敗，等同無效備援；待修。
-- 證據：`yt_down_txt/.agent/tasks/T20260929-1601-01-chrome-background-focus/e2e/attempt-1/`。
+- **實機冷啟動焦點驗證通過（attempt-2）**：兩次乾淨冷啟動中 managed Chrome 從未成為 frontmost（run-2 frontmost 基準完全不變；run-3 Chrome ASN 從未出現在 frontmost 取樣）、`isHidden=true`／`isActive=false`、`onscreen_chrome_windows=0`；reuse 路徑 60 個取樣亦未出現 Chrome。attempt-1 的失敗（`open -g -j` 後 Chrome 於 +0.46 秒成為 frontmost）已由 `--no-startup-window` 修正。
+- AppleScript 備援語法錯誤已修正（`whose unix id is <PID>`；先前的 `whose unix id <PID>` 會讓 osascript 回報 -2740），語法檢查 exit 0。
+- 證據：`yt_down_txt/.agent/tasks/T20260929-1601-01-chrome-background-focus/e2e/attempt-2/`（run-2／run-3 冷啟動 + reuse；attempt-1 失敗證據保留於同層 attempt-1/）。
 
 ---
 

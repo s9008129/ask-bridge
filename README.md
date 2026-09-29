@@ -276,9 +276,9 @@ receipt，再以最佳努力關閉 reasoning 選單（清理失敗只輸出警�
 ### 4. Headless 模式
 
 一般提問預設使用 headless Chrome，也就是 `--headless=true`。macOS 冷啟動時會以
-LaunchServices（`open -g -j -n`）嘗試隱藏啟動，失敗時 fail-closed；若 Chrome 已在
-debug port 上執行則直接重用。⚠️ 實機驗證（2026-09-29）**尚未通過**：Chrome 仍會在
-啟動後被帶到前景，修正待續。
+LaunchServices（`open -g -j -n` 加 `--no-startup-window`）隱藏啟動，失敗時 fail-closed；
+若 Chrome 已在 debug port 上執行則直接重用。實機驗證（2026-09-29 attempt-2）**通過**：
+冷啟動與 reuse 都不會把 Chrome 帶到前景，且不會出現可見的 Chrome 視窗。
 
 `--headless` 只控制「Chrome 可不可見」，分頁的前景／背景是另一條契約：自動化分頁以
 CDP `background: true` 建立。預設會沿用歷史行為（headless 時分頁走背景），需要明確

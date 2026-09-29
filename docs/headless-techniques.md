@@ -38,7 +38,7 @@ AppleScript `set visible ... to false` 補救。這條路徑有兩個結構性�
 
 ```mermaid
 graph TD
-    A["冷啟動（debug port 無 listener）"] -->|"macOS：open -g -j -n -a Chrome.app"| B["Chrome 實例誕生（目標不 activate；2026-09-29 實機驗證未通過）"]
+    A["冷啟動（debug port 無 listener）"] -->|"macOS：open -g -j -n -a Chrome.app"| B["Chrome 實例誕生（--no-startup-window；不 activate，2026-09-29 實機驗證通過）"]
     B -->|"LaunchServices 失敗"| X[fail-closed：回報錯誤，不改走會搶前景的直 spawn]
     B -->|"best-effort fallback"| C["osascript 隱藏迴圈（需 Automation 權限）"]
     F["MCP 工具 select_page"] -->|"bringToFront: !background_tab"| G[背景默默互動]
@@ -57,22 +57,28 @@ open -g -j -n -a "/Applications/Google Chrome.app" --stdout /dev/null --stderr /
   --args --remote-debugging-port=9223 --user-data-dir=<profile> --ask-bridge-instance \
          --no-first-run --no-default-browser-check --ask-bridge-background \
          --disable-blink-features=AutomationControlled --window-size=1440,1200 \
-         --window-position=-2000,-2000
+         --window-position=-2000,-2000 --no-startup-window
 ```
 
 - `-g`：不要 bring to foreground（不 activate）。
 - `-j`：以 hidden 狀態啟動應用程式。
 - `-n`：即使 Chrome 已在執行也開新實例（維持原本的 profile 隔離語意）。
+- `--no-startup-window`：冷啟動不建立初始瀏覽器視窗。這是關鍵一步：Chrome 在建立
+  啟動視窗時會自我 activate（`open -g -j` 擋不住，attempt-1 已實測）；不建立視窗就不會
+  activate，自動化分頁之後由 CDP 以 `background: true` 建立。
 
 `start_chrome_if_needed` 會檢查 `open` 的退出狀態；**失敗時直接回報錯誤，不會退回會搶
 前景的直 spawn**（fail-closed）。`open` 會立即退出且不回報瀏覽器 PID，因此後續改由
 debug port 的 listener 反查真正的 Chrome PID。
 
-> ⚠️ **2026-09-29 實機驗證未通過**：使用此機制仍觀察到 managed Chrome 在啟動後約
-> 0.5 秒成為 frontmost app（維持約 4.6 秒後才交還焦點）；`open -g -j` 的 activate 抑制
-> 在本機環境（macOS 27.0 / Chrome 154）未生效。另有兩點待修：下方的 AppleScript
-> 備援因語法錯誤（`whose unix id <PID>` 缺少 `is`，osascript 回報 -2740）全數失敗，
-> 等同無效備援；實測時環境中另有其他 Chrome 實例，需在乾淨環境重驗。
+> ✅ **2026-09-29 實機驗證通過（attempt-2）**：`open -g -j -n` 本身不足以阻止 Chrome
+> 在建立啟動視窗時自我 activate（attempt-1 於 +0.46 秒成為 frontmost、維持約 4.6 秒）。
+> 補上 `--no-startup-window` 後，Chrome 冷啟動不建立任何視窗，isolated tab 之後由 CDP
+> `background: true` 建立：連續兩次乾淨冷啟動取樣（run-2：frontmost 完全不變；run-3：
+> Chrome ASN 從未成為 frontmost）＋ `isHidden=true`／`isActive=false` ＋
+> `onscreen_chrome_windows=0`。AppleScript fallback 的 `whose unix id` 語法錯誤
+> （-2740）亦已修正為 `whose unix id is`。證據：
+> `yt_down_txt/.agent/tasks/T20260929-1601-01-chrome-background-focus/e2e/attempt-2/`。
 
 ### 技術一之一：AppleScript 隱藏迴圈（best-effort fallback）
 
@@ -171,8 +177,8 @@ call_mcp_tool(
 2. **精準 PID 隔離的 AppleScript 備援隱藏（僅在 `System Events` 權限可用時生效）**
 3. **可見性（`--headless`）與分頁前景／背景（`--background-tab`）解耦，取消 DevTools `bringToFront` 前景調用**
 
-本方案的目標是解決有介面 Chrome 做背景自動化時的視覺困擾，並讓首次啟動不再依賴
-「延遲補救」。整合端可透過 `background_isolated_tab_v1` 與 `background_launch_isolation_v1`
-兩個能力宣告，在送出工作前以 fail-closed 方式檢查這條「不得搶前景」契約；⚠️ 但
-`background_launch_isolation_v1` 宣稱的冷啟動行為在 2026-09-29 實機驗證未通過
-（Chrome 仍會被帶到前景），修正完成前請將冷啟動視為可能搶前景。
+本方案已在 2026-09-29 通過實機驗證（attempt-2；`--no-startup-window` + CDP 背景分頁 +
+AppleScript 備援語法修正）：冷啟動與 reuse 兩條路徑的 managed Chrome 都未成為
+frontmost，且沒有任何 onscreen Chrome 視窗。整合端可透過 `background_isolated_tab_v1`
+與 `background_launch_isolation_v1` 兩個能力宣告，在送出工作前以 fail-closed 方式檢查
+這條「不得搶前景」契約。

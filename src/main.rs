@@ -2700,7 +2700,7 @@ fn background_chrome_launch_plan(
 #[cfg(target_os = "macos")]
 fn hide_chrome_process(pid: &str) {
     let script = format!(
-        "tell application \"System Events\" to try\nset visible of first application process whose unix id {} to false\nend try",
+        "tell application \"System Events\" to try\nset visible of first application process whose unix id is {} to false\nend try",
         pid
     );
     let _ = Command::new("osascript").arg("-e").arg(&script).status();
@@ -2810,6 +2810,12 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         chrome_args.push("--disable-blink-features=AutomationControlled".to_string());
         chrome_args.push("--window-size=1440,1200".to_string());
         chrome_args.push("--window-position=-2000,-2000".to_string());
+        // macOS: starting without an initial browser window is what keeps the
+        // freshly launched Chrome from activating itself.  Chrome creates the
+        // startup window (and activates) even under `open -g -j`; the isolated
+        // tab is created afterwards through CDP with `background: true`.
+        #[cfg(target_os = "macos")]
+        chrome_args.push("--no-startup-window".to_string());
     }
 
     #[cfg(target_os = "macos")]
