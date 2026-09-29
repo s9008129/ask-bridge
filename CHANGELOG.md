@@ -14,12 +14,21 @@
 - 修正 macOS 冷啟動 managed Chrome 的搶前景問題：不再以 `Command::spawn` 直接啟動 Chrome 執行檔（此舉會觸發 macOS app activation，使 Chrome 成為 frontmost app），改以 LaunchServices `open -g -j -n -a` 搭配 `--no-startup-window` 隱藏啟動；`open` 失敗時直接回報錯誤，**不會**退回會搶前景的直 spawn。
 - 修正「先啟動、後以 AppleScript 隱藏」的延遲補救鏈：AppleScript 隱藏迴圈降級為有界的 best-effort fallback（依賴 `System Events` Automation 權限），並改由 debug port 反查真正的 Chrome PID（`open` 不回報 child PID）。
 - 修正分頁層級的 activate 風險：`select_page` 的 `bringToFront` 與 `new_page` 的 `background` 改由 `--background-tab` 驅動，而非隱式綁定 `--headless`。
+- 修正 ChatGPT 登入偵測在「已登入」頁面誤判為 `Unknown` 的問題：`login_signals_js()` 的帳號選單探測原本取「第一個符合元素」，會被頁面上 0×0 的隱藏複製品（例如 `button[aria-label*="個人檔案"]`）鎖住，導致 `account=false`；`ask-bridge login --provider chatgpt` 因此每輪都判 `Unknown`，一路空等到 `--timeout`（CLI 預設 300 秒、GUI 900 秒）後失敗，`session-probe --json` 也回報 `authenticated=false, state=unknown`。現改為在既有 selector 清單中取「第一個可見」的符合元素（`firstVisible`），並保留原本的 selector 優先順序；同一個 probe 內的 composer 診斷訊號一併改用同一策略。
+- 補齊對應測試：Rust 端新增 `chatgpt_login_signals_prefer_the_visible_account_control`；Node DOM contract fixture 新增 `ChatGPT login signals read the visible account control, not hidden duplicates`，以 headless Chrome 驗證「隱藏複製品在前、可見元件在後 → `account=true`」、「只有隱藏複製品 → `account=false`」與「可見登入鈕＋隱藏複製品 → `auth_control=true`」。
 
 ### ⚠️ 驗證狀態 (2026-09-29)
 - 離線測試通過：`cargo fmt --all -- --check`、`cargo test`（131 passed）、`cargo build --release`、capabilities payload 檢查。
 - **實機冷啟動焦點驗證通過（attempt-2）**：兩次乾淨冷啟動中 managed Chrome 從未成為 frontmost（run-2 frontmost 基準完全不變；run-3 Chrome ASN 從未出現在 frontmost 取樣）、`isHidden=true`／`isActive=false`、`onscreen_chrome_windows=0`；reuse 路徑 60 個取樣亦未出現 Chrome。attempt-1 的失敗（`open -g -j` 後 Chrome 於 +0.46 秒成為 frontmost）已由 `--no-startup-window` 修正。
 - AppleScript 備援語法錯誤已修正（`whose unix id is <PID>`；先前的 `whose unix id <PID>` 會讓 osascript 回報 -2740），語法檢查 exit 0。
 - 證據：`yt_down_txt/.agent/tasks/T20260929-1601-01-chrome-background-focus/e2e/attempt-2/`（run-2／run-3 冷啟動 + reuse；attempt-1 失敗證據保留於同層 attempt-1/）。
+
+### ⚠️ 登入偵測修復驗證 (2026-09-29)
+- 修復後離線測試：`cargo fmt --all -- --check`、`cargo test`（132 passed）、`npm test`（20 passed）、`cargo build --release` 全數通過；`cargo clippy --all-targets` 僅有 8 個既有 warning（與修復前相同，未新增）。
+- **實機登入按鈕流程 E2E 通過**：managed Chrome（CDP 9223）已登入 ChatGPT，`ask-bridge login --provider chatgpt` 於 2 秒內印出 `Success: Logged in successfully!`（修復前會空等至 300 秒逾時），`--verbose` 訊號為 `account=true, auth_control=false, auth_path=false, composer=true`；後續 `ask-bridge session-probe --provider chatgpt --json` 回 `{"authenticated":true,"provider":"chatgpt","state":"logged_in"}`（exit 0）。
+- 應用層按鈕路徑（`media_toolbox.chatgpt.ask_bridge_adapter.AskBridgeAdapter.start_login`）E2E 通過：`status=success`、`message=ChatGPT 登入完成，唯讀 session probe 已確認`、`retry_safety=safe`，耗時 3.45 秒。
+- 焦點契約未回歸：驗證期間 managed Chrome 的 `System Events visible=false`，從未成為 frontmost app。
+- 反向證據（離線 fixture）：只有隱藏 profile 複製品時 `account=false`、`stable=true`；頁面存在可見「登入」按鈕時 `auth_control=true` 且 `account=false`。
 
 ---
 

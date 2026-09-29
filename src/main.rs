@@ -201,6 +201,15 @@ impl Provider {
                         el.textContent
                     ].filter(Boolean).join(' ').trim();
 
+                    const firstVisible = (selectors) => {
+                        for (const selector of selectors) {
+                            const match = Array.from(document.querySelectorAll(selector))
+                                .find((candidate) => isVisible(candidate));
+                            if (match) return match;
+                        }
+                        return null;
+                    };
+
                     const readSignals = () => {
                         const visibleAuthButton = Array.from(document.querySelectorAll('a, button'))
                             .some((el) => {
@@ -209,25 +218,29 @@ impl Provider {
                                 return /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册)$/i.test(text);
                             });
 
-                        const composer = document.querySelector('#prompt-textarea') ||
-                            document.querySelector('[data-testid="composer-text-input"]') ||
-                            document.querySelector('textarea[placeholder*="Message"]') ||
-                            document.querySelector('textarea[placeholder*="訊息"]') ||
-                            document.querySelector('[contenteditable="true"]');
+                        const composer = firstVisible([
+                            '#prompt-textarea',
+                            '[data-testid="composer-text-input"]',
+                            'textarea[placeholder*="Message"]',
+                            'textarea[placeholder*="訊息"]',
+                            '[contenteditable="true"]'
+                        ]);
 
-                        const accountMenu = document.querySelector('[data-testid="profile-button"]') ||
-                            document.querySelector('[data-testid="account-menu-button"]') ||
-                            document.querySelector('[data-testid="user-menu-button"]') ||
-                            document.querySelector('button[aria-label*="Profile"]') ||
-                            document.querySelector('button[aria-label*="profile"]') ||
-                            document.querySelector('button[aria-label*="Account"]') ||
-                            document.querySelector('button[aria-label*="account"]') ||
-                            document.querySelector('button[aria-label*="User"]') ||
-                            document.querySelector('button[aria-label*="user"]') ||
-                            document.querySelector('button[aria-label*="帳戶"]') ||
-                            document.querySelector('button[aria-label*="個人檔案"]') ||
-                            document.querySelector('button[aria-label*="使用者"]') ||
-                            document.querySelector('button[aria-label*="設定檔"]');
+                        const accountMenu = firstVisible([
+                            '[data-testid="profile-button"]',
+                            '[data-testid="account-menu-button"]',
+                            '[data-testid="user-menu-button"]',
+                            'button[aria-label*="Profile"]',
+                            'button[aria-label*="profile"]',
+                            'button[aria-label*="Account"]',
+                            'button[aria-label*="account"]',
+                            'button[aria-label*="User"]',
+                            'button[aria-label*="user"]',
+                            'button[aria-label*="帳戶"]',
+                            'button[aria-label*="個人檔案"]',
+                            'button[aria-label*="使用者"]',
+                            'button[aria-label*="設定檔"]'
+                        ]);
 
                         return {
                             account: isVisible(accountMenu),
@@ -7380,6 +7393,20 @@ mod tests {
         assert!(script.contains("await new Promise"));
         assert!(script.contains("Date.now() + 5000"));
         assert!(script.contains("return { ...signals, stable }"));
+    }
+
+    #[test]
+    fn chatgpt_login_signals_prefer_the_visible_account_control() {
+        let script = Provider::ChatGpt.login_signals_js();
+
+        assert!(script.contains("const firstVisible = (selectors) =>"));
+        assert!(script.contains("const composer = firstVisible(["));
+        assert!(script.contains("const accountMenu = firstVisible(["));
+        assert!(script.contains("'button[aria-label*=\"個人檔案\"]'"));
+        assert!(
+            !script.contains("document.querySelector('button[aria-label*=\"個人檔案\"]')"),
+            "the account probe must not lock onto the first matching element, because ChatGPT renders hidden duplicates"
+        );
     }
 
     #[test]

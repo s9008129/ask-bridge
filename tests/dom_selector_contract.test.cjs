@@ -535,6 +535,78 @@ test('ChatGPT reasoning control reports a root-only lock marker without failing 
   });
 });
 
+const extractChatGptLoginSignals = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const functionStart = source.indexOf("fn login_signals_js(self) -> &'static str {");
+  assert.ok(functionStart >= 0, 'login_signals_js must exist');
+  const chatGptArm = source.indexOf('Provider::ChatGpt => {', functionStart);
+  assert.ok(chatGptArm >= 0, 'the ChatGPT login signals arm must exist');
+  const scriptStart = source.indexOf('r#"', chatGptArm);
+  const scriptEnd = source.indexOf('"#', scriptStart + 3);
+  assert.ok(
+    scriptStart >= 0 && scriptEnd > scriptStart,
+    'the ChatGPT login signals must stay in a Rust raw string',
+  );
+  const script = source.slice(scriptStart + 3, scriptEnd);
+  assert.ok(
+    script.startsWith('async () => {'),
+    'the extracted ChatGPT login signals must be the async probe',
+  );
+  return script;
+};
+
+const renderLoginSignals = (markup, budgetMs = 8000) => {
+  const fixture = `<!doctype html>
+    <main id="fixture">${markup}</main>
+    <pre id="result"></pre>
+    <script>
+      const loginSignals = ${extractChatGptLoginSignals()};
+      loginSignals().then((signals) => {
+        document.querySelector('#result').textContent = JSON.stringify(signals);
+      });
+    </script>`;
+  const url = `data:text/html;charset=utf-8,${encodeURIComponent(fixture)}`;
+  const rendered = execFileSync(
+    chrome,
+    [
+      '--headless=new',
+      '--disable-gpu',
+      '--no-sandbox',
+      `--virtual-time-budget=${budgetMs}`,
+      '--dump-dom',
+      url,
+    ],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 },
+  );
+  const encoded = rendered.match(/<pre id="result">([^<]*)<\/pre>/)?.[1];
+  assert.ok(encoded, 'the headless login signals fixture did not return a result');
+  return JSON.parse(encoded);
+};
+
+test('ChatGPT login signals read the visible account control, not hidden duplicates', { skip: !chrome }, () => {
+  const loggedIn = renderLoginSignals(`
+    <button aria-label="開啟個人檔案選單" style="display:none">hidden</button>
+    <button aria-label="開啟個人檔案選單" style="width:0;height:0;padding:0;border:0;overflow:hidden">zero-size</button>
+    <button aria-label="開啟個人檔案選單">visible</button>`);
+
+  assert.equal(loggedIn.account, true, 'a visible profile control must report the account signal');
+  assert.equal(loggedIn.auth_control, false, 'a logged-in shell must not expose a visible sign-in control');
+
+  const hiddenOnly = renderLoginSignals(`
+    <button aria-label="開啟個人檔案選單" style="display:none">hidden</button>
+    <button aria-label="開啟個人檔案選單" style="width:0;height:0;padding:0;border:0;overflow:hidden">zero-size</button>`);
+
+  assert.equal(hiddenOnly.account, false, 'hidden duplicates must never be reported as a logged-in account');
+  assert.equal(hiddenOnly.stable, true, 'an unambiguous shell must settle before it is reported');
+
+  const loggedOut = renderLoginSignals(`
+    <button aria-label="開啟個人檔案選單" style="display:none">hidden</button>
+    <button>登入</button>`);
+
+  assert.equal(loggedOut.account, false, 'hidden duplicates must not mask a visible sign-in control');
+  assert.equal(loggedOut.auth_control, true, 'the localized sign-in control must stay detectable');
+});
+
 const chatGptCopySelectorSource = () =>
   readFileSync(join(repoRoot, 'src', 'chatgpt_copy_button_selector.js'), 'utf8');
 
