@@ -233,7 +233,16 @@ ask-bridge capabilities --json
 
 安全附件工作至少需要 `isolated_new_tab_v1` 與 `verified_file_upload_v1`；要求
 生成圖片並下載的整合工具還必須檢查
-`verified_image_response_completion_v1`。登入後可用唯讀
+`verified_image_response_completion_v1`。不得搶佔使用者前景焦點的自動化工作還必須
+檢查 `background_isolated_tab_v1`，且 payload 必須是
+`new_page_background=headless`、`foreground=visible`、
+`scope=isolated-new-tab-only`；若 payload 同時宣告
+`new_page_background_flag`（本版為 `--background-tab`），整合工具應以
+`<flag>=true` 明確要求背景分頁，而不是依賴 `--headless` 的隱式綁定。冷啟動
+（debug port 尚無 listener）也不能搶前景時，再加驗
+`background_launch_isolation_v1`，payload 必須是
+`launch_activation=suppressed`、`launch_visibility=hidden`；未宣告此能力代表
+冷啟動可能短暫把 Chrome 帶到前景，整合工具應自行決定警告或停止。登入後可用唯讀
 session probe 驗證目前登入狀態，不會送出 prompt：
 
 ```bash
@@ -266,7 +275,15 @@ receipt，再以最佳努力關閉 reasoning 選單（清理失敗只輸出警�
 
 ### 4. Headless 模式
 
-一般提問預設使用 headless Chrome，也就是 `--headless=true`。Chrome 會在背景執行，不會搶走焦點或跳出視窗。
+一般提問預設使用 headless Chrome，也就是 `--headless=true`。macOS 冷啟動時會以
+LaunchServices（`open -g -j -n`）嘗試隱藏啟動，失敗時 fail-closed；若 Chrome 已在
+debug port 上執行則直接重用。⚠️ 實機驗證（2026-09-29）**尚未通過**：Chrome 仍會在
+啟動後被帶到前景，修正待續。
+
+`--headless` 只控制「Chrome 可不可見」，分頁的前景／背景是另一條契約：自動化分頁以
+CDP `background: true` 建立。預設會沿用歷史行為（headless 時分頁走背景），需要明確
+指定時可用 `--background-tab[=<bool>]`，例如
+`ask-bridge "整理這段文字" --headless=true --background-tab=true`。
 
 若想觀察 Chrome 的操作過程，或需要手動檢查頁面狀態，可改用 headful 模式：
 

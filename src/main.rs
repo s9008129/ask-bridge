@@ -30,6 +30,7 @@ const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
 const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
+const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
@@ -522,6 +523,13 @@ struct Cli {
     /// Run Chrome in headless mode. Defaults to true.
     #[arg(long, require_equals = true, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     headless: bool,
+
+    /// Open isolated provider tabs in the background without bringing them to
+    /// the front. Defaults to the value of --headless; this flag decouples
+    /// "Chrome hidden" from "tab in background" so the two contracts stay
+    /// explicit.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true")]
+    background_tab: Option<bool>,
 
     /// Create a brand new provider session by opening a new tab and closing old ones.
     /// This is retained for backwards compatibility and is destructive.
@@ -1732,6 +1740,7 @@ fn capabilities_value() -> Value {
         "capabilities": [
             ISOLATED_NEW_TAB_CAPABILITY,
             BACKGROUND_ISOLATED_TAB_CAPABILITY,
+            BACKGROUND_LAUNCH_ISOLATION_CAPABILITY,
             VERIFIED_FILE_UPLOAD_CAPABILITY,
             VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
             VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
@@ -1752,8 +1761,17 @@ fn capabilities_value() -> Value {
         },
         "background_isolated_tab_v1": {
             "new_page_background": "headless",
+            "new_page_background_flag": "--background-tab",
             "foreground": "visible",
             "scope": "isolated-new-tab-only"
+        },
+        "background_launch_isolation_v1": {
+            "launch_activation": "suppressed",
+            "launch_visibility": "hidden",
+            "mechanism": "macos-launchservices-open-gj",
+            "applies_when": "headless=true",
+            "scope": "cold-start-only",
+            "fallback": "bounded-poll-and-hide-ask-bridge-chrome-pids"
         },
         "verified_file_upload_v1": {
             "verification": "filename-multiset-stable-dom-probe",
@@ -2619,6 +2637,100 @@ fn find_chrome_path() -> Result<String, String> {
     }
 }
 
+/// Resolve the `.app` bundle that contains `chrome_path`.
+///
+/// macOS LaunchServices (`open -a`) needs the bundle path, not the executable
+/// inside `Contents/MacOS`.
+fn chrome_app_bundle_path(chrome_path: &str) -> Result<String, String> {
+    for ancestor in Path::new(chrome_path).ancestors() {
+        if ancestor
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+        {
+            return Ok(ancestor.to_string_lossy().to_string());
+        }
+    }
+    Err(format!(
+        "Chrome executable '{}' is not inside a .app bundle",
+        chrome_path
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ChromeLaunchPlan {
+    program: String,
+    args: Vec<String>,
+}
+
+/// Build the macOS launch plan for a background Chrome instance.
+///
+/// A plain `Command::spawn` of the Chrome executable makes macOS activate the
+/// new Regular application: the window is ordered to the front and the app
+/// becomes frontmost before any asynchronous AppleScript hide can run.  The
+/// LaunchServices `open` tool is the supported way to start an application
+/// without that activation:
+///
+/// * `-g` do not bring the application to the foreground
+/// * `-j` launch the application hidden
+/// * `-n` start a new instance even if Chrome is already running
+fn background_chrome_launch_plan(
+    chrome_path: &str,
+    chrome_args: &[String],
+) -> Result<ChromeLaunchPlan, String> {
+    let bundle_path = chrome_app_bundle_path(chrome_path)?;
+    let mut args = vec![
+        "-g".to_string(),
+        "-j".to_string(),
+        "-n".to_string(),
+        "-a".to_string(),
+        bundle_path,
+        "--stdout".to_string(),
+        "/dev/null".to_string(),
+        "--stderr".to_string(),
+        "/dev/null".to_string(),
+        "--args".to_string(),
+    ];
+    args.extend(chrome_args.iter().cloned());
+    Ok(ChromeLaunchPlan {
+        program: "open".to_string(),
+        args,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn hide_chrome_process(pid: &str) {
+    let script = format!(
+        "tell application \"System Events\" to try\nset visible of first application process whose unix id {} to false\nend try",
+        pid
+    );
+    let _ = Command::new("osascript").arg("-e").arg(&script).status();
+}
+
+/// Bounded best-effort fallback for Chrome builds that still surface a window
+/// despite the hidden LaunchServices start.  The real browser PIDs are
+/// discovered on the debug port because `open` exits immediately and reports
+/// no child PID.
+#[cfg(target_os = "macos")]
+fn hide_ask_bridge_chrome_pids(profile_path: &str) {
+    let mut pids = Vec::new();
+    for _ in 0..30 {
+        pids = ask_chrome_pids_on_debug_port(profile_path);
+        if !pids.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if pids.is_empty() {
+        return;
+    }
+    for _ in 0..20 {
+        for pid in &pids {
+            hide_chrome_process(pid);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
 
@@ -2637,14 +2749,8 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
                 {
                     let pids = snapshot.ask_pids.clone();
                     thread::spawn(move || {
-                        for pid_str in pids {
-                            if let Ok(pid) = pid_str.parse::<u32>() {
-                                let script = format!(
-                                    "tell application \"System Events\" to set visible of first application process whose unix id is {} to false",
-                                    pid
-                                );
-                                let _ = Command::new("osascript").arg("-e").arg(&script).status();
-                            }
+                        for pid in &pids {
+                            hide_chrome_process(pid);
                         }
                     });
                 }
@@ -2691,61 +2797,91 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let chrome_path = find_chrome_path()?;
     let _ = remove_chrome_pid_file();
 
-    let mut cmd = Command::new(&chrome_path);
-    cmd.arg("--remote-debugging-port=9223")
-        .arg(format!("--user-data-dir={}", profile_path))
-        .arg(ASK_BRIDGE_CHROME_MARKER)
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
-
-    #[cfg(target_os = "windows")]
-    {
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
+    let mut chrome_args: Vec<String> = vec![
+        "--remote-debugging-port=9223".to_string(),
+        format!("--user-data-dir={}", profile_path),
+        ASK_BRIDGE_CHROME_MARKER.to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+    ];
 
     if headless {
-        cmd.arg("--ask-bridge-background")
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--window-size=1440,1200")
-            .arg("--window-position=-2000,-2000");
+        chrome_args.push("--ask-bridge-background".to_string());
+        chrome_args.push("--disable-blink-features=AutomationControlled".to_string());
+        chrome_args.push("--window-size=1440,1200".to_string());
+        chrome_args.push("--window-position=-2000,-2000".to_string());
     }
 
-    let child = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start Google Chrome: {}", e))?;
+    #[cfg(target_os = "macos")]
+    let launched_through_launchservices = headless;
+    #[cfg(not(target_os = "macos"))]
+    let launched_through_launchservices = false;
 
-    let child_pid = child.id();
+    let launcher_pid = if launched_through_launchservices {
+        // On macOS a plain spawn activates the new Chrome app and steals focus
+        // before the fallback AppleScript hide can run.  Background (headless)
+        // launches therefore go through LaunchServices `open -g -j -n`, which
+        // starts the instance hidden and without foreground activation.  A
+        // LaunchServices failure is reported instead of silently falling back
+        // to the focus-stealing direct spawn.
+        let plan = background_chrome_launch_plan(&chrome_path, &chrome_args)?;
+        let status = Command::new(&plan.program)
+            .args(&plan.args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Failed to launch Chrome via LaunchServices: {}", error))?;
+        if !status.success() {
+            return Err(format!(
+                "LaunchServices refused to start Chrome without foreground activation (open status {})",
+                status
+            ));
+        }
+        None
+    } else {
+        let mut cmd = Command::new(&chrome_path);
+        cmd.args(&chrome_args);
+        #[cfg(target_os = "windows")]
+        {
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start Google Chrome: {}", e))?;
+        Some(child.id())
+    };
 
     if verbose {
-        println!(
-            "Started ask-bridge Chrome PID {} with profile {}.",
-            child_pid, profile_path
-        );
+        match launcher_pid {
+            Some(pid) => println!(
+                "Started ask-bridge Chrome PID {} with profile {}.",
+                pid, profile_path
+            ),
+            None => println!(
+                "Requested hidden background Chrome via LaunchServices with profile {}.",
+                profile_path
+            ),
+        }
     }
 
     if headless {
         #[cfg(target_os = "macos")]
         {
-            let pid = child.id();
+            // Fallback only: `open -g -j` already starts the instance hidden,
+            // but keep hiding the real browser PIDs in case a Chrome build
+            // still surfaces a window.  `open` exits immediately, so the
+            // launcher PID is useless here; the debug-port owner PIDs are
+            // discovered instead.
+            let profile_for_hide = profile_path.clone();
             thread::spawn(move || {
-                // Rapidly set visibility to false during startup to prevent window from flashing or drawing
-                for _ in 0..40 {
-                    let script = format!(
-                        "tell application \"System Events\" to try\nset visible of first application process whose unix id is {} to false\nend try",
-                        pid
-                    );
-                    let _ = Command::new("osascript").arg("-e").arg(&script).status();
-                    thread::sleep(Duration::from_millis(50));
-                }
+                hide_ask_bridge_chrome_pids(&profile_for_hide);
             });
         }
     }
-
-    let _ = child; // Avoid unused variable warning on non-macOS platforms
 
     // Wait for Chrome to listen and prove that the listener belongs to this launch.
     let startup_deadline = Instant::now() + Duration::from_secs(15);
@@ -2762,11 +2898,15 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
                         error
                     ));
                 }
-                if verbose && record.pid != child_pid {
-                    println!(
-                        "Recorded actual Chrome listener PID {} (launcher PID {}).",
-                        record.pid, child_pid
-                    );
+                if verbose {
+                    match launcher_pid {
+                        Some(pid) if pid != record.pid => println!(
+                            "Recorded actual Chrome listener PID {} (launcher PID {}).",
+                            record.pid, pid
+                        ),
+                        Some(_) => {}
+                        None => println!("Recorded Chrome listener PID {}.", record.pid),
+                    }
                 }
                 if verbose {
                     println!("Chrome started and listening on port 9223.");
@@ -3790,6 +3930,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
         assert!(advertised.contains(&BACKGROUND_ISOLATED_TAB_CAPABILITY));
+        assert!(advertised.contains(&BACKGROUND_LAUNCH_ISOLATION_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
@@ -3811,6 +3952,22 @@ mod tests {
         assert_eq!(
             capabilities["background_isolated_tab_v1"]["scope"].as_str(),
             Some("isolated-new-tab-only")
+        );
+        assert_eq!(
+            capabilities["background_isolated_tab_v1"]["new_page_background_flag"].as_str(),
+            Some("--background-tab")
+        );
+        assert_eq!(
+            capabilities["background_launch_isolation_v1"]["launch_activation"].as_str(),
+            Some("suppressed")
+        );
+        assert_eq!(
+            capabilities["background_launch_isolation_v1"]["launch_visibility"].as_str(),
+            Some("hidden")
+        );
+        assert_eq!(
+            capabilities["background_launch_isolation_v1"]["scope"].as_str(),
+            Some("cold-start-only")
         );
         assert_eq!(
             capabilities["verified_file_upload_v1"]["verification"].as_str(),
@@ -3973,14 +4130,91 @@ mod tests {
     }
 
     #[test]
-    fn isolated_new_page_args_maps_headless_to_background() {
-        let headless = isolated_new_page_args("https://chatgpt.com/", true);
-        assert_eq!(headless["url"].as_str(), Some("https://chatgpt.com/"));
-        assert_eq!(headless["background"].as_bool(), Some(true));
+    fn isolated_new_page_args_maps_background_tab_to_cdp_background() {
+        let background = isolated_new_page_args("https://chatgpt.com/", true);
+        assert_eq!(background["url"].as_str(), Some("https://chatgpt.com/"));
+        assert_eq!(background["background"].as_bool(), Some(true));
 
-        let visible = isolated_new_page_args("https://chatgpt.com/", false);
-        assert_eq!(visible["url"].as_str(), Some("https://chatgpt.com/"));
-        assert_eq!(visible["background"].as_bool(), Some(false));
+        let foreground = isolated_new_page_args("https://chatgpt.com/", false);
+        assert_eq!(foreground["url"].as_str(), Some("https://chatgpt.com/"));
+        assert_eq!(foreground["background"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn background_tab_flag_decouples_tab_activation_from_headless() {
+        let cli = Cli::try_parse_from([
+            "ask-bridge",
+            "--background-tab=false",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(cli.background_tab, Some(false));
+        assert!(cli.headless, "visible Chrome is requested separately");
+
+        let defaulted = Cli::try_parse_from([
+            "ask-bridge",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(defaulted.background_tab, None);
+
+        let shorthand = Cli::try_parse_from([
+            "ask-bridge",
+            "--background-tab",
+            "--new-tab-preserve-existing",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000001",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(shorthand.background_tab, Some(true));
+    }
+
+    #[test]
+    fn background_chrome_launch_plan_uses_hidden_launchservices_start() {
+        let chrome_args = vec![
+            "--remote-debugging-port=9223".to_string(),
+            "--ask-bridge-background".to_string(),
+        ];
+        let plan = background_chrome_launch_plan(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            &chrome_args,
+        )
+        .expect("launch plan");
+        assert_eq!(plan.program, "open");
+        assert_eq!(
+            &plan.args[..8],
+            &[
+                "-g",
+                "-j",
+                "-n",
+                "-a",
+                "/Applications/Google Chrome.app",
+                "--stdout",
+                "/dev/null",
+                "--stderr",
+            ]
+        );
+        assert_eq!(
+            &plan.args[8..11],
+            &["/dev/null", "--args", "--remote-debugging-port=9223"]
+        );
+        assert_eq!(plan.args[11], "--ask-bridge-background");
+    }
+
+    #[test]
+    fn chrome_app_bundle_path_rejects_bare_executables() {
+        assert!(chrome_app_bundle_path("/usr/bin/google-chrome").is_err());
+        assert!(
+            chrome_app_bundle_path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -7631,7 +7865,7 @@ fn open_url_tab(
     config_path: &str,
     provider: Provider,
     url: &str,
-    headless: bool,
+    background_tab: bool,
     verbose: bool,
 ) -> Result<(), String> {
     if verbose {
@@ -7665,7 +7899,8 @@ fn open_url_tab(
             config_path,
             "new_page",
             serde_json::json!({
-                "url": url
+                "url": url,
+                "background": background_tab
             }),
         )?;
     }
@@ -7692,7 +7927,7 @@ fn open_url_tab(
                 "select_page",
                 serde_json::json!({
                     "pageId": page.id,
-                    "bringToFront": !headless
+                    "bringToFront": !background_tab
                 }),
             )?;
 
@@ -11733,12 +11968,14 @@ fn list_pages(config_path: &str) -> Result<Vec<Page>, String> {
 
 /// Build the `new_page` args for the safe isolated new-tab path.
 ///
-/// Headless mode opens the tab in the background so Chrome does not steal
-/// macOS foreground focus; visible mode opens it in the foreground.
-fn isolated_new_page_args(url: &str, headless: bool) -> Value {
+/// `background_tab` is the tab-level foreground/background contract and is
+/// deliberately independent from the Chrome instance visibility
+/// (`--headless`).  A background tab is created through CDP with
+/// `background: true`, so the new target is never activated.
+fn isolated_new_page_args(url: &str, background_tab: bool) -> Value {
     serde_json::json!({
         "url": url,
-        "background": headless
+        "background": background_tab
     })
 }
 
@@ -11748,7 +11985,7 @@ fn ensure_isolated_provider_tab(
     session_id: &str,
     attachment_summary: &AttachmentSummary,
     expected_output_type: ExpectedOutputType,
-    headless: bool,
+    background_tab: bool,
     verbose: bool,
 ) -> Result<PathBuf, String> {
     let session_id = validate_session_id(session_id)?;
@@ -11769,7 +12006,7 @@ fn ensure_isolated_provider_tab(
     call_mcp_tool_raw(
         config_path,
         "new_page",
-        isolated_new_page_args(&provider.home_url(), headless),
+        isolated_new_page_args(&provider.home_url(), background_tab),
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -11808,7 +12045,7 @@ fn ensure_isolated_provider_tab(
             "select_page",
             serde_json::json!({
                 "pageId": page_id,
-                "bringToFront": !headless
+                "bringToFront": !background_tab
             }),
         )?;
         bind_owned_page(&session_id, page_id)?;
@@ -11840,7 +12077,7 @@ fn ensure_provider_tab(
     config_path: &str,
     provider: Provider,
     force_new: bool,
-    headless: bool,
+    background_tab: bool,
     verbose: bool,
 ) -> Result<(), String> {
     if verbose {
@@ -11872,7 +12109,8 @@ fn ensure_provider_tab(
             config_path,
             "new_page",
             serde_json::json!({
-                "url": provider.home_url()
+                "url": provider.home_url(),
+                "background": background_tab
             }),
         )?;
 
@@ -11921,7 +12159,7 @@ fn ensure_provider_tab(
                 "select_page",
                 serde_json::json!({
                     "pageId": page.id,
-                    "bringToFront": !headless
+                    "bringToFront": !background_tab
                 }),
             )?;
 
@@ -11987,7 +12225,7 @@ fn ensure_provider_tab(
                     "select_page",
                     serde_json::json!({
                         "pageId": page.id,
-                        "bringToFront": !headless
+                        "bringToFront": !background_tab
                     }),
                 )?;
             }
@@ -12019,7 +12257,8 @@ fn ensure_provider_tab(
                         config_path,
                         "new_page",
                         serde_json::json!({
-                            "url": provider.home_url()
+                            "url": provider.home_url(),
+                            "background": background_tab
                         }),
                     )?;
                 }
@@ -12054,7 +12293,7 @@ fn ensure_provider_tab(
                     "select_page",
                     serde_json::json!({
                         "pageId": page.id,
-                        "bringToFront": !headless
+                        "bringToFront": !background_tab
                     }),
                 );
             }
@@ -12406,6 +12645,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => cli.headless, // Respect --headless (defaults to true) for all other commands (including Open)
     };
 
+    // Visible (Chrome window) and foreground/background (new provider tab) are
+    // separate contracts: `--headless` controls the Chrome instance, while
+    // `--background-tab` controls whether isolated provider tabs are created
+    // without activation.  The default keeps the historical coupling
+    // (background tabs whenever Chrome runs headless).
+    let background_tab = cli.background_tab.unwrap_or(is_headless);
+
     if matches!(cli.command, Some(Commands::Close)) {
         let profile_path = match chrome_profile_path() {
             Ok(path) => path,
@@ -12454,7 +12700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &config_path,
                         page_provider,
                         &url,
-                        is_headless,
+                        background_tab,
                         command_verbose,
                     ) {
                         eprintln!("Error opening URL: {}", e);
@@ -12504,7 +12750,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &config_path,
                         provider,
                         false,
-                        is_headless,
+                        background_tab,
                         command_verbose,
                     ) {
                         eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
@@ -12522,7 +12768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &config_path,
                         page_provider,
                         &url,
-                        is_headless,
+                        background_tab,
                         command_verbose,
                     ) {
                         eprintln!("Error opening URL: {}", e);
@@ -12533,7 +12779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &config_path,
                         provider,
                         false,
-                        is_headless,
+                        background_tab,
                         command_verbose,
                     ) {
                         eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
@@ -12582,9 +12828,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Login => {
-                if let Err(e) =
-                    ensure_provider_tab(&config_path, provider, false, is_headless, command_verbose)
-                {
+                if let Err(e) = ensure_provider_tab(
+                    &config_path,
+                    provider,
+                    false,
+                    background_tab,
+                    command_verbose,
+                ) {
                     eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
@@ -12627,7 +12877,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Provider::Claude => "claude",
                 };
                 let (authenticated, state) =
-                    match ensure_provider_tab(&config_path, provider, false, is_headless, false) {
+                    match ensure_provider_tab(&config_path, provider, false, background_tab, false)
+                    {
                         Ok(()) => match check_login_status(&config_path, provider, false) {
                             Ok(LoginState::LoggedIn) => (true, "logged_in"),
                             Ok(LoginState::LoggedOut) => (false, "logged_out"),
@@ -12667,9 +12918,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Commands::Dump => {
                 let list_res = call_mcp_tool(&config_path, "list_pages", serde_json::json!({}))?;
                 println!("All pages: {:?}", list_res);
-                if let Err(e) =
-                    ensure_provider_tab(&config_path, provider, false, is_headless, command_verbose)
-                {
+                if let Err(e) = ensure_provider_tab(
+                    &config_path,
+                    provider,
+                    false,
+                    background_tab,
+                    command_verbose,
+                ) {
                     eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
@@ -12698,9 +12953,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Commands::Screenshot => {
-                if let Err(e) =
-                    ensure_provider_tab(&config_path, provider, false, is_headless, command_verbose)
-                {
+                if let Err(e) = ensure_provider_tab(
+                    &config_path,
+                    provider,
+                    false,
+                    background_tab,
+                    command_verbose,
+                ) {
                     eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
@@ -12790,7 +13049,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             &attachment_summary,
             expected_output_type,
-            is_headless,
+            background_tab,
             command_verbose,
         ) {
             Ok(path) => Some(path),
@@ -12804,7 +13063,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config_path,
             provider,
             cli.new,
-            is_headless,
+            background_tab,
             command_verbose,
         ) {
             eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);

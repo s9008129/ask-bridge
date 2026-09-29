@@ -164,6 +164,7 @@ prompt + "\n\n" + stdin
 | `[PROMPT]` | 要送給 provider 的文字 prompt | 可省略；若 stdin 有內容則使用 stdin；若兩者都有，會以兩個換行串接 |
 | `-p`, `--provider <PROVIDER>` | 選擇 provider | 可用 `chatgpt`、`gemini` 或 `claude`；此為 global option，可放在子命令前後；優先權高於全域設定檔 |
 | `--headless[=<HEADLESS>]` | 控制 Chrome 是否 headless | 預設 `true`；要顯示瀏覽器請用 `--headless=false`；不要寫成 `--headless false` |
+| `--background-tab[=<BOOL>]` | 控制自動化分頁是否以背景建立 | 預設沿用 `--headless` 的值；`--background-tab=true` 可明確要求分頁不 activate、不搶前景 |
 | `--new` | 開啟全新 provider 對話 | 會開新分頁並清理同 provider 舊分頁；用於隔離上下文 |
 | `-v`, `-V`, `--version` | 顯示版本 | `-V` 是原始碼中定義的短別名；文件與一般操作優先用 `-v` 或 `--version` |
 | `--verbose` | 顯示瀏覽器自動化流程 | 用於診斷 provider UI、登入、上傳、模型切換或等待回覆問題 |
@@ -310,7 +311,7 @@ ask-bridge --provider claude '證明這個數學問題。' --model Opus
 ask-bridge '請只根據本次輸入分析，不要沿用既有對話脈絡。' --new
 ```
 
-一般提問預設 `--headless=true`。需要觀察 Chrome 操作時使用：
+一般提問預設 `--headless=true`。macOS 冷啟動時會透過 LaunchServices（`open -g -j -n`）嘗試隱藏啟動，失敗時 fail-closed；⚠️ 實機驗證（2026-09-29）尚未通過：Chrome 仍會被帶到前景（修正待續）。需要觀察 Chrome 操作時使用：
 
 ```sh
 ask-bridge '請回覆 ok' --headless=false
