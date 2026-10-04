@@ -11,6 +11,8 @@
 - 新增 Rust 單元測試：CDP `background` 由 `background_tab` 決定、`--background-tab` 與 `--headless` 解耦、隱藏啟動計畫使用 `open -g -j -n`、非 `.app` 執行檔被拒絕，以及 capability payload 契約。
 - 新增 `verified_model_selection_v3`–`v6` capability 的 `control_bundle.marker_candidates`（`data-model-reasoning-effort-slider`、`data-reasoning-slider`）與 `control_bundle.role_evidence_scope`（`state_and_focus_owners`）：宣告推理強度 slider 的 marker 候選拼法與 role 證據判定範圍；既有 `marker` 欄位保留不變。
 - 版本推進至 `0.2.10-preserve.2`（`Cargo.toml`／`Cargo.lock` 同步；`package.json`、`install.sh`、`install.ps1`、`scripts/ask.sh` 維持 `0.2.10`）。
+- 登入流程新增 `background_login_launch_v1` 能力宣告（`launch_activation=suppressed`、`launch_visibility=visible`、`tab_creation=background`、`bring_to_front=false`、`reuse_reveal=unhide-without-activation`、`mechanism=macos-launchservices-open-g-no-startup-window`、`scope=login-only`）：登入視窗可見但絕不搶佔前景焦點，整合工具可據此把登入納入背景契約。
+- 版本推進至 `0.2.10-preserve.3`（`Cargo.toml`／`Cargo.lock` 同步；其餘版本檔沿用 `0.2.10-preserve.2` 的既有慣例，維持 `0.2.10`）。
 
 ### 🔧 修復 (Fixed)
 - 修正 macOS 冷啟動 managed Chrome 的搶前景問題：不再以 `Command::spawn` 直接啟動 Chrome 執行檔（此舉會觸發 macOS app activation，使 Chrome 成為 frontmost app），改以 LaunchServices `open -g -j -n -a` 搭配 `--no-startup-window` 隱藏啟動；`open` 失敗時直接回報錯誤，**不會**退回會搶前景的直 spawn。
@@ -23,6 +25,9 @@
 - 補齊對應測試：Node DOM contract 新增「現行 `data-reasoning-slider` menuitem bundle 可解析」、「state owner 為非 slider 互動元件仍 fail-closed」、「legacy marker 相容」、「巢狀新舊 marker 共存時 ambiguous fail-closed」與「roleless focusable owner」；Rust capability 斷言擴及 v3–v6。
 - 修正「第 2 個（含）以後的附件永遠上傳失敗」（GUI 對話框「ask-bridge 尚未確認附件完成，Prompt 未送出」，session receipt 收斂為 `ATTACHMENT_VERIFICATION_FAILED`）：舊路徑每個檔案都先點「新增檔案和更多內容」開選單再 `DOM.setFileInputFiles`；ChatGPT 收下第 1 個檔案後會把該按鈕留在 `aria-expanded="true"`、popover 已卸載的 phantom-open 狀態，下一個檔案的單次點擊因此變成「關閉」，永遠等不到選單（`Attachment menu did not open`，約 26 秒後 exit 1）。文件與圖片現在都直接對 composer 常駐的 hidden `input[type=file]`（`附加檔案`／`附加相片或影片`）設定檔案、完全不碰選單；選單只在 input 尚未掛載時作為 fallback，並改為冪等的有界重試（`ensureMenuOpen`，最多 4 次點擊）以跨越 phantom-open；ownership token 與「chip 出現才回報成功」的驗證契約不變。
 - 補齊對應測試：新增 `tests/chatgpt_upload_contract.test.cjs`（5 個測試：直接路徑不得點選單、document／image selector 契約、fallback 會重新查詢 input、phantom-open 下仍有界重試、input 缺失時回報 `File input unavailable`）。
+- 修正「登入 ChatGPT」會把 Chrome 拉到前景的問題（第一性原理：macOS 的「視窗可見」與「App 成為前景」是正交的，登入流程錯把它們耦合）。登入不再走 `Commands::Login => headful ⇒ 直接 spawn + background_tab=false` 的舊路徑，改為：LaunchServices `open -g -n -a`＋`--no-startup-window`（可見、非激活、失敗 fail-closed）、分頁一律以 CDP `background: true` 建立／`bringToFront=false`（可由顯式 `--background-tab=false` 覆寫），reuse 到先前被 headless 隱藏的實例時以 `System Events` 非激活式 unhide。自動化路徑的啟動契約與 `--headless` 直接 spawn 的除錯指令行為維持不變。
+- 修正非激活式 unhide 的靜默失效：原本 AppleScript 先把 process 存進變數再 `set visible of theVariable to true`，在現行 macOS 會無效果但 osascript 仍 exit 0（實機驗證：App 維持 `isHidden=true`，CLI 卻回報 reveal 成功）。改為 inline process 參照的 guard（`if not (visible of (first application process whose unix id is PID)) then set visible of (first application process whose unix id is PID) to true`），並在設定後以 ≤1 秒 bounded 輪詢確認 `visible=true`；仍失敗時大聲警告（改由 Dock／⌘-Tab 手動顯示），不再把靜默 no-op 當成功。
+- 補齊對應測試：`login_launch_plan_is_visible_but_never_activating`、`chrome_start_mode_and_background_tab_defaults_cover_login`、`reveal_script_unhides_without_activating`（含「不得使用 AppleScript 變數形式」回歸斷言）與 capability payload 斷言。
 
 ### ⚠️ 驗證狀態 (2026-09-29)
 - 離線測試通過：`cargo fmt --all -- --check`、`cargo test`（131 passed）、`cargo build --release`、capabilities payload 檢查。

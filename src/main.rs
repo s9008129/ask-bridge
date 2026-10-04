@@ -31,6 +31,7 @@ const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
+const BACKGROUND_LOGIN_LAUNCH_CAPABILITY: &str = "background_login_launch_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
@@ -1754,6 +1755,7 @@ fn capabilities_value() -> Value {
             ISOLATED_NEW_TAB_CAPABILITY,
             BACKGROUND_ISOLATED_TAB_CAPABILITY,
             BACKGROUND_LAUNCH_ISOLATION_CAPABILITY,
+            BACKGROUND_LOGIN_LAUNCH_CAPABILITY,
             VERIFIED_FILE_UPLOAD_CAPABILITY,
             VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
             VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
@@ -1785,6 +1787,16 @@ fn capabilities_value() -> Value {
             "applies_when": "headless=true",
             "scope": "cold-start-only",
             "fallback": "bounded-poll-and-hide-ask-bridge-chrome-pids"
+        },
+        "background_login_launch_v1": {
+            "launch_activation": "suppressed",
+            "launch_visibility": "visible",
+            "tab_creation": "background",
+            "bring_to_front": false,
+            "reuse_reveal": "unhide-without-activation",
+            "mechanism": "macos-launchservices-open-g-no-startup-window",
+            "applies_when": "command=login",
+            "scope": "login-only"
         },
         "verified_file_upload_v1": {
             "verification": "filename-multiset-stable-dom-probe",
@@ -2704,16 +2716,23 @@ struct ChromeLaunchPlan {
 /// without that activation:
 ///
 /// * `-g` do not bring the application to the foreground
-/// * `-j` launch the application hidden
+/// * `-j` launch the application hidden (`hidden = true`; headless automation)
 /// * `-n` start a new instance even if Chrome is already running
+///
+/// `hidden = false` keeps the app visible but still non-activating; the
+/// interactive login flow uses that mode so its window is ready for the user
+/// to switch to without stealing the current foreground focus.
 fn background_chrome_launch_plan(
     chrome_path: &str,
     chrome_args: &[String],
+    hidden: bool,
 ) -> Result<ChromeLaunchPlan, String> {
     let bundle_path = chrome_app_bundle_path(chrome_path)?;
-    let mut args = vec![
-        "-g".to_string(),
-        "-j".to_string(),
+    let mut args = vec!["-g".to_string()];
+    if hidden {
+        args.push("-j".to_string());
+    }
+    args.extend([
         "-n".to_string(),
         "-a".to_string(),
         bundle_path,
@@ -2722,12 +2741,67 @@ fn background_chrome_launch_plan(
         "--stderr".to_string(),
         "/dev/null".to_string(),
         "--args".to_string(),
-    ];
+    ]);
     args.extend(chrome_args.iter().cloned());
     Ok(ChromeLaunchPlan {
         program: "open".to_string(),
         args,
     })
+}
+
+/// How the Chrome instance for the current invocation should be started.
+///
+/// The three modes exist because "the window is visible to the user" and "the
+/// app is allowed to become the foreground app" are orthogonal on macOS: the
+/// interactive login flow needs the first without the second, while headless
+/// automation needs neither and headful debug commands keep the historical
+/// focus-following direct spawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChromeStartMode {
+    /// Headless automation: hidden app, launched without activation.
+    Hidden,
+    /// Interactive login: visible app, launched without activation.
+    VisibleNonActivating,
+    /// Headful debug commands (`dump`, `screenshot`, `get` without
+    /// `--headless`): keep the historical direct spawn.
+    Direct,
+}
+
+impl ChromeStartMode {
+    fn hides_instance(self) -> bool {
+        matches!(self, ChromeStartMode::Hidden)
+    }
+
+    /// True when the launch must be proven not to activate Chrome.
+    fn suppresses_activation(self) -> bool {
+        matches!(
+            self,
+            ChromeStartMode::Hidden | ChromeStartMode::VisibleNonActivating
+        )
+    }
+}
+
+fn chrome_start_mode(is_headless: bool, is_login: bool) -> ChromeStartMode {
+    if is_login {
+        ChromeStartMode::VisibleNonActivating
+    } else if is_headless {
+        ChromeStartMode::Hidden
+    } else {
+        ChromeStartMode::Direct
+    }
+}
+
+/// Default tab foreground contract for this invocation.
+///
+/// Headless automation and the interactive login flow both create their
+/// provider tab in the background; an explicit `--background-tab` (either
+/// value) still wins so the two contracts stay decoupled.
+fn resolve_background_tab(
+    cli_background_tab: Option<bool>,
+    is_headless: bool,
+    is_login: bool,
+) -> bool {
+    cli_background_tab.unwrap_or(is_headless || is_login)
 }
 
 #[cfg(target_os = "macos")]
@@ -2737,6 +2811,99 @@ fn hide_chrome_process(pid: &str) {
         pid
     );
     let _ = Command::new("osascript").arg("-e").arg(&script).status();
+}
+
+/// AppleScript that unhides the ask-bridge Chrome process without activating it.
+///
+/// The process is referenced inline (twice) on purpose: assigning it to an
+/// AppleScript variable and then writing `set visible of theVariable to true`
+/// silently no-ops on current macOS (osascript still exits 0, verified in
+/// T20261004-1930-01), which would leave the login window invisible while the
+/// CLI reports a successful reveal.
+#[cfg(target_os = "macos")]
+fn reveal_chrome_without_activation_script(pid: &str) -> String {
+    format!(
+        "tell application \"System Events\" to try\nif not (visible of (first application process whose unix id is {pid})) then set visible of (first application process whose unix id is {pid}) to true\nend try",
+        pid = pid
+    )
+}
+
+/// `Some(true)`/`Some(false)` when System Events can read the process's
+/// `visible` property, `None` when it cannot (e.g. the process disappeared).
+#[cfg(target_os = "macos")]
+fn chrome_process_visible(pid: &str) -> Option<bool> {
+    let script = format!(
+        "tell application \"System Events\" to return visible of (first application process whose unix id is {pid})",
+        pid = pid
+    );
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Best-effort non-activating reveal for the interactive login flow.
+///
+/// A login can reuse a Chrome instance that an earlier headless automation run
+/// started hidden (`open -j`).  System Events can flip the app back to visible
+/// without stealing the foreground (verified in T20261004-1930-01); if the
+/// AppleScript is blocked the user can still unhide Chrome from the Dock, so a
+/// failure only warns instead of failing the login.  The reveal is verified
+/// with a bounded poll so a silent no-op is reported instead of claimed as
+/// success.
+#[cfg(target_os = "macos")]
+fn reveal_ask_bridge_chrome_without_activation(profile_path: &str, verbose: bool) {
+    let pids = ask_chrome_pids_on_debug_port(profile_path);
+    if pids.is_empty() {
+        if verbose {
+            eprintln!(
+                "Warning: Could not locate the ask-bridge Chrome process to reveal; switch to Chrome manually if the login window stays hidden."
+            );
+        }
+        return;
+    }
+    for pid in &pids {
+        let script = reveal_chrome_without_activation_script(pid);
+        match Command::new("osascript").arg("-e").arg(&script).status() {
+            Ok(status) if status.success() => {
+                let mut revealed = false;
+                for _ in 0..5 {
+                    if chrome_process_visible(pid) == Some(true) {
+                        revealed = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                if revealed {
+                    if verbose {
+                        println!("Revealed ask-bridge Chrome PID {} without activation.", pid);
+                    }
+                } else {
+                    eprintln!(
+                        "Warning: ask-bridge Chrome PID {} is still hidden after the non-activating reveal; unhide it from the Dock or with Command-Tab if the login window stays invisible.",
+                        pid
+                    );
+                }
+            }
+            Ok(status) => eprintln!(
+                "Warning: Failed to reveal ask-bridge Chrome without activation (osascript status {}); switch to Chrome manually if the login window stays hidden.",
+                status
+            ),
+            Err(error) => eprintln!(
+                "Warning: Failed to run osascript to reveal ask-bridge Chrome: {}; switch to Chrome manually if the login window stays hidden.",
+                error
+            ),
+        }
+    }
 }
 
 /// Bounded best-effort fallback for Chrome builds that still surface a window
@@ -2764,7 +2931,7 @@ fn hide_ask_bridge_chrome_pids(profile_path: &str) {
     }
 }
 
-fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
+fn start_chrome_if_needed(mode: ChromeStartMode, verbose: bool) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
 
     if TcpStream::connect("127.0.0.1:9223").is_ok() {
@@ -2776,7 +2943,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
                 &snapshot.listener_pids,
             )
         {
-            if headless {
+            if mode.hides_instance() {
                 // Force hide any existing background Chrome PIDs asynchronously just in case they are currently visible
                 #[cfg(target_os = "macos")]
                 {
@@ -2788,7 +2955,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
                     });
                 }
             }
-            if verbose && headless && !is_debug_chrome_background(&profile_path) {
+            if verbose && mode.hides_instance() && !is_debug_chrome_background(&profile_path) {
                 println!(
                     "Reusing existing ask-bridge Chrome on port 9223. Run `ask-bridge close` if you want to restart it in background mode."
                 );
@@ -2821,10 +2988,17 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     }
 
     if verbose {
-        println!(
-            "Chrome is not running on port 9223. Starting Chrome with remote debugging (headless: {})...",
-            headless
-        );
+        match mode {
+            ChromeStartMode::Hidden => println!(
+                "Chrome is not running on port 9223. Starting Chrome hidden with remote debugging..."
+            ),
+            ChromeStartMode::VisibleNonActivating => println!(
+                "Chrome is not running on port 9223. Starting Chrome visibly without foreground activation..."
+            ),
+            ChromeStartMode::Direct => println!(
+                "Chrome is not running on port 9223. Starting Chrome with remote debugging..."
+            ),
+        }
     }
 
     let chrome_path = find_chrome_path()?;
@@ -2838,32 +3012,39 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
         "--no-default-browser-check".to_string(),
     ];
 
-    if headless {
+    if mode.hides_instance() {
         chrome_args.push("--ask-bridge-background".to_string());
         chrome_args.push("--disable-blink-features=AutomationControlled".to_string());
         chrome_args.push("--window-size=1440,1200".to_string());
         chrome_args.push("--window-position=-2000,-2000".to_string());
-        // macOS: starting without an initial browser window is what keeps the
-        // freshly launched Chrome from activating itself.  Chrome creates the
-        // startup window (and activates) even under `open -g -j`; the isolated
-        // tab is created afterwards through CDP with `background: true`.
-        #[cfg(target_os = "macos")]
+    }
+
+    // macOS: starting without an initial browser window is what keeps the
+    // freshly launched Chrome from activating itself.  Chrome creates the
+    // startup window (and activates) even under `open -g`; the provider tab is
+    // created afterwards through CDP with `background: true`.  This applies to
+    // both the hidden headless start and the visible non-activating login
+    // start; only the latter keeps the instance itself un-hidden.
+    #[cfg(target_os = "macos")]
+    if mode.suppresses_activation() {
         chrome_args.push("--no-startup-window".to_string());
     }
 
     #[cfg(target_os = "macos")]
-    let launched_through_launchservices = headless;
+    let launched_through_launchservices = mode.suppresses_activation();
     #[cfg(not(target_os = "macos"))]
     let launched_through_launchservices = false;
 
     let launcher_pid = if launched_through_launchservices {
         // On macOS a plain spawn activates the new Chrome app and steals focus
-        // before the fallback AppleScript hide can run.  Background (headless)
-        // launches therefore go through LaunchServices `open -g -j -n`, which
-        // starts the instance hidden and without foreground activation.  A
+        // before any fallback AppleScript hide can run.  LaunchServices
+        // `open -g [-j] -n` starts the instance without foreground activation:
+        // `-j` (hidden) for headless automation, without `-j` (visible but
+        // still non-activating) for the interactive login flow.  A
         // LaunchServices failure is reported instead of silently falling back
         // to the focus-stealing direct spawn.
-        let plan = background_chrome_launch_plan(&chrome_path, &chrome_args)?;
+        let plan =
+            background_chrome_launch_plan(&chrome_path, &chrome_args, mode.hides_instance())?;
         let status = Command::new(&plan.program)
             .args(&plan.args)
             .stdout(Stdio::null())
@@ -2901,13 +3082,18 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
                 pid, profile_path
             ),
             None => println!(
-                "Requested hidden background Chrome via LaunchServices with profile {}.",
+                "{} with profile {}.",
+                match mode {
+                    ChromeStartMode::VisibleNonActivating =>
+                        "Requested a visible, non-activating Chrome launch via LaunchServices",
+                    _ => "Requested hidden background Chrome via LaunchServices",
+                },
                 profile_path
             ),
         }
     }
 
-    if headless {
+    if mode.hides_instance() {
         #[cfg(target_os = "macos")]
         {
             // Fallback only: `open -g -j` already starts the instance hidden,
@@ -3970,6 +4156,7 @@ mod tests {
         assert!(advertised.contains(&ISOLATED_NEW_TAB_CAPABILITY));
         assert!(advertised.contains(&BACKGROUND_ISOLATED_TAB_CAPABILITY));
         assert!(advertised.contains(&BACKGROUND_LAUNCH_ISOLATION_CAPABILITY));
+        assert!(advertised.contains(&BACKGROUND_LOGIN_LAUNCH_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
@@ -4007,6 +4194,26 @@ mod tests {
         assert_eq!(
             capabilities["background_launch_isolation_v1"]["scope"].as_str(),
             Some("cold-start-only")
+        );
+        assert_eq!(
+            capabilities["background_login_launch_v1"]["launch_activation"].as_str(),
+            Some("suppressed")
+        );
+        assert_eq!(
+            capabilities["background_login_launch_v1"]["launch_visibility"].as_str(),
+            Some("visible")
+        );
+        assert_eq!(
+            capabilities["background_login_launch_v1"]["tab_creation"].as_str(),
+            Some("background")
+        );
+        assert_eq!(
+            capabilities["background_login_launch_v1"]["bring_to_front"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            capabilities["background_login_launch_v1"]["reuse_reveal"].as_str(),
+            Some("unhide-without-activation")
         );
         assert_eq!(
             capabilities["verified_file_upload_v1"]["verification"].as_str(),
@@ -4242,6 +4449,7 @@ mod tests {
         let plan = background_chrome_launch_plan(
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             &chrome_args,
+            true,
         )
         .expect("launch plan");
         assert_eq!(plan.program, "open");
@@ -4263,6 +4471,75 @@ mod tests {
             &["/dev/null", "--args", "--remote-debugging-port=9223"]
         );
         assert_eq!(plan.args[11], "--ask-bridge-background");
+    }
+
+    #[test]
+    fn login_launch_plan_is_visible_but_never_activating() {
+        let chrome_args = vec![
+            "--remote-debugging-port=9223".to_string(),
+            "--no-startup-window".to_string(),
+        ];
+        let plan = background_chrome_launch_plan(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            &chrome_args,
+            false,
+        )
+        .expect("launch plan");
+        assert_eq!(plan.program, "open");
+        assert_eq!(
+            &plan.args[..7],
+            &[
+                "-g",
+                "-n",
+                "-a",
+                "/Applications/Google Chrome.app",
+                "--stdout",
+                "/dev/null",
+                "--stderr",
+            ]
+        );
+        assert!(
+            !plan.args.iter().any(|argument| argument == "-j"),
+            "the login launch must stay visible: {:?}",
+            plan.args
+        );
+        assert_eq!(plan.args[8], "--args");
+        assert_eq!(plan.args[9], "--remote-debugging-port=9223");
+        assert_eq!(plan.args[10], "--no-startup-window");
+    }
+
+    #[test]
+    fn chrome_start_mode_and_background_tab_defaults_cover_login() {
+        assert_eq!(
+            chrome_start_mode(false, true),
+            ChromeStartMode::VisibleNonActivating
+        );
+        assert_eq!(chrome_start_mode(true, false), ChromeStartMode::Hidden);
+        assert_eq!(chrome_start_mode(false, false), ChromeStartMode::Direct);
+
+        assert!(resolve_background_tab(None, false, true));
+        assert!(resolve_background_tab(None, true, false));
+        assert!(!resolve_background_tab(None, false, false));
+        assert!(!resolve_background_tab(Some(false), true, true));
+        assert!(resolve_background_tab(Some(true), false, false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reveal_script_unhides_without_activating() {
+        let script = reveal_chrome_without_activation_script("4242");
+        assert!(script.contains("whose unix id is 4242"));
+        assert!(
+            script
+                .contains(
+                    "if not (visible of (first application process whose unix id is 4242)) then set visible of (first application process whose unix id is 4242) to true"
+                )
+        );
+        // Regression guard: the AppleScript-variable form silently no-ops on
+        // current macOS, so the reveal must reference the process inline.
+        assert!(!script.contains("askProcess"));
+        assert!(!script.contains("activate"));
+        assert!(!script.contains("set frontmost"));
     }
 
     #[test]
@@ -12716,13 +12993,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Get { .. }) => false, // Default get to headful for debugging by default
         _ => cli.headless, // Respect --headless (defaults to true) for all other commands (including Open)
     };
+    let is_login = matches!(cli.command, Some(Commands::Login));
+    let chrome_start = chrome_start_mode(is_headless, is_login);
 
     // Visible (Chrome window) and foreground/background (new provider tab) are
     // separate contracts: `--headless` controls the Chrome instance, while
-    // `--background-tab` controls whether isolated provider tabs are created
-    // without activation.  The default keeps the historical coupling
-    // (background tabs whenever Chrome runs headless).
-    let background_tab = cli.background_tab.unwrap_or(is_headless);
+    // `--background-tab` controls whether provider tabs are created without
+    // activation.  Automation defaults to background tabs whenever Chrome runs
+    // headless; the interactive login flow also defaults to a background tab
+    // because its window only needs to be visible, never activated.  An
+    // explicit `--background-tab`/`--background-tab=false` still wins.
+    let background_tab = resolve_background_tab(cli.background_tab, is_headless, is_login);
 
     if matches!(cli.command, Some(Commands::Close)) {
         let profile_path = match chrome_profile_path() {
@@ -12758,7 +13039,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Err(e) = start_chrome_if_needed(is_headless, command_verbose) {
+    if let Err(e) = start_chrome_if_needed(chrome_start, command_verbose) {
         eprintln!("Error starting Chrome: {}", e);
         std::process::exit(1);
     }
@@ -12910,8 +13191,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error ensuring {} tab: {}", provider.display_name(), e);
                     std::process::exit(1);
                 }
+                // Reusing an instance that an earlier headless automation run
+                // started hidden (`open -j`) must not leave the login window
+                // invisible.  Unhide it without activating it; the user still
+                // decides when to switch to Chrome.
+                #[cfg(target_os = "macos")]
+                match chrome_profile_path() {
+                    Ok(profile_path) => {
+                        reveal_ask_bridge_chrome_without_activation(&profile_path, command_verbose)
+                    }
+                    Err(e) => eprintln!("Warning: Failed to locate Chrome profile: {}", e),
+                }
                 println!("\n========================================================");
-                println!("Please complete the login manually in the Chrome window.");
+                println!("The login window was opened in the background; your current");
+                println!("foreground app keeps focus. Switch to the ask-bridge Chrome");
+                println!("window to complete the login manually.");
                 println!("The tool will automatically detect when login is complete every second.");
                 println!("========================================================\n");
 
