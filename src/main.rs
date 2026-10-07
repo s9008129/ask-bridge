@@ -10352,7 +10352,7 @@ fn build_chatgpt_model_selection_script(target_json: &str) -> String {
             };
             await closeMenus();
             let pill = null;
-            for (let attempt = 0; attempt < 20; attempt++) {
+            for (let attempt = 0; attempt < 360; attempt++) {
                 pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
                 if (pill && isVisible(pill)) break;
                 await sleep(250);
@@ -10700,7 +10700,12 @@ fn build_chatgpt_reopen_slider_script() -> String {
                     style.opacity !== '0' && rect.width > 0 && rect.height > 0;
             };
             const resolveReasoningControlBundle = __CONTROL_BUNDLE_RESOLVER__;
-            const pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
+            let pill = null;
+            for (let attempt = 0; attempt < 360; attempt++) {
+                pill = document.querySelector('button.__composer-pill, button[aria-label*="選取 ChatGPT 模型"], button[aria-label*="Select ChatGPT model"]');
+                if (pill && isVisible(pill)) break;
+                await sleep(250);
+            }
             if (!pill || !isVisible(pill)) {
                 window.__reopen_model_status = 'error: composer pill not found';
                 return;
@@ -10712,7 +10717,7 @@ fn build_chatgpt_reopen_slider_script() -> String {
                 bubbles: true, pointerType: 'mouse', isPrimary: true
             }));
             pill.click();
-            for (let attempt = 0; attempt < 20; attempt++) {
+            for (let attempt = 0; attempt < 360; attempt++) {
                 const bundle = resolveReasoningControlBundle(null);
                 if (bundle.found) {
                     if (bundle.bundle_error) {
@@ -10749,7 +10754,7 @@ fn reopen_chatgpt_slider(config_path: &str) -> Result<(), String> {
 
     let mut wait_cycles = 0;
     let mut status = String::from("pending");
-    while status == "pending" && wait_cycles < 60 {
+    while status == "pending" && wait_cycles < 600 {
         thread::sleep(Duration::from_millis(200));
         let check_res = call_mcp_tool(
             config_path,
@@ -11267,7 +11272,7 @@ fn switch_model(
 
     let mut wait_cycles = 0;
     let mut status = String::from("pending");
-    while status == "pending" && wait_cycles < 60 {
+    while status == "pending" && wait_cycles < 600 {
         thread::sleep(Duration::from_millis(200));
         let check_res = call_mcp_tool(
             config_path,
