@@ -29,6 +29,7 @@ const VERIFIED_MODEL_SELECTION_V4_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v5";
 const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
 const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
+const VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY: &str = "verified_text_response_backend_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
 const BACKGROUND_LOGIN_LAUNCH_CAPABILITY: &str = "background_login_launch_v1";
@@ -61,6 +62,14 @@ const RESPONSE_REQUIRED_STABLE_PROBES: usize = 3;
 /// real response.
 const MINIMUM_TEXT_RESPONSE_BYTES: usize = 200;
 const GENERATED_IMAGE_MIN_DIMENSION: u32 = 256;
+/// Cadence (in DOM-probe ticks) of the ChatGPT backend conversation probe
+/// used to harvest text responses.  The DOM probe runs at
+/// `RESPONSE_POLL_INTERVAL`; the backend probe is a full same-origin HTTP
+/// round-trip and only needs to run every few seconds.
+const BACKEND_RESPONSE_POLL_TICKS: usize = 4;
+/// Abort a single backend conversation fetch after this long so one slow
+/// request can never stall the response wait loop.
+const BACKEND_RESPONSE_FETCH_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginState {
@@ -885,6 +894,89 @@ struct ResponseDomProbe {
     dom_signature: String,
 }
 
+/// One observation of the ChatGPT conversation through the provider's own
+/// backend API (``/backend-api/conversation/<id>``) instead of the client
+/// DOM.
+///
+/// ChatGPT renders long final answers lazily through a client-side deferred
+/// renderer (`DilResponseRoot`); in a background tab the shell stays empty,
+/// so the DOM probe can never see the text even though the server has
+/// already finished the response.  The backend API is the system of record
+/// for the same message and does not depend on any renderer.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct BackendResponseProbe {
+    ok: bool,
+    reason: String,
+    conversation_id: String,
+    user_count: usize,
+    assistant_count: usize,
+    last_assistant_id: String,
+    last_assistant_status: String,
+    last_assistant_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BackendResponseDecision {
+    Pending,
+    Completed(String),
+    Unknown(ResponseFailureCode),
+}
+
+/// Terminal outcome of the response wait loop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResponseWaitOutcome {
+    /// The DOM tracker verified the completed response identity.
+    Dom(VerifiedResponseIdentity),
+    /// The provider backend reported a finished text response and supplied
+    /// its text directly (no DOM rendering or clipboard involved).
+    BackendText(String),
+    /// The completion state is unknown; the caller must fail closed.
+    Unknown(ResponseFailureCode),
+}
+
+fn response_wait_outcome(decision: ResponseTrackerDecision) -> ResponseWaitOutcome {
+    match decision {
+        ResponseTrackerDecision::Completed(identity) => ResponseWaitOutcome::Dom(identity),
+        ResponseTrackerDecision::Unknown(code) => ResponseWaitOutcome::Unknown(code),
+        ResponseTrackerDecision::Pending => {
+            ResponseWaitOutcome::Unknown(ResponseFailureCode::ResponseTimeout)
+        }
+    }
+}
+
+/// Score a backend conversation probe against the pre-submit baseline.
+///
+/// The probe may only complete the request when the linear conversation
+/// branch grew by exactly one user turn and one assistant turn (the same
+/// identity bound the DOM tracker enforces), and the newest assistant
+/// message is finished with non-empty text.
+fn assess_backend_response_probe(
+    probe: &BackendResponseProbe,
+    initial_user_count: usize,
+    initial_assistant_count: usize,
+) -> BackendResponseDecision {
+    if !probe.ok || probe.conversation_id.is_empty() {
+        return BackendResponseDecision::Pending;
+    }
+    if probe.user_count > initial_user_count.saturating_add(1)
+        || probe.assistant_count > initial_assistant_count.saturating_add(1)
+    {
+        return BackendResponseDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged);
+    }
+    if probe.user_count < initial_user_count.saturating_add(1)
+        || probe.assistant_count < initial_assistant_count.saturating_add(1)
+    {
+        return BackendResponseDecision::Pending;
+    }
+    if probe.last_assistant_status != "finished_successfully" {
+        return BackendResponseDecision::Pending;
+    }
+    if probe.last_assistant_text.trim().is_empty() {
+        return BackendResponseDecision::Pending;
+    }
+    BackendResponseDecision::Completed(probe.last_assistant_text.clone())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedResponseIdentity {
     conversation_id: String,
@@ -1236,6 +1328,7 @@ impl SessionReceipt {
                 VERIFIED_MODEL_SELECTION_V5_CAPABILITY.to_string(),
                 VERIFIED_MODEL_SELECTION_V6_CAPABILITY.to_string(),
                 VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY.to_string(),
+                VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
@@ -1765,7 +1858,8 @@ fn capabilities_value() -> Value {
             VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
-            VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY
+            VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
+            VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1841,6 +1935,23 @@ fn capabilities_value() -> Value {
                 "expected_output_type",
                 "response_completion",
                 "downloaded_image_count",
+                "response_failure_code"
+            ]
+        },
+        "verified_text_response_backend_v1": {
+            "applies_when": "expected_output_type=text",
+            "completion_source": "chatgpt-backend-conversation-api",
+            "conversation_endpoint": "/backend-api/conversation/<conversation-id>",
+            "session_endpoint": "/api/auth/session",
+            "identity_gate": "linear-chain-user-and-assistant-delta-exactly-one",
+            "finish_state": "finished_successfully",
+            "probe_interval_ms": (RESPONSE_POLL_INTERVAL.as_millis() as usize)
+                * BACKEND_RESPONSE_POLL_TICKS,
+            "fetch_timeout_ms": BACKEND_RESPONSE_FETCH_TIMEOUT_MS,
+            "dom_fallback": "kept-as-primary-signal-for-images-and-non-chatgpt",
+            "receipt_fields": [
+                "expected_output_type",
+                "response_completion",
                 "response_failure_code"
             ]
         },
@@ -2060,6 +2171,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_MODEL_SELECTION_V4_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);
+        println!("  {}", VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -6240,6 +6352,129 @@ mod tests {
         let source = include_str!("main.rs");
         assert!(source.contains("println!(\"  {}\", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);"));
         assert!(source.contains("println!(\"  {}\", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);"));
+    }
+
+    #[test]
+    fn backend_response_probe_declares_capability_and_is_chatgpt_only() {
+        let value = capabilities_value();
+        assert!(
+            value["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some(VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY))
+        );
+        assert_eq!(
+            value[VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY]["finish_state"].as_str(),
+            Some("finished_successfully")
+        );
+        let receipt = SessionReceipt::new(0, 0);
+        assert!(
+            receipt
+                .capabilities
+                .iter()
+                .any(|entry| entry == VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY)
+        );
+        let script = build_backend_response_probe_script(Provider::ChatGpt)
+            .expect("chatgpt backend probe script");
+        assert!(script.contains("/backend-api/conversation/"));
+        assert!(script.contains("/api/auth/session"));
+        assert!(build_backend_response_probe_script(Provider::Gemini).is_err());
+    }
+
+    #[test]
+    fn backend_response_probe_completes_only_on_finished_fresh_text() {
+        let fresh_finished = BackendResponseProbe {
+            ok: true,
+            conversation_id: "6acede20-a42c-83ee-af58-a14802a5823a".to_string(),
+            user_count: 1,
+            assistant_count: 1,
+            last_assistant_id: "08299039-d17c-4de7-9d94-857e41784792".to_string(),
+            last_assistant_status: "finished_successfully".to_string(),
+            last_assistant_text: "{\"schema_version\":\"2.0\"}".to_string(),
+            reason: String::new(),
+        };
+        assert_eq!(
+            assess_backend_response_probe(&fresh_finished, 0, 0),
+            BackendResponseDecision::Completed("{\"schema_version\":\"2.0\"}".to_string())
+        );
+
+        let in_progress = BackendResponseProbe {
+            last_assistant_status: "in_progress".to_string(),
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&in_progress, 0, 0),
+            BackendResponseDecision::Pending
+        );
+
+        let empty_text = BackendResponseProbe {
+            last_assistant_text: String::new(),
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&empty_text, 0, 0),
+            BackendResponseDecision::Pending
+        );
+
+        let extra_turn = BackendResponseProbe {
+            user_count: 2,
+            assistant_count: 2,
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&extra_turn, 0, 0),
+            BackendResponseDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+
+        let assistant_not_yet = BackendResponseProbe {
+            assistant_count: 0,
+            last_assistant_status: String::new(),
+            last_assistant_text: String::new(),
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&assistant_not_yet, 0, 0),
+            BackendResponseDecision::Pending
+        );
+
+        let failed_probe = BackendResponseProbe {
+            ok: false,
+            reason: "conversation_http_404".to_string(),
+            ..fresh_finished
+        };
+        assert_eq!(
+            assess_backend_response_probe(&failed_probe, 0, 0),
+            BackendResponseDecision::Pending
+        );
+    }
+
+    #[test]
+    fn chatgpt_escape_wrapper_is_unwrapped_only_when_it_wraps_everything() {
+        assert_eq!(
+            strip_chatgpt_escape_wrapper("<escape>{\"ok\": true}</escape>"),
+            "{\"ok\": true}"
+        );
+        assert_eq!(
+            strip_chatgpt_escape_wrapper("  <escape>  raw text  </escape>\n"),
+            "raw text"
+        );
+        assert_eq!(
+            strip_chatgpt_escape_wrapper("<escape><escape>nested</escape></escape>"),
+            "nested"
+        );
+        assert_eq!(
+            strip_chatgpt_escape_wrapper("{\"ok\": true}"),
+            "{\"ok\": true}"
+        );
+        assert_eq!(
+            strip_chatgpt_escape_wrapper("<escape>unterminated"),
+            "<escape>unterminated"
+        );
+        assert_eq!(
+            strip_chatgpt_escape_wrapper("prefix <escape>value</escape> suffix"),
+            "prefix <escape>value</escape> suffix"
+        );
     }
 
     #[test]
@@ -12260,6 +12495,157 @@ fn build_response_probe_script(
     .replace("__TOKEN__", &token_json))
 }
 
+/// Build an awaited JS probe that reads the newest assistant message of the
+/// current conversation through ChatGPT's own backend API.
+///
+/// The tool response is the response text itself; it never depends on
+/// client-side rendering, the clipboard or window focus.  The access token
+/// is read once from the same-origin session endpoint and cached in the
+/// page; a 401/403 clears the cache so the next poll re-fetches it.
+fn build_backend_response_probe_script(provider: Provider) -> Result<String, String> {
+    if provider != Provider::ChatGpt {
+        return Err("backend response probe is only implemented for ChatGPT".to_string());
+    }
+    Ok(format!(
+        r#"async () => {{
+            const result = {{
+                ok: false,
+                reason: '',
+                conversation_id: '',
+                user_count: 0,
+                assistant_count: 0,
+                last_assistant_id: '',
+                last_assistant_status: '',
+                last_assistant_text: ''
+            }};
+            try {{
+                const match = (window.location.pathname || '').match(/^\/c\/([^/?#]+)/);
+                if (!match) {{
+                    result.reason = 'no_conversation';
+                    return result;
+                }}
+                const conversationId = match[1];
+                result.conversation_id = conversationId;
+                let token = window.__ask_bridge_backend_token_v1 || '';
+                if (!token) {{
+                    const sessionResponse = await fetch('/api/auth/session', {{ credentials: 'include' }});
+                    if (!sessionResponse.ok) {{
+                        result.reason = 'session_http_' + sessionResponse.status;
+                        return result;
+                    }}
+                    const session = await sessionResponse.json();
+                    token = (session && session.accessToken) || '';
+                    if (!token) {{
+                        result.reason = 'no_access_token';
+                        return result;
+                    }}
+                    window.__ask_bridge_backend_token_v1 = token;
+                }}
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), {fetch_timeout_ms});
+                let response;
+                try {{
+                    response = await fetch('/backend-api/conversation/' + conversationId, {{
+                        credentials: 'include',
+                        headers: {{ Authorization: 'Bearer ' + token }},
+                        signal: controller.signal
+                    }});
+                }} finally {{
+                    clearTimeout(timer);
+                }}
+                if (response.status === 401 || response.status === 403) {{
+                    window.__ask_bridge_backend_token_v1 = '';
+                }}
+                if (!response.ok) {{
+                    result.reason = 'conversation_http_' + response.status;
+                    return result;
+                }}
+                const data = await response.json();
+                const mapping = (data && data.mapping) || {{}};
+                const chain = [];
+                const seen = new Set();
+                let nodeId = data && data.current_node;
+                while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {{
+                    seen.add(nodeId);
+                    chain.push(mapping[nodeId]);
+                    nodeId = mapping[nodeId].parent;
+                }}
+                const messages = chain
+                    .filter((node) => node && node.message)
+                    .map((node) => node.message);
+                messages.sort((left, right) => (left.create_time || 0) - (right.create_time || 0));
+                const users = messages.filter(
+                    (message) => message.author && message.author.role === 'user'
+                );
+                const assistants = messages.filter(
+                    (message) => message.author && message.author.role === 'assistant'
+                );
+                result.user_count = users.length;
+                result.assistant_count = assistants.length;
+                const lastAssistant = assistants.length > 0 ? assistants[assistants.length - 1] : null;
+                if (lastAssistant) {{
+                    result.last_assistant_id = lastAssistant.id || '';
+                    result.last_assistant_status = lastAssistant.status || '';
+                    const contentType =
+                        (lastAssistant.content && lastAssistant.content.content_type) || '';
+                    const parts = (lastAssistant.content && lastAssistant.content.parts) || [];
+                    const textParts = parts.filter(
+                        (part) => typeof part === 'string' && part.length > 0
+                    );
+                    if ((contentType === 'text' || contentType === 'code') && textParts.length > 0) {{
+                        result.last_assistant_text = textParts.join('\n\n');
+                    }}
+                }}
+                result.ok = true;
+            }} catch (error) {{
+                result.reason = String((error && error.message) || error);
+            }}
+            return result;
+        }}"#,
+        fetch_timeout_ms = BACKEND_RESPONSE_FETCH_TIMEOUT_MS,
+    ))
+}
+
+fn fetch_backend_response_probe(
+    config_path: &str,
+    probe_script: &str,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<BackendResponseProbe, String> {
+    let result = call_mcp_tool_with_deadline(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({"function": probe_script}),
+        deadline,
+    )?;
+    parse_script_result(&result).and_then(|value| {
+        serde_json::from_value::<BackendResponseProbe>(value)
+            .map(|mut probe| {
+                probe.last_assistant_text =
+                    strip_chatgpt_escape_wrapper(&probe.last_assistant_text);
+                probe
+            })
+            .map_err(|error| format!("Backend response probe returned an invalid payload: {error}"))
+    })
+}
+
+/// Remove ChatGPT's literal-text transport wrapper from a harvested message.
+///
+/// The ChatGPT client renders text responses through a deferred renderer and
+/// transports some answers as literal text wrapped in
+/// ``<escape>...</escape>``; the wrapper is a display directive, not part of
+/// the answer.  Unwrap only a complete outer pair and keep everything else
+/// untouched.
+fn strip_chatgpt_escape_wrapper(text: &str) -> String {
+    let mut value = text.trim().to_string();
+    while let Some(inner) = value
+        .strip_prefix("<escape>")
+        .and_then(|rest| rest.strip_suffix("</escape>"))
+    {
+        value = inner.trim().to_string();
+    }
+    value
+}
+
 fn execute_verified_prompt_submission<Baseline, Upload, BeforeSubmit, Submit>(
     receipt_path: Option<&Path>,
     upload_and_verify: Upload,
@@ -13632,7 +14018,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         response_baseline.initial_user_count,
         response_baseline.initial_assistant_count,
     );
-    let response_decision = loop {
+    // Text responses are harvested through ChatGPT's own conversation
+    // backend as well: long final answers render lazily in the client and
+    // never materialise in a background tab, so the DOM probe alone can
+    // wait forever even though the server already finished the answer.
+    let backend_probe_script =
+        if expected_output_type == ExpectedOutputType::Text && provider == Provider::ChatGpt {
+            Some(build_backend_response_probe_script(provider)?)
+        } else {
+            None
+        };
+    let mut backend_probe_tick: usize = 0;
+    let response_outcome = loop {
         if is_terminal {
             let frame = spinner_frames[spinner_idx % spinner_frames.len()];
             print!(
@@ -13645,7 +14042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if Instant::now() >= response_deadline.expires_at {
-            break response_tracker.timeout();
+            break response_wait_outcome(response_tracker.timeout());
         }
         let check_res = match call_mcp_tool_with_deadline(
             &config_path,
@@ -13655,10 +14052,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(result) => result,
             Err(_) if Instant::now() >= response_deadline.expires_at => {
-                break response_tracker.timeout();
+                break response_wait_outcome(response_tracker.timeout());
             }
             Err(_) => {
-                break response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed);
+                break response_wait_outcome(
+                    response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed),
+                );
             }
         };
         let probe = match parse_script_result(&check_res)
@@ -13667,12 +14066,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             Some(probe) => probe,
             None => {
-                break response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed);
+                break response_wait_outcome(
+                    response_tracker.finish_unknown(ResponseFailureCode::ResponseProbeFailed),
+                );
             }
         };
         match response_tracker.observe(probe) {
             ResponseTrackerDecision::Pending => {}
-            terminal => break terminal,
+            terminal => break response_wait_outcome(terminal),
+        }
+
+        if let Some(backend_probe_script) = backend_probe_script.as_deref() {
+            backend_probe_tick = backend_probe_tick.saturating_add(1);
+            if backend_probe_tick % BACKEND_RESPONSE_POLL_TICKS == 0 {
+                if let Ok(backend_probe) = fetch_backend_response_probe(
+                    &config_path,
+                    backend_probe_script,
+                    Some(response_deadline),
+                ) {
+                    match assess_backend_response_probe(
+                        &backend_probe,
+                        response_baseline.initial_user_count,
+                        response_baseline.initial_assistant_count,
+                    ) {
+                        BackendResponseDecision::Pending => {}
+                        BackendResponseDecision::Completed(text) => {
+                            break ResponseWaitOutcome::BackendText(text);
+                        }
+                        BackendResponseDecision::Unknown(code) => {
+                            break ResponseWaitOutcome::Unknown(code);
+                        }
+                    }
+                }
+                // A failed backend poll is never terminal on its own: the
+                // DOM tracker stays the primary completion signal until the
+                // deadline, and a transient fetch error is retried on the
+                // next cadence tick.
+            }
         }
 
         let remaining = response_deadline
@@ -13686,17 +14116,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().flush()?;
     }
 
-    let verified_response = match response_decision {
-        ResponseTrackerDecision::Completed(identity) => identity,
-        ResponseTrackerDecision::Unknown(code) => {
+    let mut backend_response_text: Option<String> = None;
+    let verified_response = match response_outcome {
+        ResponseWaitOutcome::Dom(identity) => Some(identity),
+        ResponseWaitOutcome::BackendText(text) => {
+            if command_verbose {
+                println!(
+                    "ChatGPT backend conversation reported a finished response ({} bytes).",
+                    text.len()
+                );
+            }
+            backend_response_text = Some(text);
+            None
+        }
+        ResponseWaitOutcome::Unknown(code) => {
             if let Some(path) = receipt_path.as_deref() {
                 record_session_response_outcome(path, ResponseCompletion::Unknown, 0, Some(code))
                     .map_err(|_| "Response became unknown, but receipt audit failed")?;
             }
             return Err(format!("Provider response completion is unknown ({code})").into());
-        }
-        ResponseTrackerDecision::Pending => {
-            unreachable!("response wait must end in a terminal state")
         }
     };
 
@@ -13704,7 +14142,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config_path,
         provider,
         cli.image_output.as_deref(),
-        Some((&response_baseline, &verified_response)),
+        verified_response
+            .as_ref()
+            .map(|identity| (&response_baseline, identity)),
         command_verbose,
     );
     let downloaded_image_count = if expected_output_type == ExpectedOutputType::Image {
@@ -13744,22 +14184,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to persist final response receipt")?;
     }
 
-    if command_verbose {
-        println!(
-            "Copying final response from {} toolbar...",
-            provider.display_name()
-        );
-    }
-    match copy_latest_markdown(&config_path, provider) {
-        Ok(content) => {
-            last_markdown = content;
-        }
-        Err(e) => {
-            eprintln!(
-                "Error copying response from {} toolbar: {}",
-                provider.display_name(),
-                e
+    if let Some(text) = backend_response_text {
+        // The backend conversation API already supplied the finished text
+        // for this response; the toolbar copy button is skipped entirely so
+        // the result never depends on window focus or clipboard state.
+        last_markdown = text;
+    } else {
+        if command_verbose {
+            println!(
+                "Copying final response from {} toolbar...",
+                provider.display_name()
             );
+        }
+        match copy_latest_markdown(&config_path, provider) {
+            Ok(content) => {
+                last_markdown = content;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Error copying response from {} toolbar: {}",
+                    provider.display_name(),
+                    e
+                );
+            }
+        }
+        if last_markdown.trim().is_empty() {
+            // The DOM completed but the toolbar copy and DOM scrape both came
+            // back empty (for example a lazy renderer plus an unfocused
+            // clipboard).  Ask the backend conversation API once more before
+            // giving up on the text.
+            if let Some(backend_probe_script) = backend_probe_script.as_deref() {
+                if let Ok(backend_probe) = fetch_backend_response_probe(
+                    &config_path,
+                    backend_probe_script,
+                    Some(response_deadline),
+                ) {
+                    if let BackendResponseDecision::Completed(text) = assess_backend_response_probe(
+                        &backend_probe,
+                        response_baseline.initial_user_count,
+                        response_baseline.initial_assistant_count,
+                    ) {
+                        if command_verbose {
+                            println!(
+                                "Falling back to ChatGPT backend conversation text ({} bytes).",
+                                text.len()
+                            );
+                        }
+                        last_markdown = text;
+                    }
+                }
+            }
         }
     }
 
