@@ -30,6 +30,7 @@ const VERIFIED_MODEL_SELECTION_V5_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v6";
 const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY: &str = "verified_text_response_backend_v1";
+const VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY: &str = "verified_logical_turn_image_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
 const BACKGROUND_LOGIN_LAUNCH_CAPABILITY: &str = "background_login_launch_v1";
@@ -62,6 +63,76 @@ const RESPONSE_REQUIRED_STABLE_PROBES: usize = 3;
 /// real response.
 const MINIMUM_TEXT_RESPONSE_BYTES: usize = 200;
 const GENERATED_IMAGE_MIN_DIMENSION: u32 = 256;
+
+/// Shared JS helper: collapse the raw provider message nodes into logical
+/// turns before any count or content decision.
+///
+/// `assistant_selector()` intentionally matches more than one DOM node for a
+/// single assistant answer: since 2026-10 ChatGPT renders the
+/// `generated-image-gallery` message as a *sibling* of the keyed assistant
+/// unit inside the same turn.  Counting raw nodes made the identity tracker
+/// observe two assistants after one answer (`assistant_count_changed`,
+/// fail-closed) and made the image download read the empty keyed shell
+/// instead of the gallery.
+///
+/// Every matched node is grouped by its closest logical turn scope
+/// (`[data-turn-key]` — the virtualized turn wrapper — then the turn-key,
+/// turn-id and legacy turn markers, finally the node itself).  One logical
+/// turn is therefore counted once, its content nodes are all considered, and
+/// two genuinely distinct turns still count as two so the fail-closed
+/// identity gate keeps its meaning.  Providers without those attributes
+/// (Gemini/Claude) keep the previous node-per-message behaviour.
+const CANONICAL_TURN_GROUP_JS: &str = r#"
+            const turnGroups = (selector) => {
+                const groups = new Map();
+                const ordered = [];
+                for (const node of Array.from(document.querySelectorAll(selector))) {
+                    const scope = node.closest('[data-turn-key]') ||
+                        node.closest('[data-content-search-turn-key]') ||
+                        node.closest('[data-turn-id]') ||
+                        node;
+                    let group = groups.get(scope);
+                    if (!group) {
+                        group = { scope, nodes: [] };
+                        groups.set(scope, group);
+                        ordered.push(group);
+                    }
+                    group.nodes.push(node);
+                }
+                return ordered;
+            };
+"#;
+
+/// Shared JS helper: the semantic identity of one canonical turn group.
+/// Must stay identical between the response probe and the image download so
+/// the verified identity can be re-checked before and after the download.
+const TURN_IDENTITY_JS: &str = r#"
+            const turnIdentity = (group) => {
+                const nodes = group ? group.nodes : [];
+                const fallback = nodes.length > 0 ? nodes[nodes.length - 1] : null;
+                const scope = group ? group.scope : null;
+                const turn = scope
+                    ? (scope.closest('section[data-turn="assistant"][data-turn-id]') ||
+                        scope.closest('[data-turn="assistant"][data-turn-id]') ||
+                        scope.closest('[data-turn-key]') ||
+                        scope)
+                    : null;
+                const turnId = (turn
+                    ? (turn.getAttribute('data-turn-id') || turn.getAttribute('data-turn-key'))
+                    : '') ||
+                    (fallback ? (fallback.getAttribute('data-chatgpt-selection-message-id') || '') : '') ||
+                    '';
+                const artifactIds = turn
+                    ? Array.from(turn.querySelectorAll('[id^="image-"]'))
+                        .map((element) => element.id)
+                        .filter(Boolean)
+                        .filter((id, index, all) => all.indexOf(id) === index)
+                        .sort()
+                    : [];
+                return { turnId, artifactIds };
+            };
+"#;
+
 /// Cadence (in DOM-probe ticks) of the ChatGPT backend conversation probe
 /// used to harvest text responses.  The DOM probe runs at
 /// `RESPONSE_POLL_INTERVAL`; the backend probe is a full same-origin HTTP
@@ -1329,6 +1400,7 @@ impl SessionReceipt {
                 VERIFIED_MODEL_SELECTION_V6_CAPABILITY.to_string(),
                 VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY.to_string(),
                 VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY.to_string(),
+                VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY.to_string(),
             ],
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
@@ -1859,7 +1931,8 @@ fn capabilities_value() -> Value {
             VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
             VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
             VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
-            VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY
+            VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY,
+            VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -1931,6 +2004,26 @@ fn capabilities_value() -> Value {
             "zero_images_exit_success": false,
             "download_error_exit_success": false,
             "interference_result": "unknown",
+            "receipt_fields": [
+                "expected_output_type",
+                "response_completion",
+                "downloaded_image_count",
+                "response_failure_code"
+            ]
+        },
+        "verified_logical_turn_image_v1": {
+            "applies_when": "expected_output_type=image",
+            "counting_unit": "logical-turn",
+            "turn_scope_attributes": [
+                "data-turn-key",
+                "data-content-search-turn-key",
+                "data-turn-id"
+            ],
+            "message_node_policy": "group-siblings-of-one-turn-before-counting",
+            "image_scan_scope": "every-message-node-of-the-latest-logical-turn",
+            "user_delta": 1,
+            "assistant_delta": 1,
+            "distinct_turn_delta_policy": "fail-closed",
             "receipt_fields": [
                 "expected_output_type",
                 "response_completion",
@@ -2172,6 +2265,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_MODEL_SELECTION_V5_CAPABILITY);
         println!("  {}", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);
         println!("  {}", VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY);
+        println!("  {}", VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -5313,6 +5407,87 @@ mod tests {
         assert!(!script.contains("__USER_SELECTOR__"));
     }
 
+    /// Shipped source of one top-level function, resolved by bare name and a
+    /// leading newline so no string literal inside this test module can shadow
+    /// the real definition.  The response baseline and the image download
+    /// execute their scripts through MCP and have no in-process builder, so
+    /// their contracts are asserted against the shipped source instead of a
+    /// runtime string.
+    fn shipped_function_source(function_name: &str) -> &'static str {
+        let source = include_str!("main.rs");
+        let signature = format!("\nfn {function_name}(");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("fn {function_name} must exist in src/main.rs"));
+        let rest = &source[start + signature.len()..];
+        let end = rest
+            .find("\nfn ")
+            .map(|offset| start + signature.len() + offset)
+            .unwrap_or(source.len());
+        &source[start + 1..end]
+    }
+
+    #[test]
+    fn canonical_turn_grouping_is_injected_into_every_response_script() {
+        // Shared helper contract: message nodes are grouped by their logical
+        // turn scope before any count or content decision (2026-10 ChatGPT
+        // renders the image gallery as a sibling of the keyed assistant unit).
+        assert!(CANONICAL_TURN_GROUP_JS.contains("const turnGroups = (selector) => {"));
+        assert!(CANONICAL_TURN_GROUP_JS.contains("[data-turn-key]"));
+        assert!(CANONICAL_TURN_GROUP_JS.contains("[data-content-search-turn-key]"));
+        assert!(CANONICAL_TURN_GROUP_JS.contains("[data-turn-id]"));
+        assert!(TURN_IDENTITY_JS.contains("const turnIdentity = (group) => {"));
+
+        // The probe script is built in-process, so the injected helpers and
+        // logical-turn counts must be visible in the produced string.
+        let probe_baseline = ResponseBaseline {
+            initial_user_count: 2,
+            initial_assistant_count: 3,
+            ownership_token: "00000000-0000-4000-8000-000000000004".to_string(),
+        };
+        let probe = build_response_probe_script(Provider::ChatGpt, &probe_baseline).unwrap();
+        assert!(probe.contains("const turnGroups = (selector) => {"));
+        assert!(probe.contains("const turnIdentity = (group) => {"));
+        assert!(probe.contains("[data-turn-key]"));
+        assert!(probe.contains("[data-content-search-turn-key]"));
+        assert!(probe.contains("turnGroups(assistantSelector)"));
+        assert!(probe.contains("turnGroups(userSelector)"));
+        assert!(probe.contains("turnIdentity(latestGroup)"));
+        assert!(probe.contains("assistant_count: assistantGroups.length"));
+        assert!(probe.contains("user_count: userGroups.length"));
+        // Regression guard: raw node counting produced the 2026-10
+        // assistant_count_changed fail-closed loop and must never return.
+        assert!(!probe.contains("const messages = Array.from(document.querySelectorAll"));
+        assert!(!probe.contains("document.querySelectorAll(assistantSelector)"));
+        assert!(!probe.contains("document.querySelectorAll(userSelector)"));
+        assert!(!probe.contains("semanticIdentity"));
+
+        // Baseline and download must inject the same shared constants.
+        let baseline = shipped_function_source("establish_response_baseline");
+        assert!(
+            baseline.contains(".replace(\"__CANONICAL_TURN_GROUP_JS__\", CANONICAL_TURN_GROUP_JS)")
+        );
+        assert!(baseline.contains("turnGroups(__USER_SELECTOR__).length"));
+        assert!(baseline.contains("turnGroups(__ASSISTANT_SELECTOR__).length"));
+        assert!(!baseline.contains("document.querySelectorAll(__ASSISTANT_SELECTOR__)"));
+        assert!(!baseline.contains("const turnGroups"));
+
+        let download = shipped_function_source("download_images_from_latest_message");
+        assert!(
+            download.contains(".replace(\"__CANONICAL_TURN_GROUP_JS__\", CANONICAL_TURN_GROUP_JS)")
+        );
+        assert!(download.contains(".replace(\"__TURN_IDENTITY_JS__\", TURN_IDENTITY_JS)"));
+        assert!(
+            download.contains("turnGroups(expectedIdentity ? assistantSelector : latestSelector)")
+        );
+        assert!(download.contains("turnIdentity(latestGroup)"));
+        assert!(download.contains("const contentNodes = latestGroup ? latestGroup.nodes : [];"));
+        assert!(download.contains("for (const node of contentNodes)"));
+        assert!(!download.contains("const turnGroups"));
+        assert!(!download.contains("semanticIdentity"));
+        assert!(!download.contains("assistantMessages"));
+    }
+
     #[test]
     fn chatgpt_response_selectors_cover_current_and_legacy_transcripts() {
         let assistant = Provider::ChatGpt.assistant_selector();
@@ -6380,6 +6555,43 @@ mod tests {
         assert!(script.contains("/backend-api/conversation/"));
         assert!(script.contains("/api/auth/session"));
         assert!(build_backend_response_probe_script(Provider::Gemini).is_err());
+    }
+
+    #[test]
+    fn logical_turn_image_capability_declares_grouping_contract() {
+        let value = capabilities_value();
+        assert!(
+            value["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some(VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY))
+        );
+        assert_eq!(
+            value[VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY]["counting_unit"].as_str(),
+            Some("logical-turn")
+        );
+        assert_eq!(
+            value[VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY]["message_node_policy"].as_str(),
+            Some("group-siblings-of-one-turn-before-counting")
+        );
+        assert_eq!(
+            value[VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY]["image_scan_scope"].as_str(),
+            Some("every-message-node-of-the-latest-logical-turn")
+        );
+        assert_eq!(
+            value[VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY]["distinct_turn_delta_policy"].as_str(),
+            Some("fail-closed")
+        );
+        let receipt = SessionReceipt::new(0, 0);
+        assert!(
+            receipt
+                .capabilities
+                .iter()
+                .any(|entry| entry == VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY)
+        );
+        let source = include_str!("main.rs");
+        assert!(source.contains("println!(\"  {}\", VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY);"));
     }
 
     #[test]
@@ -8799,37 +9011,20 @@ fn download_images_from_latest_message(
                             const rect = element.getBoundingClientRect();
                             return rect.width > 0 && rect.height > 0;
                         };
+__CANONICAL_TURN_GROUP_JS__
+__TURN_IDENTITY_JS__
                         const conversationId = (() => {
                             const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
                             return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
                         })();
-                        const semanticIdentity = (element) => {
-                            const turn = element
-                                ? (element.closest('section[data-turn="assistant"][data-turn-id]') ||
-                                    element.closest('[data-turn="assistant"][data-turn-id]') ||
-                                    element.closest('[data-turn-key]') || element)
-                                : null;
-                            const turnId = turn?.getAttribute('data-turn-id') ||
-                                turn?.getAttribute('data-turn-key') ||
-                                element?.getAttribute('data-chatgpt-selection-message-id') || '';
-                            const artifactIds = turn
-                                ? Array.from(turn.querySelectorAll('[id^="image-"]'))
-                                    .map((candidate) => candidate.id)
-                                    .filter(Boolean)
-                                    .filter((id, index, all) => all.indexOf(id) === index)
-                                    .sort()
-                                : [];
-                            return { turnId, artifactIds };
-                        };
                         const responseState = () => {
-                            const assistantMessages = Array.from(document.querySelectorAll(assistantSelector));
-                            const userMessages = Array.from(document.querySelectorAll(userSelector));
-                            const latestMessages = expectedIdentity
-                                ? assistantMessages
-                                : Array.from(document.querySelectorAll(latestSelector));
-                            const latestMessage = latestMessages[latestMessages.length - 1] || null;
-                            if (!expectedIdentity) return { ok: true, latestMessage };
-                            const identity = semanticIdentity(latestMessage);
+                            const assistantGroups = turnGroups(expectedIdentity ? assistantSelector : latestSelector);
+                            const userGroups = turnGroups(userSelector);
+                            const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
+                            const contentNodes = latestGroup ? latestGroup.nodes : [];
+                            const latestMessage = contentNodes[contentNodes.length - 1] || null;
+                            if (!expectedIdentity) return { ok: true, contentNodes, latestMessage };
+                            const identity = turnIdentity(latestGroup);
                             const generationControl = stopSelectors
                                 .map((selector) => document.querySelector(selector))
                                 .find(isVisibleControl);
@@ -8839,16 +9034,17 @@ fn download_images_from_latest_message(
                                 (!expectedIdentity.turn_id || identity.turnId === expectedIdentity.turn_id) &&
                                 (expectedIdentity.artifact_ids.length === 0 ||
                                     JSON.stringify(identity.artifactIds) === JSON.stringify(expectedIdentity.artifact_ids)) &&
-                                userMessages.length === expectedIdentity.user_count &&
-                                assistantMessages.length === expectedIdentity.assistant_count &&
+                                userGroups.length === expectedIdentity.user_count &&
+                                assistantGroups.length === expectedIdentity.assistant_count &&
                                 !generationControl;
-                            return { ok, latestMessage };
+                            return { ok, contentNodes, latestMessage };
                         };
                         const before = responseState();
                         if (!before.ok) {
                             window.__downloaded_images_status = "error: response_identity_changed";
                             return;
                         }
+                        const contentNodes = before.contentNodes;
                         const latestMessage = before.latestMessage;
                         if (!latestMessage) {
                             window.__downloaded_images = [];
@@ -8856,7 +9052,15 @@ fn download_images_from_latest_message(
                             return;
                         }
                         
-                        const imgs = Array.from(latestMessage.querySelectorAll('img'));
+                        const imgs = [];
+                        const seenElements = new Set();
+                        for (const node of contentNodes) {
+                            for (const img of Array.from(node.querySelectorAll('img'))) {
+                                if (seenElements.has(img)) continue;
+                                seenElements.add(img);
+                                imgs.push(img);
+                            }
+                        }
                         const seenSrcs = new Set();
                         const candidateImgs = imgs.filter(img => {
                             const src = img.src || '';
@@ -8930,6 +9134,8 @@ fn download_images_from_latest_message(
     .replace("__LATEST_SELECTOR__", &latest_selector)
     .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
     .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__CANONICAL_TURN_GROUP_JS__", CANONICAL_TURN_GROUP_JS)
+    .replace("__TURN_IDENTITY_JS__", TURN_IDENTITY_JS)
     .replace("__EXPECTED_IDENTITY__", &expected_identity_json)
     .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
     .replace(
@@ -12343,20 +12549,22 @@ fn establish_response_baseline(
                 return rect.width > 0 && rect.height > 0;
             };
             window.__ask_bridge_response_owner_v1 = __TOKEN__;
+__CANONICAL_TURN_GROUP_JS__
             return {
                 ownership_token_set: window.__ask_bridge_response_owner_v1 === __TOKEN__,
                 provider_url_owned: window.location.origin === new URL(__PROVIDER_HOME_URL__).origin,
                 generation_control_visible: Boolean(stopSelectors
                     .map((selector) => document.querySelector(selector))
                     .find(isVisibleControl)),
-                user_count: document.querySelectorAll(__USER_SELECTOR__).length,
-                assistant_count: document.querySelectorAll(__ASSISTANT_SELECTOR__).length
+                user_count: turnGroups(__USER_SELECTOR__).length,
+                assistant_count: turnGroups(__ASSISTANT_SELECTOR__).length
             };
         }"#
     .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
     .replace("__TOKEN__", &token_json)
     .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
     .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__CANONICAL_TURN_GROUP_JS__", CANONICAL_TURN_GROUP_JS)
     .replace("__PROVIDER_HOME_URL__", &home_url_json);
     let result = call_mcp_tool(
         config_path,
@@ -12421,46 +12629,48 @@ fn build_response_probe_script(
                 if (src.includes('avatar') || src.includes('profile')) return false;
                 return src.startsWith('http') || src.startsWith('blob:') || src.startsWith('data:image/');
             };
-            const domSignature = (element) => {
-                if (!element) return '';
-                const source = element.innerHTML || '';
+            const domSignature = (elements) => {
+                let length = 0;
                 let hash = 2166136261;
-                for (let index = 0; index < source.length; index += 1) {
-                    hash ^= source.charCodeAt(index);
-                    hash = Math.imul(hash, 16777619);
+                for (const element of elements || []) {
+                    const source = element ? (element.innerHTML || '') : '';
+                    length += source.length;
+                    for (let index = 0; index < source.length; index += 1) {
+                        hash ^= source.charCodeAt(index);
+                        hash = Math.imul(hash, 16777619);
+                    }
                 }
-                return `${source.length}:${(hash >>> 0).toString(16)}`;
+                return `${length}:${(hash >>> 0).toString(16)}`;
             };
+__CANONICAL_TURN_GROUP_JS__
+__TURN_IDENTITY_JS__
             const conversationId = (() => {
                 const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
                 return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
             })();
-            const messages = Array.from(document.querySelectorAll(assistantSelector));
-            const userMessages = Array.from(document.querySelectorAll(userSelector));
-            const latest = messages[messages.length - 1] || null;
-            const turn = latest
-                ? (latest.closest('section[data-turn="assistant"][data-turn-id]') ||
-                    latest.closest('[data-turn="assistant"][data-turn-id]') ||
-                    latest.closest('[data-turn-key]') || latest)
-                : null;
-            const turnId = turn?.getAttribute('data-turn-id') ||
-                turn?.getAttribute('data-turn-key') ||
-                latest?.getAttribute('data-chatgpt-selection-message-id') || '';
-            const artifactIds = turn
-                ? Array.from(turn.querySelectorAll('[id^="image-"]'))
-                    .map((element) => element.id)
-                    .filter(Boolean)
-                    .filter((id, index, all) => all.indexOf(id) === index)
-                    .sort()
-                : [];
-            const loadedImages = latest
-                ? Array.from(latest.querySelectorAll('img')).filter(isLargeLoadedImage)
-                : [];
+            const assistantGroups = turnGroups(assistantSelector);
+            const userGroups = turnGroups(userSelector);
+            const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
+            const contentNodes = latestGroup ? latestGroup.nodes : [];
+            const latest = contentNodes[contentNodes.length - 1] || null;
+            const identity = turnIdentity(latestGroup);
+            const turnId = identity.turnId;
+            const artifactIds = identity.artifactIds;
+            const loadedImages = [];
+            const seenImageSources = new Set();
+            for (const node of contentNodes) {
+                for (const img of Array.from(node.querySelectorAll('img')).filter(isLargeLoadedImage)) {
+                    const src = img.currentSrc || img.src || '';
+                    if (seenImageSources.has(src)) continue;
+                    seenImageSources.add(src);
+                    loadedImages.push(img);
+                }
+            }
             const generationControl = stopSelectors
                 .map((selector) => document.querySelector(selector))
                 .find(isVisibleControl);
-            const latestText = latest ? (latest.textContent || '') : '';
-            const providerFailureVisible = Boolean(latest && /(?:content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i.test(latestText));
+            const latestText = contentNodes.map((node) => node.textContent || '').join('\n');
+            const providerFailureVisible = Boolean(latestText && /(?:content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i.test(latestText));
             let providerUrlOwned = false;
             try {
                 providerUrlOwned = window.location.origin === new URL(__PROVIDER_HOME_URL__).origin;
@@ -12474,19 +12684,21 @@ fn build_response_probe_script(
                 conversation_id: conversationId,
                 turn_id: turnId,
                 artifact_ids: artifactIds,
-                user_count: userMessages.length,
-                assistant_count: messages.length,
+                user_count: userGroups.length,
+                assistant_count: assistantGroups.length,
                 generation_control_visible: Boolean(generationControl),
-                content_present: Boolean(latest && (((latest.textContent || '').trim().length > 0) || loadedImages.length > 0)),
-                content_text_length: latest ? (latest.textContent || '').trim().length : 0,
+                content_present: Boolean((latestText || '').trim().length > 0 || loadedImages.length > 0),
+                content_text_length: (latestText || '').trim().length,
                 provider_failure_visible: providerFailureVisible,
                 loaded_large_image_count: loadedImages.length,
-                dom_signature: domSignature(latest)
+                dom_signature: domSignature(contentNodes)
             };
         }"#
     .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
     .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
     .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__CANONICAL_TURN_GROUP_JS__", CANONICAL_TURN_GROUP_JS)
+    .replace("__TURN_IDENTITY_JS__", TURN_IDENTITY_JS)
     .replace(
         "__MINIMUM_IMAGE_DIMENSION__",
         &GENERATED_IMAGE_MIN_DIMENSION.to_string(),

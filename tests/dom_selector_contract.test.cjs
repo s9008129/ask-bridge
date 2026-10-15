@@ -625,6 +625,53 @@ const chatGptAssistantSelector = () => {
 const chatGptUserSelector =
   '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"]:not([data-chatgpt-search-unit-key$=":user"]):not([data-chatgpt-search-unit-key$=":user"] *)';
 
+// The shipped logical-turn helpers are raw string constants in main.rs; the
+// response probe, the baseline and the image download all inject them, so the
+// DOM contract must exercise the exact shipped source instead of a local copy.
+const chatGptCanonicalTurnHelperSource = () => {
+  const source = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const extract = (name) => {
+    const marker = `const ${name}: &str = r#"`;
+    const start = source.indexOf(marker);
+    assert.ok(start > 0, `${name} must exist in src/main.rs`);
+    const literal = source.slice(start, start + 40000).match(/r#"([\s\S]*?)"#/);
+    assert.ok(literal, `${name} must be a raw string helper`);
+    assert.ok(
+      !literal[1].includes('`') && !literal[1].includes('${'),
+      `${name} must stay safe to embed in a fixture template literal`,
+    );
+    return literal[1];
+  };
+  return `${extract('CANONICAL_TURN_GROUP_JS')}\n${extract('TURN_IDENTITY_JS')}`;
+};
+
+// Mirrors the observed 2026-10 chatgpt.com transcript shape: the
+// generated-image message is a *sibling* of the keyed assistant unit inside
+// one logical turn wrapper (`data-turn-key` on the virtualized turn,
+// `data-content-search-turn-key` on the inner group), which is exactly the
+// shape a raw node count double counts.
+const canonicalTurnFixture = ({ helperSource, assistantSelector, turns }) => `<!doctype html>
+    <main>
+      ${turns}
+      <pre id="result"></pre>
+    </main>
+    <script>
+${helperSource}
+      const selector = ${JSON.stringify(assistantSelector)};
+      const summarize = (group) => ({
+        nodeCount: group.nodes.length,
+        ids: group.nodes.map((node) => node.id).sort(),
+        galleryImageVisible: group.nodes.some((node) => Boolean(node.querySelector('[data-testid="generated-image-gallery"] img'))),
+        identity: turnIdentity(group),
+      });
+      const groups = turnGroups(selector);
+      document.querySelector('#result').textContent = JSON.stringify({
+        rawCount: document.querySelectorAll(selector).length,
+        groupCount: groups.length,
+        groups: groups.map(summarize),
+      });
+    </script>`;
+
 // Mirrors the observed chatgpt.com transcript shape: one pair container holds
 // the user unit, the assistant unit and (once rendered) the assistant action
 // bar, while the user copy control lives inside the user unit only.
@@ -802,6 +849,126 @@ test('ChatGPT assistant selector keeps one count when a keyed unit hosts the gal
 
   assert.equal(result.count, 1, 'a keyed assistant unit must not be double counted');
   assert.deepEqual(result.ids, ['assistant-unit']);
+});
+
+test('ChatGPT canonical turn grouping merges the gallery sibling and the keyed unit into one logical turn', { skip: !chrome }, () => {
+  const result = renderFixture(canonicalTurnFixture({
+    helperSource: chatGptCanonicalTurnHelperSource(),
+    assistantSelector: chatGptAssistantSelector(),
+    turns: `
+      <div data-turn-key="turn-uuid-1">
+        <div class="flex flex-col gap-1.5" data-content-search-turn-key="fallback-turn-0">
+          <div class="flex flex-col gap-3 browser:gap-1">
+            <div class="block-BQZwFn">
+              <div class="group/user-message" data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-content-search-unit-key="fallback-turn-0:0:user">
+                <div data-message-author-role="user"><p>\u8acb\u7522\u751f 8 \u9801\u6295\u8cc7\u7c21\u5831</p></div>
+              </div>
+            </div>
+            <div class="block-BQZwFn">
+              <div id="deck-image-message" class="browser:mb-3" data-chatgpt-search-message-ids="uuid-a uuid-b">
+                <div data-testid="generated-image-gallery">
+                  <button data-testid="generated-image-preview" aria-label="\u7522\u751f\u7684\u5716\u7247 1">
+                    <img id="deck-image-1" alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo=">
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="block-BQZwFn">
+              <div id="deck-keyed-unit" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" data-content-search-unit-key="fallback-turn-0:2:assistant">
+                <div data-message-author-role="assistant"><p>ChatGPT \u8aaa</p></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>`,
+  }));
+
+  assert.equal(result.rawCount, 2, 'the raw selector must still match both the gallery node and the keyed unit');
+  assert.equal(result.groupCount, 1, 'both nodes belong to one logical assistant turn');
+  assert.equal(result.groups[0].nodeCount, 2, 'the logical turn keeps both content nodes');
+  assert.deepEqual(result.groups[0].ids, ['deck-image-message', 'deck-keyed-unit']);
+  assert.equal(
+    result.groups[0].galleryImageVisible,
+    true,
+    'the gallery image must stay reachable inside the logical turn',
+  );
+  assert.equal(
+    result.groups[0].identity.turnId,
+    'turn-uuid-1',
+    'the virtualized turn wrapper must provide the semantic turn identity',
+  );
+});
+
+test('ChatGPT canonical turn grouping still counts two distinct assistant turns as two', { skip: !chrome }, () => {
+  const result = renderFixture(canonicalTurnFixture({
+    helperSource: chatGptCanonicalTurnHelperSource(),
+    assistantSelector: chatGptAssistantSelector(),
+    turns: `
+      <div data-turn-key="turn-uuid-1">
+        <div data-content-search-turn-key="fallback-turn-0">
+          <div class="block-BQZwFn">
+            <div id="first-keyed-unit" data-chatgpt-search-unit-key="fallback-turn-0:2:assistant" data-content-search-unit-key="fallback-turn-0:2:assistant">\u7b2c\u4e00\u8f2a\u56de\u8986</div>
+          </div>
+        </div>
+      </div>
+      <div data-turn-key="turn-uuid-2">
+        <div data-content-search-turn-key="fallback-turn-1">
+          <div class="block-BQZwFn">
+            <div id="second-image-message" data-chatgpt-search-message-ids="uuid-c">
+              <div data-testid="generated-image-gallery"><img id="second-image-1" alt="\u7522\u751f\u7684\u5716\u7247 1" src="data:image/png;base64,iVBORw0KGgo="></div>
+            </div>
+          </div>
+          <div class="block-BQZwFn">
+            <div id="second-keyed-unit" data-chatgpt-search-unit-key="fallback-turn-1:2:assistant" data-content-search-unit-key="fallback-turn-1:2:assistant">\u7b2c\u4e8c\u8f2a\u56de\u8986</div>
+          </div>
+        </div>
+      </div>`,
+  }));
+
+  assert.equal(result.rawCount, 3, 'two keyed units plus one sibling gallery node');
+  assert.equal(result.groupCount, 2, 'a genuinely new assistant turn must still count as a new turn');
+  assert.deepEqual(
+    result.groups.map((group) => group.identity.turnId),
+    ['turn-uuid-1', 'turn-uuid-2'],
+  );
+  assert.deepEqual(result.groups[1].ids, ['second-image-message', 'second-keyed-unit']);
+});
+
+test('ChatGPT canonical turn grouping keeps the legacy single-node identity fallback', { skip: !chrome }, () => {
+  const result = renderFixture(canonicalTurnFixture({
+    helperSource: chatGptCanonicalTurnHelperSource(),
+    assistantSelector: chatGptAssistantSelector(),
+    turns: `
+      <div class="agent-turn" data-chatgpt-selection-message-id="legacy-message-1">
+        <section><div data-message-author-role="assistant">\u820a\u7248\u56de\u8986</div></section>
+      </div>`,
+  }));
+
+  assert.equal(result.rawCount, 1, 'the legacy agent turn must match once');
+  assert.equal(result.groupCount, 1);
+  assert.equal(result.groups[0].nodeCount, 1);
+  assert.equal(
+    result.groups[0].identity.turnId,
+    'legacy-message-1',
+    'without a turn attribute the selection message id must supply the identity',
+  );
+
+  // Providers without the ChatGPT turn attributes must keep the previous
+  // node-per-message behaviour: two sibling nodes stay two logical turns.
+  const siblings = renderFixture(canonicalTurnFixture({
+    helperSource: chatGptCanonicalTurnHelperSource(),
+    assistantSelector: chatGptAssistantSelector(),
+    turns: `
+      <div class="agent-turn" data-chatgpt-selection-message-id="legacy-message-1">\u820a\u7248\u56de\u8986\u4e00</div>
+      <div class="agent-turn" data-chatgpt-selection-message-id="legacy-message-2">\u820a\u7248\u56de\u8986\u4e8c</div>`,
+  }));
+
+  assert.equal(siblings.rawCount, 2);
+  assert.equal(
+    siblings.groupCount,
+    2,
+    'nodes without turn scope attributes must not be merged into one logical turn',
+  );
 });
 
 test('ChatGPT stop control selectors cover the localized stop button', { skip: !chrome }, () => {
