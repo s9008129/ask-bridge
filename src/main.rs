@@ -979,8 +979,20 @@ struct BackendResponseProbe {
     ok: bool,
     reason: String,
     conversation_id: String,
+    /// Real user prompts in the linear conversation branch
+    /// (``author.role == "user"`` with no tool/context author name).
     user_count: usize,
-    assistant_count: usize,
+    /// Logical assistant turns: messages carrying the provider's turn
+    /// boundary marker ``end_turn == true``.  One ChatGPT turn expands into
+    /// several assistant-role nodes (``code``, ``thoughts``,
+    /// ``reasoning_recap`` and the final ``text``); only the final answer
+    /// node is marked ``end_turn = true``, so raw assistant-role nodes must
+    /// never be counted as turns.
+    answer_count: usize,
+    /// Answers that appear after the newest user prompt.  A finished turn
+    /// contributes exactly one; the wait may only complete on one, and more
+    /// than one fails closed as an identity change.
+    answers_after_last_user: usize,
     last_assistant_id: String,
     last_assistant_status: String,
     last_assistant_text: String,
@@ -1017,26 +1029,31 @@ fn response_wait_outcome(decision: ResponseTrackerDecision) -> ResponseWaitOutco
 
 /// Score a backend conversation probe against the pre-submit baseline.
 ///
-/// The probe may only complete the request when the linear conversation
-/// branch grew by exactly one user turn and one assistant turn (the same
-/// identity bound the DOM tracker enforces), and the newest assistant
-/// message is finished with non-empty text.
+/// The identity anchor is the linear branch itself: after submitting exactly
+/// one prompt the branch may only have grown by exactly one user message,
+/// and the response after that message may only contain one finished
+/// logical turn.  A ChatGPT turn expands into several assistant-role nodes
+/// (``code`` / ``thoughts`` / ``reasoning_recap`` / final ``text``), so the
+/// answer set is counted through the provider's ``end_turn`` marker instead
+/// of raw assistant-role node counts.  A second ``end_turn`` answer after
+/// the newest user prompt fails closed as an identity change.
 fn assess_backend_response_probe(
     probe: &BackendResponseProbe,
     initial_user_count: usize,
-    initial_assistant_count: usize,
 ) -> BackendResponseDecision {
     if !probe.ok || probe.conversation_id.is_empty() {
         return BackendResponseDecision::Pending;
     }
-    if probe.user_count > initial_user_count.saturating_add(1)
-        || probe.assistant_count > initial_assistant_count.saturating_add(1)
-    {
+    if probe.user_count > initial_user_count.saturating_add(1) {
         return BackendResponseDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged);
     }
-    if probe.user_count < initial_user_count.saturating_add(1)
-        || probe.assistant_count < initial_assistant_count.saturating_add(1)
-    {
+    if probe.user_count < initial_user_count.saturating_add(1) {
+        return BackendResponseDecision::Pending;
+    }
+    if probe.answers_after_last_user > 1 {
+        return BackendResponseDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged);
+    }
+    if probe.answers_after_last_user == 0 {
         return BackendResponseDecision::Pending;
     }
     if probe.last_assistant_status != "finished_successfully" {
@@ -2036,7 +2053,8 @@ fn capabilities_value() -> Value {
             "completion_source": "chatgpt-backend-conversation-api",
             "conversation_endpoint": "/backend-api/conversation/<conversation-id>",
             "session_endpoint": "/api/auth/session",
-            "identity_gate": "linear-chain-user-and-assistant-delta-exactly-one",
+            "identity_gate": "linear-chain-user-delta-exactly-one-and-single-end-turn-answer-after-newest-prompt",
+            "assistant_node_policy": "count-only-end-turn-final-answers",
             "finish_state": "finished_successfully",
             "probe_interval_ms": (RESPONSE_POLL_INTERVAL.as_millis() as usize)
                 * BACKEND_RESPONSE_POLL_TICKS,
@@ -6543,6 +6561,16 @@ mod tests {
             value[VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY]["finish_state"].as_str(),
             Some("finished_successfully")
         );
+        assert_eq!(
+            value[VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY]["identity_gate"].as_str(),
+            Some(
+                "linear-chain-user-delta-exactly-one-and-single-end-turn-answer-after-newest-prompt"
+            )
+        );
+        assert_eq!(
+            value[VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY]["assistant_node_policy"].as_str(),
+            Some("count-only-end-turn-final-answers")
+        );
         let receipt = SessionReceipt::new(0, 0);
         assert!(
             receipt
@@ -6554,6 +6582,12 @@ mod tests {
             .expect("chatgpt backend probe script");
         assert!(script.contains("/backend-api/conversation/"));
         assert!(script.contains("/api/auth/session"));
+        // The probe may only count `end_turn` answers: one ChatGPT turn
+        // expands into several assistant-role nodes, so raw assistant-role
+        // counts would misread a single turn as an identity change.
+        assert!(script.contains("message.end_turn === true"));
+        assert!(script.contains("answers_after_last_user"));
+        assert!(!script.contains("const assistants = messages.filter"));
         assert!(build_backend_response_probe_script(Provider::Gemini).is_err());
     }
 
@@ -6596,19 +6630,45 @@ mod tests {
 
     #[test]
     fn backend_response_probe_completes_only_on_finished_fresh_text() {
+        // A finished ChatGPT turn expands into several assistant-role nodes
+        // (code / thoughts / reasoning_recap / final text) that share one
+        // logical turn.  Counting raw assistant-role nodes used to misread
+        // this as an identity change; only the single `end_turn` answer after
+        // the newest prompt may complete the wait.
         let fresh_finished = BackendResponseProbe {
             ok: true,
             conversation_id: "6acede20-a42c-83ee-af58-a14802a5823a".to_string(),
             user_count: 1,
-            assistant_count: 1,
+            answer_count: 1,
+            answers_after_last_user: 1,
             last_assistant_id: "08299039-d17c-4de7-9d94-857e41784792".to_string(),
             last_assistant_status: "finished_successfully".to_string(),
             last_assistant_text: "{\"schema_version\":\"2.0\"}".to_string(),
             reason: String::new(),
         };
         assert_eq!(
-            assess_backend_response_probe(&fresh_finished, 0, 0),
+            assess_backend_response_probe(&fresh_finished, 0),
             BackendResponseDecision::Completed("{\"schema_version\":\"2.0\"}".to_string())
+        );
+
+        let four_assistant_nodes_one_answer = BackendResponseProbe {
+            answer_count: 1,
+            answers_after_last_user: 1,
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&four_assistant_nodes_one_answer, 0),
+            BackendResponseDecision::Completed("{\"schema_version\":\"2.0\"}".to_string())
+        );
+
+        let second_answer_after_prompt = BackendResponseProbe {
+            answer_count: 2,
+            answers_after_last_user: 2,
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&second_answer_after_prompt, 0),
+            BackendResponseDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
         );
 
         let in_progress = BackendResponseProbe {
@@ -6616,7 +6676,7 @@ mod tests {
             ..fresh_finished.clone()
         };
         assert_eq!(
-            assess_backend_response_probe(&in_progress, 0, 0),
+            assess_backend_response_probe(&in_progress, 0),
             BackendResponseDecision::Pending
         );
 
@@ -6625,28 +6685,43 @@ mod tests {
             ..fresh_finished.clone()
         };
         assert_eq!(
-            assess_backend_response_probe(&empty_text, 0, 0),
+            assess_backend_response_probe(&empty_text, 0),
             BackendResponseDecision::Pending
         );
 
         let extra_turn = BackendResponseProbe {
             user_count: 2,
-            assistant_count: 2,
+            answer_count: 2,
+            answers_after_last_user: 2,
             ..fresh_finished.clone()
         };
         assert_eq!(
-            assess_backend_response_probe(&extra_turn, 0, 0),
+            assess_backend_response_probe(&extra_turn, 0),
             BackendResponseDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
         );
 
         let assistant_not_yet = BackendResponseProbe {
-            assistant_count: 0,
+            answer_count: 0,
+            answers_after_last_user: 0,
             last_assistant_status: String::new(),
             last_assistant_text: String::new(),
             ..fresh_finished.clone()
         };
         assert_eq!(
-            assess_backend_response_probe(&assistant_not_yet, 0, 0),
+            assess_backend_response_probe(&assistant_not_yet, 0),
+            BackendResponseDecision::Pending
+        );
+
+        let prompt_not_yet = BackendResponseProbe {
+            user_count: 0,
+            answer_count: 0,
+            answers_after_last_user: 0,
+            last_assistant_status: String::new(),
+            last_assistant_text: String::new(),
+            ..fresh_finished.clone()
+        };
+        assert_eq!(
+            assess_backend_response_probe(&prompt_not_yet, 0),
             BackendResponseDecision::Pending
         );
 
@@ -6656,7 +6731,7 @@ mod tests {
             ..fresh_finished
         };
         assert_eq!(
-            assess_backend_response_probe(&failed_probe, 0, 0),
+            assess_backend_response_probe(&failed_probe, 0),
             BackendResponseDecision::Pending
         );
     }
@@ -12725,7 +12800,8 @@ fn build_backend_response_probe_script(provider: Provider) -> Result<String, Str
                 reason: '',
                 conversation_id: '',
                 user_count: 0,
-                assistant_count: 0,
+                answer_count: 0,
+                answers_after_last_user: 0,
                 last_assistant_id: '',
                 last_assistant_status: '',
                 last_assistant_text: ''
@@ -12786,21 +12862,41 @@ fn build_backend_response_probe_script(provider: Provider) -> Result<String, Str
                     .filter((node) => node && node.message)
                     .map((node) => node.message);
                 messages.sort((left, right) => (left.create_time || 0) - (right.create_time || 0));
-                const users = messages.filter(
-                    (message) => message.author && message.author.role === 'user'
+                const isUserPrompt = (message) => Boolean(
+                    message.author
+                    && message.author.role === 'user'
+                    && !message.author.name
                 );
-                const assistants = messages.filter(
-                    (message) => message.author && message.author.role === 'assistant'
+                // ChatGPT expands one logical turn into several assistant-role
+                // nodes (code, thoughts, reasoning_recap, then the final text).
+                // Only the provider's turn boundary marker `end_turn === true`
+                // identifies the message that actually answers the prompt.
+                const isAnswer = (message) => Boolean(
+                    message.author
+                    && message.author.role === 'assistant'
+                    && message.end_turn === true
                 );
-                result.user_count = users.length;
-                result.assistant_count = assistants.length;
-                const lastAssistant = assistants.length > 0 ? assistants[assistants.length - 1] : null;
-                if (lastAssistant) {{
-                    result.last_assistant_id = lastAssistant.id || '';
-                    result.last_assistant_status = lastAssistant.status || '';
+                let lastUserIndex = -1;
+                messages.forEach((message, index) => {{
+                    if (isUserPrompt(message)) {{
+                        lastUserIndex = index;
+                    }}
+                }});
+                const answersAfterLastUser = messages.filter(
+                    (message, index) => index > lastUserIndex && isAnswer(message)
+                );
+                result.user_count = messages.filter(isUserPrompt).length;
+                result.answer_count = messages.filter(isAnswer).length;
+                result.answers_after_last_user = answersAfterLastUser.length;
+                const lastAnswer = answersAfterLastUser.length > 0
+                    ? answersAfterLastUser[answersAfterLastUser.length - 1]
+                    : null;
+                if (lastAnswer) {{
+                    result.last_assistant_id = lastAnswer.id || '';
+                    result.last_assistant_status = lastAnswer.status || '';
                     const contentType =
-                        (lastAssistant.content && lastAssistant.content.content_type) || '';
-                    const parts = (lastAssistant.content && lastAssistant.content.parts) || [];
+                        (lastAnswer.content && lastAnswer.content.content_type) || '';
+                    const parts = (lastAnswer.content && lastAnswer.content.parts) || [];
                     const textParts = parts.filter(
                         (part) => typeof part === 'string' && part.length > 0
                     );
@@ -14299,13 +14395,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match assess_backend_response_probe(
                         &backend_probe,
                         response_baseline.initial_user_count,
-                        response_baseline.initial_assistant_count,
                     ) {
                         BackendResponseDecision::Pending => {}
                         BackendResponseDecision::Completed(text) => {
                             break ResponseWaitOutcome::BackendText(text);
                         }
                         BackendResponseDecision::Unknown(code) => {
+                            if command_verbose {
+                                eprintln!(
+                                    "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
+                                    code,
+                                    backend_probe.user_count,
+                                    backend_probe.answer_count,
+                                    backend_probe.answers_after_last_user,
+                                    backend_probe.last_assistant_status
+                                );
+                            }
                             break ResponseWaitOutcome::Unknown(code);
                         }
                     }
@@ -14434,7 +14539,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let BackendResponseDecision::Completed(text) = assess_backend_response_probe(
                         &backend_probe,
                         response_baseline.initial_user_count,
-                        response_baseline.initial_assistant_count,
                     ) {
                         if command_verbose {
                             println!(

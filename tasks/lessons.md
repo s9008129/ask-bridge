@@ -64,3 +64,14 @@
   - Chrome fixture 固定驗證 nested／agent-only／role-only／sibling selector counts；state machine 固定覆蓋 home→conversation、WEB→UUID、Stop remount 與真正 turn／artifact change。
   - refusal fixture 固定要求單次／兩次 marker probe 維持 Pending，第三次穩定才 Unknown；普通串流文字、marker 消失或大圖出現不得誤判拒絕。
   - 每次真實 provider E2E 先保存 low-sensitivity manifest／receipt／hash；看到 `prompt_submission=submitted` 後不重送，並把 provider failure 與 bridge timeout 分開記錄。
+
+## 2026-10-16 後端 conversation 的 assistant 節點數不是回合數
+
+- Mistake class: incorrect assumption about provider API shape、missing verification。
+- Failure mode: ChatGPT 一則邏輯回覆在 `/backend-api/conversation/<id>` 上會展開成多個 assistant-role 節點（`code`／`thoughts`／`reasoning_recap`／最終 `text`，GPT-6 思考型實測 4 個；其他模式可能只有 1 個），只有最終節點帶 `end_turn=true`、`channel=final`。舊的後端身分閘以 raw assistant-role 節點數做「送出後只可 +1」的比較，生成中一出現第 2 個節點就判 `ResponseIdentityChanged` fail-closed——文字型語意抽取批次每次都約 40–50 秒內 exit 1、重試同樣失敗，而 ChatGPT 其實早已正常回覆（使用者批次 2 topics × 2 次全敗）。
+- Detection signal: receipt `response_failure_code=response_identity_changed`＋`prompt_submission=submitted`＋`response_completion=unknown`、exit 1；但唯讀 CDP 直讀後端鏈可見同一回合多個 assistant-role 節點、僅最後一個 `end_turn=true`。
+- Prevention rule: 對話鏈的「回合數」只能採用 provider 自己宣告的邊界（`end_turn === true` 的 final answer），不得以 raw role 節點數推論；身分閘形狀應為「user 增量恰為 1＋最新 user 之後恰有 0／1 個答案」，>1 才 fail-closed。user prompt 判定要排除帶 `author.name` 的 tool／context 節點；節點數依模型／模式而異，任何「固定 +N」的假設都會再漂移。
+- Tripwires:
+  - Rust 回歸固定覆蓋「同回合 4 個 assistant-role 節點、僅 1 個 `end_turn` → Completed」、「最新 user 之後出現第 2 個 `end_turn` → `response_identity_changed`」、「prompt 未出現 → Pending」、「probe 尚未有答案 → Pending」。
+  - 出貨 probe 腳本負向斷言：不得再出現 raw assistant 過濾計數（`const assistants = messages.filter`）；必須含 `message.end_turn === true`。
+  - 真實 provider 驗收後以 CDP 讀 `/backend-api/conversation/<id>` 留原證（如 `cdp-backend-chain-raw.txt`：role／name／content_type／status／end_turn 逐節點清單），不只看 receipt。
