@@ -31,6 +31,7 @@ const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY: &str = "verified_text_response_backend_v1";
 const VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY: &str = "verified_logical_turn_image_v1";
+const STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY: &str = "structured_failure_diagnostics_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
 const BACKGROUND_LOGIN_LAUNCH_CAPABILITY: &str = "background_login_launch_v1";
@@ -41,6 +42,106 @@ const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
 const PROMPT_SUBMISSION_FAILURE_STAGE: &str = "prompt_submission";
 const PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE: &str = "PROMPT_SUBMISSION_PRECLICK_FAILED";
 const PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE: &str = "PROMPT_SUBMISSION_STATE_UNKNOWN";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StructuredDiagnosticCode {
+    LeaseUnavailable,
+    RuntimePreflightFailed,
+    ChromeStartFailed,
+    ProviderTabFailed,
+    McpTransportFailed,
+    SessionReceiptFailed,
+    UnclassifiedFailure,
+}
+
+impl StructuredDiagnosticCode {
+    #[cfg(test)]
+    const ALL: [Self; 7] = [
+        Self::LeaseUnavailable,
+        Self::RuntimePreflightFailed,
+        Self::ChromeStartFailed,
+        Self::ProviderTabFailed,
+        Self::McpTransportFailed,
+        Self::SessionReceiptFailed,
+        Self::UnclassifiedFailure,
+    ];
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::LeaseUnavailable => "lease_unavailable",
+            Self::RuntimePreflightFailed => "runtime_preflight_failed",
+            Self::ChromeStartFailed => "chrome_start_failed",
+            Self::ProviderTabFailed => "provider_tab_failed",
+            Self::McpTransportFailed => "mcp_transport_failed",
+            Self::SessionReceiptFailed => "session_receipt_failed",
+            Self::UnclassifiedFailure => "unclassified_failure",
+        }
+    }
+
+    fn stage(self) -> &'static str {
+        match self {
+            Self::LeaseUnavailable => "lease",
+            Self::RuntimePreflightFailed => "runtime_preflight",
+            Self::ChromeStartFailed => "chrome_start",
+            Self::ProviderTabFailed => "provider_tab",
+            Self::McpTransportFailed => "mcp_transport",
+            Self::SessionReceiptFailed => "session_receipt",
+            Self::UnclassifiedFailure => "unclassified",
+        }
+    }
+}
+
+static STRUCTURED_DIAGNOSTIC_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SESSION_RECEIPT_CREATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn format_structured_diagnostic(code: StructuredDiagnosticCode) -> String {
+    format!(
+        "ASK_BRIDGE_DIAGNOSTIC v1 code={} stage={}",
+        code.token(),
+        code.stage()
+    )
+}
+
+fn emit_structured_diagnostic(code: StructuredDiagnosticCode) {
+    if STRUCTURED_DIAGNOSTIC_EMITTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        eprintln!("{}", format_structured_diagnostic(code));
+    }
+}
+
+fn diagnostic_for_boundary(
+    default: StructuredDiagnosticCode,
+    message: &str,
+) -> StructuredDiagnosticCode {
+    if mcp_error_is_transport(message) {
+        StructuredDiagnosticCode::McpTransportFailed
+    } else {
+        default
+    }
+}
+
+fn fallback_structured_diagnostic(
+    message: &str,
+    receipt_created: bool,
+) -> Option<StructuredDiagnosticCode> {
+    if receipt_created {
+        return None;
+    }
+    Some(if mcp_error_is_transport(message) {
+        StructuredDiagnosticCode::McpTransportFailed
+    } else {
+        StructuredDiagnosticCode::UnclassifiedFailure
+    })
+}
 
 const ATTACHMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Dynamic attachment verification timeout scaled by the number of files.
@@ -1926,6 +2027,7 @@ fn write_session_receipt(
     if persisted != receipt {
         return Err("session receipt 驗證失敗：內容與本次工作不一致".to_string());
     }
+    SESSION_RECEIPT_CREATED.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(path)
 }
 
@@ -1949,7 +2051,8 @@ fn capabilities_value() -> Value {
             VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
             VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
             VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY,
-            VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY
+            VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY,
+            STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY
         ],
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
@@ -2284,6 +2387,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);
         println!("  {}", VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY);
         println!("  {}", VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY);
+        println!("  {}", STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
     Ok(())
@@ -4384,6 +4488,7 @@ mod tests {
         assert!(advertised.contains(&VERIFIED_FILE_UPLOAD_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MIXED_ATTACHMENT_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY));
+        assert!(advertised.contains(&STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_V2_CAPABILITY));
         assert!(advertised.contains(&VERIFIED_MODEL_SELECTION_V3_CAPABILITY));
@@ -6761,6 +6866,93 @@ mod tests {
         assert_eq!(
             strip_chatgpt_escape_wrapper("prefix <escape>value</escape> suffix"),
             "prefix <escape>value</escape> suffix"
+        );
+    }
+
+    #[test]
+    fn chatgpt_transport_envelope_decodes_only_the_exact_observed_shape() {
+        let envelope = concat!(
+            "{\"alpha\":1,\\\n",
+            "&#x20;\"beta\":\"&#x20;\u{4e2d}\",\\\n",
+            "&#x20;&#x20;\"gamma\":[true,false]\\\n",
+            "}"
+        );
+        assert_eq!(
+            decode_chatgpt_transport_envelope(envelope),
+            "{\"alpha\":1,\"beta\":\"&#x20;\u{4e2d}\",\"gamma\":[true,false]}"
+        );
+
+        let nested_escape = format!("<escape>{envelope}</escape>");
+        assert_eq!(
+            decode_chatgpt_transport_envelope(&strip_chatgpt_escape_wrapper(&nested_escape)),
+            "{\"alpha\":1,\"beta\":\"&#x20;\u{4e2d}\",\"gamma\":[true,false]}"
+        );
+    }
+
+    #[test]
+    fn chatgpt_transport_envelope_leaves_non_matching_text_unchanged() {
+        let normal_json = "{\"ok\":true}";
+        assert_eq!(decode_chatgpt_transport_envelope(normal_json), normal_json);
+
+        let unknown_entity = "{\"alpha\":1,\\\n&lt;\"beta\":2\\\n}";
+        assert_eq!(
+            decode_chatgpt_transport_envelope(unknown_entity),
+            unknown_entity
+        );
+
+        let partial = "{\"alpha\":1,\\\n&#x20;\"beta\":2";
+        assert_eq!(decode_chatgpt_transport_envelope(partial), partial);
+
+        let mixed_prose = "Here is the answer:\n{\"alpha\":1,\\\n&#x20;\"beta\":2\\\n}";
+        assert_eq!(decode_chatgpt_transport_envelope(mixed_prose), mixed_prose);
+    }
+
+    #[test]
+    fn chatgpt_transport_envelope_does_not_decode_entity_inside_json_string() {
+        let text = "{\"alpha\":\"value\\\n&#x20;still-the-same-string\\\n}";
+        assert_eq!(decode_chatgpt_transport_envelope(text), text);
+    }
+
+    #[test]
+    fn structured_failure_diagnostic_has_only_allowlisted_tokens() {
+        let expected = [
+            "lease_unavailable",
+            "runtime_preflight_failed",
+            "chrome_start_failed",
+            "provider_tab_failed",
+            "mcp_transport_failed",
+            "session_receipt_failed",
+            "unclassified_failure",
+        ];
+        for (code, expected_token) in StructuredDiagnosticCode::ALL.iter().zip(expected) {
+            assert_eq!(code.token(), expected_token);
+            let line = format_structured_diagnostic(*code);
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0], "ASK_BRIDGE_DIAGNOSTIC");
+            assert_eq!(fields[1], "v1");
+            assert_eq!(fields[2], format!("code={expected_token}"));
+            assert!(fields[3].starts_with("stage="));
+        }
+    }
+
+    #[test]
+    fn fallback_diagnostic_is_emitted_only_before_receipt_creation() {
+        assert_eq!(
+            fallback_structured_diagnostic("unexpected application error", false),
+            Some(StructuredDiagnosticCode::UnclassifiedFailure)
+        );
+        assert_eq!(
+            fallback_structured_diagnostic("MCP request timed out after 30s", false),
+            Some(StructuredDiagnosticCode::McpTransportFailed)
+        );
+        assert_eq!(
+            fallback_structured_diagnostic("unexpected application error", true),
+            None
+        );
+        assert_eq!(
+            fallback_structured_diagnostic("MCP request timed out after 30s", true),
+            None
         );
     }
 
@@ -12928,8 +13120,8 @@ fn fetch_backend_response_probe(
     parse_script_result(&result).and_then(|value| {
         serde_json::from_value::<BackendResponseProbe>(value)
             .map(|mut probe| {
-                probe.last_assistant_text =
-                    strip_chatgpt_escape_wrapper(&probe.last_assistant_text);
+                let unwrapped = strip_chatgpt_escape_wrapper(&probe.last_assistant_text);
+                probe.last_assistant_text = decode_chatgpt_transport_envelope(&unwrapped);
                 probe
             })
             .map_err(|error| format!("Backend response probe returned an invalid payload: {error}"))
@@ -12952,6 +13144,80 @@ fn strip_chatgpt_escape_wrapper(text: &str) -> String {
         value = inner.trim().to_string();
     }
     value
+}
+
+/// Decode ChatGPT's exact backend-text transport envelope.
+///
+/// The observed backend response is a JSON object rendered as physical lines:
+/// the first line starts with ``{`` and ends in one continuation backslash,
+/// every middle line starts with one or more literal ``&#x20;`` prefixes and
+/// ends in one continuation backslash, and the final line is exactly ``}``.
+/// Only those transport markers are removed.  Partial, mixed-prose, unknown-
+/// entity and malformed envelopes are returned byte-for-byte unchanged so the
+/// downstream JSON parser can fail closed.
+fn decode_chatgpt_transport_envelope(text: &str) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let Some(first) = lines.first() else {
+        return text.to_string();
+    };
+    if lines.len() < 2 || lines.last().copied() != Some("}") {
+        return text.to_string();
+    }
+    if !first.starts_with('{') || trailing_backslash_count(first) != 1 {
+        return text.to_string();
+    }
+
+    let mut decoded = first[..first.len() - 1].to_string();
+    let (mut in_string, _) = scan_json_string_state(&decoded);
+    for line in &lines[1..lines.len() - 1] {
+        if in_string {
+            return text.to_string();
+        }
+        let (core, entity_count) = strip_transport_prefixes(line);
+        if entity_count == 0 || trailing_backslash_count(core) != 1 {
+            return text.to_string();
+        }
+        decoded.push_str(&core[..core.len() - 1]);
+        (in_string, _) = scan_json_string_state(&decoded);
+    }
+    if in_string {
+        return text.to_string();
+    }
+    decoded.push('}');
+    decoded
+}
+
+fn trailing_backslash_count(value: &str) -> usize {
+    value.len() - value.trim_end_matches('\\').len()
+}
+
+fn strip_transport_prefixes(line: &str) -> (&str, usize) {
+    let mut rest = line;
+    let mut count = 0;
+    while let Some(stripped) = rest.strip_prefix("&#x20;") {
+        rest = stripped;
+        count += 1;
+    }
+    (rest, count)
+}
+
+fn scan_json_string_state(value: &str) -> (bool, bool) {
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in value.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else if character == '"' {
+            in_string = true;
+        }
+    }
+    (in_string, escaped)
 }
 
 fn execute_verified_prompt_submission<Baseline, Upload, BeforeSubmit, Submit>(
@@ -13103,7 +13369,11 @@ fn ensure_isolated_provider_tab(
             attachment_summary.total_bytes,
             expected_output_type,
         )
-        .inspect_err(|_| clear_owned_page())?;
+        .map_err(|error| {
+            emit_structured_diagnostic(StructuredDiagnosticCode::SessionReceiptFailed);
+            clear_owned_page();
+            error
+        })?;
         if verbose {
             println!(
                 "Owned {} page ID {} for session {}.",
@@ -13589,7 +13859,21 @@ fn recv_piped_stdin(
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(error) = run_cli() {
+        let message = error.to_string();
+        if let Some(code) = fallback_structured_diagnostic(
+            &message,
+            SESSION_RECEIPT_CREATED.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
+            emit_structured_diagnostic(code);
+        }
+        eprintln!("Error: {}", message);
+        std::process::exit(1);
+    }
+}
+
+fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
     if cli.command.is_none() {
         let is_stdin_terminal = io::stdin().is_terminal();
@@ -13654,18 +13938,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // upload and response polling. Unlocking earlier would let another
     // process steal the selected page between two MCP calls.
     let _provider_lease = if let Some(session_id) = safe_session_id.as_deref() {
-        Some(acquire_provider_lease(provider, session_id)?)
+        match acquire_provider_lease(provider, session_id) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                emit_structured_diagnostic(StructuredDiagnosticCode::LeaseUnavailable);
+                eprintln!("Error: {}", error);
+                std::process::exit(1);
+            }
+        }
     } else {
         None
     };
 
     if let Err(e) = validate_provider_feature_support(provider, &cli) {
+        emit_structured_diagnostic(StructuredDiagnosticCode::RuntimePreflightFailed);
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
     let attachment_summary = match summarize_attachments(&cli.images, &cli.files) {
         Ok(summary) => summary,
         Err(error) => {
+            emit_structured_diagnostic(StructuredDiagnosticCode::RuntimePreflightFailed);
             eprintln!("Error: {}", error);
             std::process::exit(1);
         }
@@ -13726,6 +14019,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Err(e) = check_node_runtime() {
+        emit_structured_diagnostic(StructuredDiagnosticCode::RuntimePreflightFailed);
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -13733,12 +14027,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = match write_mcp_config(!command_verbose, is_headless) {
         Ok(path) => path,
         Err(e) => {
+            emit_structured_diagnostic(StructuredDiagnosticCode::RuntimePreflightFailed);
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
 
     if let Err(e) = start_chrome_if_needed(chrome_start, command_verbose) {
+        emit_structured_diagnostic(StructuredDiagnosticCode::ChromeStartFailed);
         eprintln!("Error starting Chrome: {}", e);
         std::process::exit(1);
     }
@@ -14119,6 +14415,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(path) => Some(path),
             Err(error) => {
+                emit_structured_diagnostic(diagnostic_for_boundary(
+                    StructuredDiagnosticCode::ProviderTabFailed,
+                    &error,
+                ));
                 eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);
                 std::process::exit(1);
             }
@@ -14131,6 +14431,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             background_tab,
             command_verbose,
         ) {
+            emit_structured_diagnostic(diagnostic_for_boundary(
+                StructuredDiagnosticCode::ProviderTabFailed,
+                &error,
+            ));
             eprintln!("Error ensuring {} tab: {}", provider.display_name(), error);
             std::process::exit(1);
         }

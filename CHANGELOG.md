@@ -17,6 +17,9 @@
 - 版本推進至 `0.2.11-preserve.2`（`Cargo.toml`／`Cargo.lock` 同步；`package.json`、`install.sh`、`install.ps1`、`scripts/ask.sh` 沿用既有慣例，維持 `0.2.10`）。
 - 更新 `verified_text_response_backend_v1` capability：`identity_gate` 改為 `linear-chain-user-delta-exactly-one-and-single-end-turn-answer-after-newest-prompt`，並新增 `assistant_node_policy=count-only-end-turn-final-answers`，宣告「一則邏輯回覆可展開成多個 assistant-role 節點、只有 `end_turn` 終結節點算答案」，整合工具可據此確認身分閘語意。
 - 版本推進至 `0.2.11-preserve.3`（`Cargo.toml`／`Cargo.lock` 同步；`package.json`、`install.sh`、`install.ps1`、`scripts/ask.sh` 沿用既有慣例，維持 `0.2.10`）。
+- 新增 `structured_failure_diagnostics_v1` capability 與固定 stderr 診斷格式 `ASK_BRIDGE_DIAGNOSTIC v1 code=<token> stage=<token>`；代碼採固定 allowlist，整合工具可只保存正規化 token，不需保留原始錯誤字串。
+- ChatGPT backend conversation text 新增 fail-closed transport envelope 解碼：只接受完整的 `{...\`／`&#x20;...\`／`}` 行續接格式，先移除既有 `<escape>` wrapper，再去除固定 transport markers；partial、mixed prose、未知 entity 與字串內 `&#x20;` 均保持原樣。
+- 版本推進至 `0.2.11-preserve.4`（`Cargo.toml`／`Cargo.lock` 同步；`package.json`、`install.sh`、`install.ps1`、`scripts/ask.sh` 沿用既有慣例，維持 `0.2.10`）。
 
 ### 🔧 修復 (Fixed)
 - 修正 macOS 冷啟動 managed Chrome 的搶前景問題：不再以 `Command::spawn` 直接啟動 Chrome 執行檔（此舉會觸發 macOS app activation，使 Chrome 成為 frontmost app），改以 LaunchServices `open -g -j -n -a` 搭配 `--no-startup-window` 隱藏啟動；`open` 失敗時直接回報錯誤，**不會**退回會搶前景的直 spawn。
