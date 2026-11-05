@@ -1349,3 +1349,107 @@ test('ChatGPT reasoning control resolves a roleless focusable owner inside the c
   );
   assert.equal(result.bundle_error, undefined, 'a roleless focusable owner must not fail the bundle');
 });
+
+test('ChatGPT DOM contract prefers the current composer and form submit with a legacy fallback', { skip: !chrome }, () => {
+  const main = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  const promptInput = readFileSync(join(repoRoot, 'src', 'chatgpt_prompt_input.js'), 'utf8');
+
+  assert.match(
+    main,
+    /\[data-composer-markdown\]\[contenteditable=\\?"true\\?"\][\s\S]*#prompt-textarea/,
+    'the current ProseMirror composer must be declared before the legacy textarea',
+  );
+  assert.match(
+    main,
+    /form\[data-chatgpt-composer\] button\[type=\\?"submit\\?"\][\s\S]*#composer-submit-button/,
+    'the current form submit button must be declared before the legacy ids',
+  );
+  assert.match(main, /\[data-testid="login-form"\]/, 'ready check must accept the login form');
+  assert.match(main, /\/\(auth\|login\|signup\)\(\\\/\|\$\)\/i/, 'ready check must accept auth paths');
+  assert.match(main, /\[data-talvt-turn-state\]/, 'response probing must read the current turn state');
+  assert.match(main, /latestTurnState === 'in_progress'/, 'in-progress turns must count as generating');
+  assert.match(main, /\[role="alert"\]/, 'provider rejection must read visible alert elements');
+  assert.match(main, /你提交的訊息太長/, 'the localized message-limit rejection must be recognized');
+  assert.match(main, /provider_failure_signature/, 'provider alerts need a stable DOM signature');
+  assert.match(main, /provider_rejected: ChatGPT rejected/, 'post-click rejection must terminate submission promptly');
+  assert.match(main, /fn chatgpt_chat_mode_script\(\)/, 'the Chat/Work mode guard must exist');
+  assert.match(main, /:scope > button\[aria-pressed\]/, 'the mode guard must use the bounded toggle shape');
+  assert.match(main, /isStopButton/, 'prompt submission must never click a stop control');
+  assert.match(
+    promptInput,
+    /const selectors = \['\[data-composer-markdown\]\[contenteditable="true"\]', '#prompt-textarea'/,
+    'native prompt insertion must try the current composer first',
+  );
+  assert.match(promptInput, /--replace-existing/, 'owned isolated tabs must replace restored drafts');
+  assert.match(promptInput, /composer-not-empty/, 'unowned tabs must fail closed instead of appending');
+  assert.match(
+    promptInput,
+    /prompt insertion verification failed/,
+    'prompt insertion must verify that the composer contains only the requested prompt',
+  );
+  assert.match(
+    promptInput,
+    /replace\(\/\\\\s\+\/g, ' '\)/,
+    'prompt verification must normalize composer whitespace before comparing',
+  );
+
+  const result = renderFixture(`<!doctype html>
+    <main>
+      <div id="composer-current" data-composer-markdown contenteditable="true" role="textbox"></div>
+      <textarea id="composer-legacy"></textarea>
+      <form data-chatgpt-composer>
+        <button id="submit-current" type="submit" aria-label="傳送">傳送</button>
+      </form>
+      <button id="submit-legacy">legacy</button>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const composerSelectors = [
+        '[data-composer-markdown][contenteditable="true"]',
+        '#prompt-textarea',
+        '[data-testid="composer-text-input"]',
+        '[role="textbox"][contenteditable="true"]',
+      ];
+      const sendSelectors = [
+        'form[data-chatgpt-composer] button[type="submit"]',
+        '[data-testid="send-button"]',
+        '#composer-submit-button',
+      ];
+      const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+      const send = sendSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+      document.querySelector('#result').textContent = JSON.stringify({
+        composer: composer ? composer.id : null,
+        send: send ? send.id : null,
+      });
+    </script>`);
+
+  assert.deepEqual(result, { composer: 'composer-current', send: 'submit-current' });
+
+  const legacy = renderFixture(`<!doctype html>
+    <main>
+      <textarea id="prompt-textarea"></textarea>
+      <button id="composer-submit-button">legacy</button>
+      <pre id="result"></pre>
+    </main>
+    <script>
+      const composerSelectors = [
+        '[data-composer-markdown][contenteditable="true"]',
+        '#prompt-textarea',
+        '[data-testid="composer-text-input"]',
+        '[role="textbox"][contenteditable="true"]',
+      ];
+      const sendSelectors = [
+        'form[data-chatgpt-composer] button[type="submit"]',
+        '[data-testid="send-button"]',
+        '#composer-submit-button',
+      ];
+      const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+      const send = sendSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+      document.querySelector('#result').textContent = JSON.stringify({
+        composer: composer ? composer.id : null,
+        send: send ? send.id : null,
+      });
+    </script>`);
+
+  assert.deepEqual(legacy, { composer: 'prompt-textarea', send: 'composer-submit-button' });
+});

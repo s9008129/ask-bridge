@@ -330,14 +330,22 @@ impl Provider {
             Provider::ChatGpt => {
                 r#"() => {
                 if (document.readyState !== 'complete' || !document.body) return false;
-                return Boolean(
-                    document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]') ||
-                    document.querySelector('[data-testid="profile-button"], button[aria-label*="個人檔案"]') ||
-                    Array.from(document.querySelectorAll('a, button')).some((el) =>
-                        /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册)$/i.test(
+                const hasAuthButton = Array.from(document.querySelectorAll('a, button'))
+                    .some((el) => el.getClientRects().length > 0 &&
+                        /^(log in|login|sign in|sign up|登入|登錄|登录|註冊|注册|免費註冊)$/i.test(
                             (el.getAttribute('aria-label') || el.textContent || '').trim()
                         )
-                    )
+                    );
+                return Boolean(
+                    document.querySelector('[data-composer-markdown][contenteditable="true"]') ||
+                    document.querySelector('#prompt-textarea') ||
+                    document.querySelector('[data-testid="composer-text-input"]') ||
+                    document.querySelector('[role="textbox"][contenteditable="true"]') ||
+                    document.querySelector('[data-testid="login-form"]') ||
+                    /\/(auth|login|signup)(\/|$)/i.test(window.location.pathname) ||
+                    document.querySelector('[data-testid="profile-button"]') ||
+                    document.querySelector('button[aria-label*="個人檔案"]') ||
+                    hasAuthButton
                 );
             }"#
             }
@@ -401,6 +409,7 @@ impl Provider {
                             });
 
                         const composer = firstVisible([
+                            '[data-composer-markdown][contenteditable="true"]',
                             '#prompt-textarea',
                             '[data-testid="composer-text-input"]',
                             'textarea[placeholder*="Message"]',
@@ -420,6 +429,7 @@ impl Provider {
                             'button[aria-label*="user"]',
                             'button[aria-label*="帳戶"]',
                             'button[aria-label*="個人檔案"]',
+                            'button[aria-label*="个人资料"]',
                             'button[aria-label*="使用者"]',
                             'button[aria-label*="設定檔"]'
                         ]);
@@ -573,7 +583,12 @@ impl Provider {
     fn composer_selectors_json(self) -> &'static str {
         match self {
             Provider::ChatGpt => {
-                r##"["#prompt-textarea", "[data-testid=\"composer-text-input\"]", "[role=\"textbox\"][contenteditable=\"true\"]"]"##
+                r##"[
+                    "[data-composer-markdown][contenteditable=\"true\"]",
+                    "#prompt-textarea",
+                    "[data-testid=\"composer-text-input\"]",
+                    "[role=\"textbox\"][contenteditable=\"true\"]"
+                ]"##
             }
             Provider::Gemini => {
                 r#"[
@@ -596,6 +611,7 @@ impl Provider {
         match self {
             Provider::ChatGpt => {
                 r##"[
+                    "form[data-chatgpt-composer] button[type=\"submit\"]",
                     "[data-testid=\"send-button\"]",
                     "#composer-submit-button",
                     "button[aria-label*=\"Send\"]",
@@ -1062,6 +1078,7 @@ struct ResponseDomProbe {
     content_present: bool,
     content_text_length: usize,
     provider_failure_visible: bool,
+    provider_failure_signature: String,
     loaded_large_image_count: usize,
     dom_signature: String,
 }
@@ -1249,6 +1266,34 @@ impl ResponseCompletionTracker {
             self.reset_stability();
             return ResponseTrackerDecision::Pending;
         }
+
+        // ChatGPT's composer-level rejection is rendered as a visible
+        // ``role="alert"`` outside the assistant turn.  In particular the
+        // "message is too long" response creates no assistant node at all, so
+        // waiting for assistant_count to increase would run until timeout.
+        // Require the alert marker and DOM signature to remain stable before
+        // failing closed; the submitted receipt still stays ambiguous.
+        if probe.provider_failure_visible
+            && !probe.provider_failure_signature.is_empty()
+            && probe.loaded_large_image_count == 0
+            && !probe.generation_control_visible
+            && probe.conversation_id.starts_with("conversation:")
+            && probe.artifact_ids.is_empty()
+        {
+            if self.provider_failure_signature.as_deref()
+                == Some(probe.provider_failure_signature.as_str())
+            {
+                self.provider_failure_probes = self.provider_failure_probes.saturating_add(1);
+            } else {
+                self.provider_failure_signature = Some(probe.provider_failure_signature.clone());
+                self.provider_failure_probes = 1;
+            }
+            if self.provider_failure_probes >= RESPONSE_REQUIRED_STABLE_PROBES {
+                return self.finish_unknown(ResponseFailureCode::ProviderRejected);
+            }
+            return ResponseTrackerDecision::Pending;
+        }
+
         if probe.assistant_count == self.initial_assistant_count {
             if self.response_conversation_id.is_some() {
                 return self.finish_unknown(ResponseFailureCode::AssistantCountChanged);
@@ -1348,34 +1393,6 @@ impl ResponseCompletionTracker {
                 None => self.response_artifact_ids = Some(probe.artifact_ids.clone()),
                 Some(_) => {}
             }
-        }
-
-        if self.expected_output_type == ExpectedOutputType::Image
-            && probe.provider_failure_visible
-            && probe.content_present
-            && probe.loaded_large_image_count == 0
-            && !probe.dom_signature.is_empty()
-            && probe.conversation_id.starts_with("conversation:")
-            && !probe.turn_id.is_empty()
-            && probe.artifact_ids.is_empty()
-        {
-            // A provider refusal is a terminal response, but it does not
-            // satisfy the image artifact contract.  Require the same
-            // provider marker and DOM signature to persist for the normal
-            // stability window so a transient error label cannot terminate a
-            // still-streaming response.  Once stable, fail closed instead of
-            // waiting for the full provider timeout; the submitted receipt
-            // remains ambiguous for the caller.
-            if self.provider_failure_signature.as_deref() == Some(probe.dom_signature.as_str()) {
-                self.provider_failure_probes = self.provider_failure_probes.saturating_add(1);
-            } else {
-                self.provider_failure_signature = Some(probe.dom_signature.clone());
-                self.provider_failure_probes = 1;
-            }
-            if self.provider_failure_probes >= RESPONSE_REQUIRED_STABLE_PROBES {
-                return self.finish_unknown(ResponseFailureCode::ProviderRejected);
-            }
-            return ResponseTrackerDecision::Pending;
         }
 
         let artifact_ready = match self.expected_output_type {
@@ -1557,6 +1574,7 @@ enum PromptSubmissionFailureDisposition {
 struct PromptSubmissionFailure {
     disposition: PromptSubmissionFailureDisposition,
     message: String,
+    response_failure_code: Option<ResponseFailureCode>,
 }
 
 impl PromptSubmissionFailure {
@@ -1564,6 +1582,7 @@ impl PromptSubmissionFailure {
         Self {
             disposition: PromptSubmissionFailureDisposition::SafeBeforeClick,
             message: message.into(),
+            response_failure_code: None,
         }
     }
 
@@ -1571,6 +1590,15 @@ impl PromptSubmissionFailure {
         Self {
             disposition: PromptSubmissionFailureDisposition::UnknownAfterClick,
             message: message.into(),
+            response_failure_code: None,
+        }
+    }
+
+    fn provider_rejected(message: impl Into<String>) -> Self {
+        Self {
+            disposition: PromptSubmissionFailureDisposition::UnknownAfterClick,
+            message: message.into(),
+            response_failure_code: Some(ResponseFailureCode::ProviderRejected),
         }
     }
 
@@ -1927,6 +1955,7 @@ fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Resu
 fn record_prompt_submission_failure(
     path: &Path,
     disposition: PromptSubmissionFailureDisposition,
+    response_failure_code: Option<ResponseFailureCode>,
 ) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     if receipt.attachment_verification != AttachmentVerification::Verified
@@ -1947,7 +1976,9 @@ fn record_prompt_submission_failure(
         PromptSubmissionFailureDisposition::UnknownAfterClick => {
             receipt.failure_code = Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE.to_string());
             receipt.response_completion = ResponseCompletion::Unknown;
-            receipt.response_failure_code = Some(ResponseFailureCode::PromptSubmissionStateUnknown);
+            receipt.response_failure_code = Some(
+                response_failure_code.unwrap_or(ResponseFailureCode::PromptSubmissionStateUnknown),
+            );
         }
     }
 
@@ -4915,6 +4946,7 @@ mod tests {
             content_present: assistant_count > 0,
             content_text_length: if assistant_count > 0 { 1000 } else { 0 },
             provider_failure_visible: false,
+            provider_failure_signature: String::new(),
             loaded_large_image_count,
             dom_signature: signature.to_string(),
         }
@@ -5074,7 +5106,47 @@ mod tests {
         let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 0);
         let mut rejected = response_probe(1, false, 0, "provider-rejection");
         rejected.provider_failure_visible = true;
-        rejected.turn_id = "request-WEB:refusal-0".to_string();
+        rejected.provider_failure_signature = "provider-rejection-signature".to_string();
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn image_provider_rejection_without_assistant_turn_fails_fast() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 0);
+        let mut rejected = response_probe(0, false, 0, "no-assistant-yet");
+        rejected.provider_failure_visible = true;
+        rejected.provider_failure_signature = "provider-alert-too-long".to_string();
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn text_provider_rejection_without_assistant_turn_fails_fast() {
+        let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Text, 0, 0);
+        let mut rejected = response_probe(0, false, 0, "no-assistant-yet");
+        rejected.provider_failure_visible = true;
+        rejected.provider_failure_signature = "provider-alert-message-too-long".to_string();
         assert_eq!(
             tracker.observe(rejected.clone()),
             ResponseTrackerDecision::Pending
@@ -5503,6 +5575,40 @@ mod tests {
     }
 
     #[test]
+    fn provider_rejection_during_submission_records_the_typed_failure() {
+        let root = make_test_dir("provider_rejected_submission");
+        let path = root.join("receipt.json");
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_output(0, 0, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        let result = execute_verified_prompt_submission(
+            Some(&path),
+            || Ok(()),
+            || Ok(1usize),
+            || {
+                Err(PromptSubmissionFailure::provider_rejected(
+                    "message too long",
+                ))
+            },
+        );
+        assert!(result.is_err());
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.prompt_submission, PromptSubmission::IntentRecorded);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Unknown);
+        assert_eq!(
+            receipt.response_failure_code,
+            Some(ResponseFailureCode::ProviderRejected)
+        );
+        assert_eq!(
+            receipt.failure_code.as_deref(),
+            Some(PROMPT_SUBMISSION_UNKNOWN_FAILURE_CODE)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn response_probe_contract_checks_token_controls_large_images_and_dom_signature() {
         let baseline = ResponseBaseline {
             initial_user_count: 2,
@@ -5512,6 +5618,8 @@ mod tests {
         let script = build_response_probe_script(Provider::ChatGpt, &baseline).unwrap();
         assert!(script.contains("__ask_bridge_response_owner_v1"));
         assert!(script.contains("generation_control_visible"));
+        assert!(script.contains("[data-talvt-turn-state]"));
+        assert!(script.contains("latestTurnState === 'in_progress'"));
         assert!(script.contains("user_count"));
         assert!(script.contains("img.complete"));
         assert!(script.contains("const minimumImageDimension = 256"));
@@ -5519,6 +5627,9 @@ mod tests {
         assert!(script.contains("naturalHeight < minimumImageDimension"));
         assert!(script.contains("dom_signature"));
         assert!(script.contains("provider_failure_visible"));
+        assert!(script.contains("provider_failure_signature"));
+        assert!(script.contains(r#"[role="alert"]"#));
+        assert!(script.contains("你提交的訊息太長"));
         assert!(script.contains("conversation_id"));
         assert!(script.contains("turn_id"));
         assert!(script.contains("[data-turn-key]"));
@@ -5625,6 +5736,39 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_provider_selectors_prefer_the_current_composer_and_submit_form() {
+        let composers = Provider::ChatGpt.composer_selectors_json();
+        let current = r#"[data-composer-markdown][contenteditable=\"true\"]"#;
+        let legacy = r#"#prompt-textarea"#;
+        assert!(composers.contains(current));
+        assert!(composers.contains(legacy));
+        assert!(
+            composers.find(current) < composers.find(legacy),
+            "the current ProseMirror composer must be tried before the legacy textarea"
+        );
+
+        let sends = Provider::ChatGpt.send_button_selectors_json();
+        let current_submit = r#"form[data-chatgpt-composer] button[type=\"submit\"]"#;
+        assert!(sends.contains(current_submit));
+        assert!(sends.contains(r#"#composer-submit-button"#));
+        assert!(
+            sends.find(current_submit) < sends.find(r#"#composer-submit-button"#),
+            "the current form submit button must be tried before legacy ids"
+        );
+    }
+
+    #[test]
+    fn chatgpt_ready_check_accepts_the_current_composer_and_login_surfaces() {
+        let script = Provider::ChatGpt.ready_check_js();
+
+        assert!(script.contains(r#"[data-composer-markdown][contenteditable="true"]"#));
+        assert!(script.contains(r#"[data-testid="login-form"]"#));
+        assert!(script.contains(r#"/(auth|login|signup)(\/|$)/i"#));
+        assert!(script.contains("getClientRects"));
+        assert!(script.contains("hasAuthButton"));
+    }
+
+    #[test]
     fn chatgpt_submission_verifies_prompt_before_and_after_send() {
         let prompt = format!(
             "workflow prompt begins\n{}\nsource.sha256: {}\nworkflow prompt ends",
@@ -5646,15 +5790,45 @@ mod tests {
         assert!(!script.contains("normalize(latestText).includes(expectedText)"));
         assert!(script.contains("initialUserCount + 1"));
         assert!(script.contains("verification: 'semantic_projection_v2'"));
+        assert!(script.contains("verification: 'backend_conversation_v1'"));
+        assert!(script.contains("provider_rejected: ChatGPT rejected"));
+        assert!(script.contains("providerFailureVisible"));
+        assert!(script.contains("你提交的訊息太長"));
+        assert!(script.contains("verifyBackendPromptEcho"));
+        assert!(script.contains("data.current_node"));
+        assert!(script.contains("baseline_message"));
         assert!(script.contains("data-chatgpt-search-unit-key"));
+        assert!(script.contains(r#"[data-composer-markdown][contenteditable=\"true\"]"#));
+        assert!(script.contains(r#"form[data-chatgpt-composer] button[type=\"submit\"]"#));
+        assert!(script.contains("isStopButton"));
+        assert!(script.contains(
+            ".find((element) => isVisibleAndEnabled(element) && !isStopButton(element))"
+        ));
         assert!(!script.contains("__PROMPT__"));
         assert!(!script.contains("__PROMPT_ECHO_VERIFIER__"));
         assert!(!script.contains("__USER_SELECTOR__"));
         assert!(!script.contains("__SEND_SELECTORS__"));
         assert!(!script.contains("execCommand('insertText'"));
         assert!(input_helper.contains("'Input.insertText'"));
+        assert!(input_helper.contains("--replace-existing"));
+        assert!(input_helper.contains("composer-not-empty"));
+        assert!(input_helper.contains("prompt insertion verification failed"));
+        assert!(input_helper.contains("selectNodeContents(composer)"));
         assert!(input_helper.contains("process.stdin"));
         assert!(input_helper.contains("__ask_bridge_prompt_input_token"));
+    }
+
+    #[test]
+    fn chatgpt_chat_mode_contract_switches_only_through_a_bounded_toggle() {
+        let script = chatgpt_chat_mode_script();
+
+        assert!(script.contains("form[data-chatgpt-composer]"));
+        assert!(script.contains(":scope > button[aria-pressed]"));
+        assert!(script.contains("attempt < 40"));
+        assert!(script.contains("status: 'chat'"));
+        assert!(script.contains("status: 'switched'"));
+        assert!(script.contains("status: 'unavailable'"));
+        assert!(script.contains("status: 'failed'"));
     }
 
     #[test]
@@ -8432,7 +8606,9 @@ mod tests {
         assert!(script.contains("const firstVisible = (selectors) =>"));
         assert!(script.contains("const composer = firstVisible(["));
         assert!(script.contains("const accountMenu = firstVisible(["));
+        assert!(script.contains(r#"'[data-composer-markdown][contenteditable="true"]'"#));
         assert!(script.contains("'button[aria-label*=\"個人檔案\"]'"));
+        assert!(script.contains("'button[aria-label*=\"个人资料\"]'"));
         assert!(
             !script.contains("document.querySelector('button[aria-label*=\"個人檔案\"]')"),
             "the account probe must not lock onto the first matching element, because ChatGPT renders hidden duplicates"
@@ -12051,6 +12227,65 @@ fn switch_model(
     Ok(outcome)
 }
 
+/// ChatGPT splits its composer into "Chat" and "Work" modes. ask-bridge targets
+/// Chat, so switch back when the home composer is left in Work mode. Any
+/// unrecognised toggle shape is left untouched and the current composer is used.
+fn chatgpt_chat_mode_script() -> &'static str {
+    r#"async () => {
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const isChatMode = () => document.querySelector('form[data-chatgpt-composer]') !== null;
+        const findModeGroup = () => Array.from(document.querySelectorAll('[role="group"]'))
+            .find((group) => group.querySelectorAll(':scope > button[aria-pressed]').length === 2);
+
+        if (isChatMode()) return { status: 'chat' };
+
+        const group = findModeGroup();
+        if (!group) return { status: 'unavailable' };
+
+        const buttons = Array.from(group.querySelectorAll(':scope > button[aria-pressed]'));
+        const chatButton = buttons.find((button) =>
+            /^(chat|對話|对话|チャット|채팅)$/i.test((button.innerText || button.textContent || '').trim())
+        ) || buttons[0];
+        chatButton.click();
+
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+            await sleep(125);
+            if (isChatMode()) return { status: 'switched' };
+        }
+        return { status: 'failed', pressed: chatButton.getAttribute('aria-pressed') };
+    }"#
+}
+
+fn ensure_chatgpt_chat_mode(config_path: &str, verbose: bool) -> Result<(), String> {
+    let res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": chatgpt_chat_mode_script() }),
+    )?;
+    let parsed = parse_script_result(&res)?;
+    match parsed.get("status").and_then(|status| status.as_str()) {
+        Some("chat") => Ok(()),
+        Some("switched") => {
+            if verbose {
+                println!("Switched ChatGPT composer from Work to Chat mode.");
+            }
+            Ok(())
+        }
+        Some("unavailable") => {
+            if verbose {
+                println!(
+                    "ChatGPT Chat/Work mode toggle not found; continuing with the current composer."
+                );
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "Failed to switch ChatGPT composer to Chat mode: {}",
+            parsed
+        )),
+    }
+}
+
 fn wait_for_submit_status(config_path: &str) -> Result<String, String> {
     let mut wait_cycles = 0;
     let mut status = String::from("pending");
@@ -12114,6 +12349,9 @@ fn wait_for_chatgpt_submit_status(config_path: &str) -> Result<String, PromptSub
 
     if let Some(message) = status.strip_prefix("safe:") {
         return Err(PromptSubmissionFailure::safe(message.trim()));
+    }
+    if let Some(message) = status.strip_prefix("provider_rejected:") {
+        return Err(PromptSubmissionFailure::provider_rejected(message.trim()));
     }
     if let Some(message) = status.strip_prefix("unknown:") {
         return Err(PromptSubmissionFailure::unknown(message.trim()));
@@ -12193,6 +12431,7 @@ fn focus_and_clear_composer(config_path: &str, provider: Provider) -> Result<(),
 
 fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
     let js = r#"() => {
+            const composerSelectors = __COMPOSER_SELECTORS__;
             const isVisible = (el) => {
                 if (!el) return false;
                 const style = window.getComputedStyle(el);
@@ -12200,7 +12439,7 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
             };
-            const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
+            const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
             const composerRect = composer ? composer.getBoundingClientRect() : null;
             const isNearComposer = (el) => {
                 if (!composerRect) return true;
@@ -12219,7 +12458,11 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
                 .filter(Boolean);
 
             return { ok: items.length > 0, items: items.slice(0, 5) };
-        }"#;
+        }"#
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        Provider::ChatGpt.composer_selectors_json(),
+    );
 
     let mut last_state = String::new();
     for _ in 0..40 {
@@ -12248,7 +12491,8 @@ fn wait_for_chatgpt_agent_menu(config_path: &str) -> Result<(), String> {
 
 fn wait_for_chatgpt_agent_selection(config_path: &str) -> Result<(), String> {
     let js = r#"() => {
-            const composer = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
+            const composerSelectors = __COMPOSER_SELECTORS__;
+            const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
             if (!composer) {
                 return { ok: false, error: 'composer not found' };
             }
@@ -12260,7 +12504,11 @@ fn wait_for_chatgpt_agent_selection(config_path: &str) -> Result<(), String> {
                 text: (composer.innerText || composer.textContent || '').trim(),
                 keyword: agentPill ? (agentPill.getAttribute('data-keyword') || agentPill.textContent || '').trim() : ''
             };
-        }"#;
+        }"#
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        Provider::ChatGpt.composer_selectors_json(),
+    );
 
     let mut last_state = String::new();
     for _ in 0..40 {
@@ -12457,7 +12705,8 @@ fn submit_chatgpt_agent_prompt(
             (async () => {
                 try {
                     const sendSelectors = __SEND_SELECTORS__;
-                    const el = document.querySelector('#prompt-textarea, [data-testid="composer-text-input"], [role="textbox"][contenteditable="true"]');
+                    const composerSelectors = __COMPOSER_SELECTORS__;
+                    const el = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
                     if (!el) {
                         window.__submit_status = 'error: composer not found';
                         return;
@@ -12563,6 +12812,10 @@ fn submit_chatgpt_agent_prompt(
         "__SEND_SELECTORS__",
         Provider::ChatGpt.send_button_selectors_json(),
     )
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        Provider::ChatGpt.composer_selectors_json(),
+    )
     .replace("__BODY__", &body_json);
 
     let start_res = call_mcp_tool(
@@ -12593,7 +12846,9 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
         const userSelector = __USER_SELECTOR__;
         const sendSelectors = __SEND_SELECTORS__;
         const composerSelectors = __COMPOSER_SELECTORS__;
+        const stopSelectors = __STOP_SELECTORS__;
         const verifyPromptEcho = __PROMPT_ECHO_VERIFIER__;
+        const backendFetchTimeoutMs = 8000;
         const normalize = (value) => String(value || '')
             .normalize('NFC')
             .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -12608,6 +12863,83 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
             if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
             const rect = element.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0;
+        };
+        const isStopButton = (element) => stopSelectors.some((selector) => {
+            try { return element.matches(selector); } catch (_) { return false; }
+        });
+        const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i;
+        const providerFailureVisible = () => Array.from(document.querySelectorAll('[role="alert"]'))
+            .filter(isVisibleAndEnabled)
+            .some((element) => providerFailurePattern.test(String(element.innerText || element.textContent || '')));
+        const baselineMessageIds = new Set(
+            Array.from(document.querySelectorAll(userSelector))
+                .flatMap((element) => (element.getAttribute('data-chatgpt-search-message-ids') || '')
+                    .split(',')
+                    .map((value) => value.trim())
+                    .filter(Boolean))
+        );
+        const verifyBackendPromptEcho = async () => {
+            const match = (window.location.pathname || '').match(/^\/c\/([^/?#]+)/);
+            if (!match) return { status: 'no_conversation' };
+            let token = window.__ask_bridge_backend_token_v1 || '';
+            if (!token) {
+                const sessionResponse = await fetch('/api/auth/session', { credentials: 'include' });
+                if (!sessionResponse.ok) return { status: 'session_http_' + sessionResponse.status };
+                const session = await sessionResponse.json();
+                token = (session && session.accessToken) || '';
+                if (!token) return { status: 'no_access_token' };
+                window.__ask_bridge_backend_token_v1 = token;
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), backendFetchTimeoutMs);
+            try {
+                const response = await fetch('/backend-api/conversation/' + match[1], {
+                    credentials: 'include',
+                    headers: { Authorization: 'Bearer ' + token },
+                    signal: controller.signal
+                });
+                if (response.status === 401 || response.status === 403) {
+                    window.__ask_bridge_backend_token_v1 = '';
+                }
+                if (!response.ok) return { status: 'conversation_http_' + response.status };
+                const data = await response.json();
+                const mapping = (data && data.mapping) || {};
+                const chain = [];
+                const seen = new Set();
+                let nodeId = data && data.current_node;
+                while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {
+                    seen.add(nodeId);
+                    chain.push(mapping[nodeId]);
+                    nodeId = mapping[nodeId].parent;
+                }
+                const userMessages = chain
+                    .filter((node) => node && node.message)
+                    .map((node) => node.message)
+                    .filter((message) => message.author
+                        && message.author.role === 'user'
+                        && !message.author.name)
+                    .sort((left, right) => (left.create_time || 0) - (right.create_time || 0));
+                const latest = userMessages[userMessages.length - 1];
+                if (!latest) return { status: 'no_user_message' };
+                if (latest.id && baselineMessageIds.has(latest.id)) {
+                    return { status: 'baseline_message', message_id: latest.id };
+                }
+                const parts = (latest.content && latest.content.parts) || [];
+                const backendText = parts
+                    .filter((part) => typeof part === 'string')
+                    .join('\n');
+                const echo = verifyPromptEcho(prompt, backendText);
+                return {
+                    status: 'ok',
+                    verified: echo.verified,
+                    message_id: latest.id || '',
+                    echo
+                };
+            } catch (error) {
+                return { status: 'error', reason: String((error && error.message) || error) };
+            } finally {
+                clearTimeout(timer);
+            }
         };
         const expectedText = normalize(prompt);
         const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(isVisibleAndEnabled);
@@ -12630,7 +12962,7 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
                 for (let attempt = 0; attempt < 150; attempt += 1) {
                     button = sendSelectors
                         .map((selector) => document.querySelector(selector))
-                        .find(isVisibleAndEnabled);
+                        .find((element) => isVisibleAndEnabled(element) && !isStopButton(element));
                     if (button) break;
                     await new Promise((resolve) => setTimeout(resolve, 100));
                 }
@@ -12638,10 +12970,15 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
                     window.__submit_status = 'safe: ChatGPT send button did not become active';
                     return;
                 }
+                const providerFailureAtStart = providerFailureVisible();
                 button.click();
                 submitClicked = true;
 
                 for (let attempt = 0; attempt < 900; attempt += 1) {
+                    if (submitClicked && !providerFailureAtStart && providerFailureVisible()) {
+                        window.__submit_status = 'provider_rejected: ChatGPT rejected the submitted prompt before creating a response turn';
+                        return;
+                    }
                     const messages = Array.from(document.querySelectorAll(userSelector));
                     if (messages.length > initialUserCount + 1) {
                         window.__submit_status = 'unknown: unexpected ChatGPT user message count after submit';
@@ -12660,6 +12997,27 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
                         });
                         return;
                     }
+                    // ChatGPT collapses long user prompts in the transcript
+                    // (head + tail + a localized "show more" control). The
+                    // rendered projection is therefore not a complete echo of
+                    // the submitted prompt. Once the conversation backend is
+                    // available, verify the full persisted user message there;
+                    // only the post-click backend record may turn this into a
+                    // success, so pre-click failures remain safe.
+                    if (attempt >= 10 && attempt % 50 === 0) {
+                        const backend = await verifyBackendPromptEcho();
+                        if (backend && backend.verified === true) {
+                            window.__submit_status = 'success:' + JSON.stringify({
+                                clicked: true,
+                                user_message_verified: true,
+                                verification: 'backend_conversation_v1',
+                                backend_user_message_id: backend.message_id,
+                                dom_echo: echo,
+                                backend_status: backend.status
+                            });
+                            return;
+                        }
+                    }
                     await new Promise((resolve) => setTimeout(resolve, 100));
                 }
                 window.__submit_status = 'unknown: ChatGPT did not render the submitted prompt in the conversation';
@@ -12674,6 +13032,10 @@ fn build_chatgpt_prompt_submission_script(prompt: &str) -> Result<String, String
     .replace("__PROMPT_ECHO_VERIFIER__", echo_verifier.trim())
     .replace("__USER_SELECTOR__", &user_selector_json)
     .replace("__SEND_SELECTORS__", send_selectors_json)
+    .replace(
+        "__STOP_SELECTORS__",
+        Provider::ChatGpt.stop_button_selectors_json(),
+    )
     .replace(
         "__COMPOSER_SELECTORS__",
         Provider::ChatGpt.composer_selectors_json(),
@@ -12701,10 +13063,19 @@ fn insert_chatgpt_prompt_text(
         return Err("Failed to mark the owned ChatGPT page for prompt input".to_string());
     }
 
-    let mut child = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .arg("-e")
         .arg(include_str!("chatgpt_prompt_input.js"))
-        .arg(&token)
+        .arg(&token);
+    if owned_page_binding().is_some() {
+        // The isolated new-tab path always owns a fresh ChatGPT tab. ChatGPT
+        // restores the account's last unsent draft into that tab, so replace
+        // it atomically before inserting this request. Never replace drafts
+        // on an unowned, user-existing tab.
+        command.arg("--replace-existing");
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -12909,6 +13280,15 @@ fn build_response_probe_script(
                 }
                 return `${length}:${(hash >>> 0).toString(16)}`;
             };
+            const textSignature = (value) => {
+                const text = String(value || '');
+                let hash = 2166136261;
+                for (let index = 0; index < text.length; index += 1) {
+                    hash ^= text.charCodeAt(index);
+                    hash = Math.imul(hash, 16777619);
+                }
+                return `${text.length}:${(hash >>> 0).toString(16)}`;
+            };
 __CANONICAL_TURN_GROUP_JS__
 __TURN_IDENTITY_JS__
             const conversationId = (() => {
@@ -12936,8 +13316,24 @@ __TURN_IDENTITY_JS__
             const generationControl = stopSelectors
                 .map((selector) => document.querySelector(selector))
                 .find(isVisibleControl);
+            // ChatGPT marks a streaming turn as in_progress until the final
+            // answer is complete. The stop button can disappear before the last
+            // tokens render, so the turn state is part of the same signal.
+            const turnStates = document.querySelectorAll('[data-talvt-turn-state]');
+            const latestTurnState = turnStates.length > 0
+                ? turnStates[turnStates.length - 1].getAttribute('data-talvt-turn-state')
+                : '';
             const latestText = contentNodes.map((node) => node.textContent || '').join('\n');
-            const providerFailureVisible = Boolean(latestText && /(?:content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i.test(latestText));
+            const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i;
+            const visibleProviderAlerts = Array.from(document.querySelectorAll('[role="alert"]'))
+                .filter(isVisibleControl)
+                .map((element) => String(element.innerText || element.textContent || '').trim())
+                .filter((text, index, values) => Boolean(text) && values.indexOf(text) === index);
+            const latestProviderFailure = providerFailurePattern.test(latestText) ? latestText : '';
+            const providerFailureText = visibleProviderAlerts
+                .filter((text) => providerFailurePattern.test(text))
+                .join('\n') || latestProviderFailure;
+            const providerFailureVisible = Boolean(providerFailureText.trim());
             let providerUrlOwned = false;
             try {
                 providerUrlOwned = window.location.origin === new URL(__PROVIDER_HOME_URL__).origin;
@@ -12953,10 +13349,13 @@ __TURN_IDENTITY_JS__
                 artifact_ids: artifactIds,
                 user_count: userGroups.length,
                 assistant_count: assistantGroups.length,
-                generation_control_visible: Boolean(generationControl),
+                generation_control_visible: Boolean(generationControl) || latestTurnState === 'in_progress',
                 content_present: Boolean((latestText || '').trim().length > 0 || loadedImages.length > 0),
                 content_text_length: (latestText || '').trim().length,
                 provider_failure_visible: providerFailureVisible,
+                provider_failure_signature: providerFailureVisible
+                    ? textSignature(providerFailureText.trim())
+                    : '',
                 loaded_large_image_count: loadedImages.length,
                 dom_signature: domSignature(contentNodes)
             };
@@ -13252,7 +13651,12 @@ where
         Ok(status) => status,
         Err(error) => {
             if let Some(path) = receipt_path {
-                record_prompt_submission_failure(path, error.disposition).map_err(|_| {
+                record_prompt_submission_failure(
+                    path,
+                    error.disposition,
+                    error.response_failure_code,
+                )
+                .map_err(|_| {
                     "prompt submission 失敗，且無法安全保存 failure receipt；遠端狀態未知"
                         .to_string()
                 })?;
@@ -14479,6 +14883,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
     if provider == Provider::ChatGpt {
         wait_for_chatgpt_composer(&config_path)?;
+        ensure_chatgpt_chat_mode(&config_path, command_verbose)?;
     }
 
     // Switch model if requested (before uploading attachments / typing the prompt).

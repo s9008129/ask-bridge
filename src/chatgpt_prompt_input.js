@@ -1,6 +1,8 @@
 // Insert prompt text into the uniquely owned ChatGPT tab via Chrome's native
 // input event. Prompt bytes arrive on stdin so they are not exposed in argv.
-const [token] = process.argv.slice(1);
+const args = process.argv.slice(1);
+const [token] = args;
+const replaceExisting = args.includes('--replace-existing');
 const input = [];
 const deadline = setTimeout(() => process.exit(1), 30000);
 
@@ -65,30 +67,72 @@ async function run() {
 
     const { ws } = await findOwnedPage();
     try {
+        const promptJson = JSON.stringify(prompt);
         const ready = await evaluate(ws, `(() => {
-            const selectors = ['#prompt-textarea', '[data-testid="composer-text-input"]', '[role="textbox"][contenteditable="true"]'];
+            const selectors = ['[data-composer-markdown][contenteditable="true"]', '#prompt-textarea', '[data-testid="composer-text-input"]', '[role="textbox"][contenteditable="true"]'];
             const visible = (element) => {
                 if (!element) return false;
                 const style = window.getComputedStyle(element);
                 const rect = element.getBoundingClientRect();
                 return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
             };
+            const readText = (element) => String(
+                typeof element.value !== 'undefined' ? element.value : (element.innerText || element.textContent || '')
+            );
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
             const composer = selectors.map((selector) => document.querySelector(selector)).find(visible);
-            if (!composer) return false;
+            if (!composer) return { ok: false, reason: 'composer-unavailable' };
+
+            const existingText = readText(composer);
+            if (normalize(existingText) && !${replaceExisting ? 'true' : 'false'}) {
+                return { ok: false, reason: 'composer-not-empty' };
+            }
+
             composer.focus();
             try {
                 const range = document.createRange();
                 range.selectNodeContents(composer);
-                range.collapse(false);
+                if (!${replaceExisting ? 'true' : 'false'}) range.collapse(false);
                 const selection = window.getSelection();
                 selection.removeAllRanges();
                 selection.addRange(range);
             } catch (_) {}
-            return document.activeElement === composer;
+            if (document.activeElement !== composer) {
+                return { ok: false, reason: 'composer-focus-failed' };
+            }
+            return { ok: true };
         })()`);
-        if (ready !== true) throw new Error('ChatGPT composer unavailable');
+        if (!ready?.ok) {
+            if (ready?.reason === 'composer-not-empty') {
+                throw new Error('ChatGPT composer already contains text');
+            }
+            throw new Error('ChatGPT composer unavailable');
+        }
 
         await call(ws, 'Input.insertText', { text: prompt });
+
+        const verified = await evaluate(ws, `(() => {
+            const selectors = ['[data-composer-markdown][contenteditable="true"]', '#prompt-textarea', '[data-testid="composer-text-input"]', '[role="textbox"][contenteditable="true"]'];
+            const visible = (element) => {
+                if (!element) return false;
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+            const readText = (element) => String(
+                typeof element.value !== 'undefined' ? element.value : (element.innerText || element.textContent || '')
+            );
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const composer = selectors.map((selector) => document.querySelector(selector)).find(visible);
+            if (!composer) return { ok: false, reason: 'composer-unavailable' };
+            return {
+                ok: normalize(readText(composer)) === normalize(${promptJson}),
+                expected_chars: normalize(${promptJson}).length,
+                actual_chars: normalize(readText(composer)).length,
+            };
+        })()`);
+        if (!verified?.ok) throw new Error('ChatGPT prompt insertion verification failed');
+
         await evaluate(ws, 'delete window.__ask_bridge_prompt_input_token');
         process.stdout.write('prompt-inserted\n');
     } finally {
@@ -103,6 +147,8 @@ run().catch((error) => {
         'Prompt text was empty',
         'Owned ChatGPT page was not unique',
         'ChatGPT composer unavailable',
+        'ChatGPT composer already contains text',
+        'ChatGPT prompt insertion verification failed',
     ];
     console.error(known.find((message) => error.message === message) || 'CDP prompt input failed');
     process.exit(1);
