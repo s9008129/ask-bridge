@@ -32,6 +32,8 @@ const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_sub
 const VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY: &str = "verified_text_response_backend_v1";
 const VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY: &str = "verified_logical_turn_image_v1";
 const VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY: &str = "verified_gemini_image_workflow_v1";
+const VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY: &str =
+    "verified_gemini_full_size_image_download_v1";
 pub(crate) const GEMINI_LIVE_PHASE0B_VERIFIED: bool = true;
 const STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY: &str = "structured_failure_diagnostics_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
@@ -1021,6 +1023,13 @@ pub(crate) enum ResponseCompletion {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum ImageDownloadSource {
+    FullSizeDownload,
+    PreviewFallback,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ResponseFailureCode {
     AssistantCountChanged,
     PageOwnershipChanged,
@@ -1617,7 +1626,7 @@ fn parse_gemini_rollback_recovery_summary(stdout: &[u8]) -> Option<String> {
 fn interpret_gemini_download_output(
     output: &std::process::Output,
     verbose: bool,
-) -> Result<Vec<String>, ImageDownloadError> {
+) -> Result<(Vec<String>, Option<ImageDownloadSource>), ImageDownloadError> {
     if output.status.code() == Some(2) {
         return Err(ImageDownloadError::ResponseIdentityChanged);
     }
@@ -1657,11 +1666,28 @@ fn interpret_gemini_download_output(
                 "Gemini image downloader missing files array".to_string(),
             )
         })?;
-    Ok(files
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect())
+    let download_source = match parsed.get("download_source") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value == "full_size_download" => {
+            Some(ImageDownloadSource::FullSizeDownload)
+        }
+        Some(Value::String(value)) if value == "preview_fallback" => {
+            Some(ImageDownloadSource::PreviewFallback)
+        }
+        Some(_) => {
+            return Err(ImageDownloadError::DownloadFailed(
+                "Gemini image downloader returned an invalid download_source".to_string(),
+            ));
+        }
+    };
+    Ok((
+        files
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        download_source,
+    ))
 }
 
 fn format_verified_image_download_failure(
@@ -1725,6 +1751,8 @@ pub(crate) struct SessionReceipt {
     downloaded_image_count: usize,
     #[serde(default)]
     response_failure_code: Option<ResponseFailureCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_download_source: Option<ImageDownloadSource>,
 }
 
 impl SessionReceipt {
@@ -1821,6 +1849,7 @@ impl SessionReceipt {
                 ];
                 if gemini_verified {
                     caps.push(VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string());
+                    caps.push(VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY.to_string());
                 }
                 caps
             }
@@ -1853,6 +1882,7 @@ impl SessionReceipt {
             response_completion: ResponseCompletion::Pending,
             downloaded_image_count: 0,
             response_failure_code: None,
+            image_download_source: None,
         }
     }
 }
@@ -2400,6 +2430,22 @@ pub(crate) fn record_session_response_outcome(
     downloaded_image_count: usize,
     failure_code: Option<ResponseFailureCode>,
 ) -> Result<(), String> {
+    record_session_response_outcome_with_image_source(
+        path,
+        completion,
+        downloaded_image_count,
+        failure_code,
+        None,
+    )
+}
+
+pub(crate) fn record_session_response_outcome_with_image_source(
+    path: &Path,
+    completion: ResponseCompletion,
+    downloaded_image_count: usize,
+    failure_code: Option<ResponseFailureCode>,
+    image_download_source: Option<ImageDownloadSource>,
+) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     if receipt.prompt_submission == PromptSubmission::NotStarted {
         return Err("prompt 尚未開始，不得記錄 response terminal outcome".to_string());
@@ -2427,6 +2473,16 @@ pub(crate) fn record_session_response_outcome(
     receipt.response_completion = completion;
     receipt.downloaded_image_count = downloaded_image_count;
     receipt.response_failure_code = failure_code;
+    receipt.image_download_source = if completion == ResponseCompletion::Completed
+        && failure_code.is_none()
+        && downloaded_image_count > 0
+        && receipt.expected_output_type == ExpectedOutputType::Image
+        && receipt.provider.as_deref() == Some("gemini")
+    {
+        image_download_source
+    } else {
+        None
+    };
     write_session_receipt_preserving_attachment_probe(path, &receipt)?;
     let persisted = read_session_receipt(path)?;
     if persisted != receipt {
@@ -2493,6 +2549,7 @@ pub(crate) fn capabilities_value_with_gemini_verified(gemini_verified: bool) -> 
     ];
     if gemini_verified {
         advertised.push(VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY);
+        advertised.push(VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY);
     }
     advertised.push(STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY);
     let mut root = serde_json::json!({
@@ -2824,6 +2881,19 @@ pub(crate) fn capabilities_value_with_gemini_verified(gemini_verified: bool) -> 
                 "shared_chrome_close_coordination": "chrome_instance_flock_v1"
             }),
         );
+        obj.insert(
+            VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY.to_string(),
+            serde_json::json!({
+                "provider": "gemini",
+                "mechanism": "cdp_browser_allow_and_name_isolated_temp",
+                "button_scope": "verified_turn_unique_generated_image_container",
+                "event_correlation": "owned_frame_and_guid",
+                "extension_policy": "magic_bytes_sniffing",
+                "post_download_reverify": true,
+                "fallback_policy": "verified_preview_with_provenance",
+                "receipt_fields": ["image_download_source"]
+            }),
+        );
     }
     root
 }
@@ -2853,6 +2923,7 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY);
         if GEMINI_LIVE_PHASE0B_VERIFIED {
             println!("  {}", VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY);
+            println!("  {}", VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY);
         }
         println!("  {}", STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
@@ -10469,6 +10540,259 @@ console.log(JSON.stringify({{ probe, verify }}));
         drop(exclusive);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    fn gemini_download_output(exit_code: i32, stdout: &str) -> std::process::Output {
+        let mut output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {exit_code}"))
+            .output()
+            .unwrap();
+        output.stdout = stdout.as_bytes().to_vec();
+        output.stderr = b"test diagnostic".to_vec();
+        output
+    }
+
+    #[test]
+    fn gemini_full_size_capabilities_are_locked_and_verified_only() {
+        let unverified = capabilities_value_with_gemini_verified(false);
+        assert!(
+            !unverified["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| {
+                    value.as_str() == Some(VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY)
+                })
+        );
+        assert!(
+            unverified
+                .get(VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY)
+                .is_none()
+        );
+
+        let verified = capabilities_value();
+        assert!(
+            verified["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| {
+                    value.as_str() == Some(VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY)
+                })
+        );
+        assert_eq!(
+            verified[VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY],
+            serde_json::json!({
+                "provider": "gemini",
+                "receipt_provider_field": "provider",
+                "login_gate": "positive_logged_in_required",
+                "upload_mechanism": "two_phase_target_locked_cdp_native",
+                "mixed_attachment_upload": VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
+                "prompt_submission_outcome": VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
+                "image_download_contract": "allowlisted_https_or_cdp_cached_zero_untrusted_redirect",
+                "text_completion_gate": "verified_output_flush_before_completed",
+                "model_selection_contract": "gemini_mode_menu_v1",
+                "model_selection_evidence": "gemini_menu_checked_v1",
+                "shared_chrome_close_coordination": "chrome_instance_flock_v1"
+            })
+        );
+        assert_eq!(
+            verified[VERIFIED_GEMINI_FULL_SIZE_IMAGE_DOWNLOAD_CAPABILITY],
+            serde_json::json!({
+                "provider": "gemini",
+                "mechanism": "cdp_browser_allow_and_name_isolated_temp",
+                "button_scope": "verified_turn_unique_generated_image_container",
+                "event_correlation": "owned_frame_and_guid",
+                "extension_policy": "magic_bytes_sniffing",
+                "post_download_reverify": true,
+                "fallback_policy": "verified_preview_with_provenance",
+                "receipt_fields": ["image_download_source"]
+            })
+        );
+    }
+
+    #[test]
+    fn interpret_gemini_download_output_accepts_legacy_and_source_closed_set() {
+        let (files, source) = interpret_gemini_download_output(
+            &gemini_download_output(0, r#"{"ok":true,"count":1,"files":["/tmp/generated.png"]}"#),
+            false,
+        )
+        .unwrap();
+        assert_eq!(files, vec!["/tmp/generated.png".to_string()]);
+        assert_eq!(source, None);
+
+        let (_, source) = interpret_gemini_download_output(
+            &gemini_download_output(0, r#"{"ok":true,"files":[],"download_source":null}"#),
+            false,
+        )
+        .unwrap();
+        assert_eq!(source, None);
+
+        for (wire_value, expected) in [
+            ("full_size_download", ImageDownloadSource::FullSizeDownload),
+            ("preview_fallback", ImageDownloadSource::PreviewFallback),
+        ] {
+            let (_, source) = interpret_gemini_download_output(
+                &gemini_download_output(
+                    0,
+                    &format!(r#"{{"ok":true,"files":[],"download_source":"{wire_value}"}}"#),
+                ),
+                false,
+            )
+            .unwrap();
+            assert_eq!(source, Some(expected));
+        }
+
+        let invalid = interpret_gemini_download_output(
+            &gemini_download_output(
+                0,
+                r#"{"ok":true,"files":[],"download_source":"server_guess"}"#,
+            ),
+            false,
+        )
+        .expect_err("unknown download_source must fail closed");
+        assert!(matches!(
+            invalid,
+            ImageDownloadError::DownloadFailed(message)
+                if message.contains("invalid download_source")
+        ));
+
+        let identity_changed =
+            interpret_gemini_download_output(&gemini_download_output(2, r#"{"ok":false}"#), false)
+                .expect_err("exit code 2 must remain an identity failure");
+        assert!(matches!(
+            identity_changed,
+            ImageDownloadError::ResponseIdentityChanged
+        ));
+    }
+
+    #[test]
+    fn gemini_image_download_source_is_persisted_only_for_successful_nonempty_image_turns() {
+        fn persist_outcome(
+            label: &str,
+            provider: Provider,
+            expected_output_type: ExpectedOutputType,
+            completion: ResponseCompletion,
+            downloaded_image_count: usize,
+            failure_code: Option<ResponseFailureCode>,
+            source: Option<ImageDownloadSource>,
+        ) -> SessionReceipt {
+            let path = make_test_dir(label).join("receipt.json");
+            write_private_json(
+                &path,
+                &SessionReceipt::new_for_provider(provider, 1, 128, expected_output_type),
+            )
+            .unwrap();
+            record_session_receipt_event(&path, SessionReceiptEvent::AttachmentsVerified).unwrap();
+            record_session_receipt_event(&path, SessionReceiptEvent::PromptIntentRecorded).unwrap();
+            record_session_receipt_event(&path, SessionReceiptEvent::PromptSubmitted).unwrap();
+            record_session_response_outcome_with_image_source(
+                &path,
+                completion,
+                downloaded_image_count,
+                failure_code,
+                source,
+            )
+            .unwrap();
+            read_session_receipt(&path).unwrap()
+        }
+
+        let gemini_full = persist_outcome(
+            "gemini_full_size_receipt",
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            ResponseCompletion::Completed,
+            1,
+            None,
+            Some(ImageDownloadSource::FullSizeDownload),
+        );
+        assert_eq!(
+            gemini_full.image_download_source,
+            Some(ImageDownloadSource::FullSizeDownload)
+        );
+
+        let gemini_fallback = persist_outcome(
+            "gemini_preview_receipt",
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            ResponseCompletion::Completed,
+            2,
+            None,
+            Some(ImageDownloadSource::PreviewFallback),
+        );
+        assert_eq!(
+            gemini_fallback.image_download_source,
+            Some(ImageDownloadSource::PreviewFallback)
+        );
+
+        let chatgpt = persist_outcome(
+            "chatgpt_image_source_receipt",
+            Provider::ChatGpt,
+            ExpectedOutputType::Image,
+            ResponseCompletion::Completed,
+            1,
+            None,
+            Some(ImageDownloadSource::FullSizeDownload),
+        );
+        assert_eq!(chatgpt.image_download_source, None);
+
+        let gemini_text = persist_outcome(
+            "gemini_text_source_receipt",
+            Provider::Gemini,
+            ExpectedOutputType::Text,
+            ResponseCompletion::Completed,
+            1,
+            None,
+            Some(ImageDownloadSource::FullSizeDownload),
+        );
+        assert_eq!(gemini_text.image_download_source, None);
+
+        let gemini_zero_images = persist_outcome(
+            "gemini_zero_image_receipt",
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            ResponseCompletion::Completed,
+            0,
+            None,
+            Some(ImageDownloadSource::FullSizeDownload),
+        );
+        assert_eq!(gemini_zero_images.image_download_source, None);
+
+        let gemini_failed = persist_outcome(
+            "gemini_failed_image_receipt",
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            ResponseCompletion::Unknown,
+            0,
+            Some(ResponseFailureCode::ImageDownloadFailed),
+            Some(ImageDownloadSource::PreviewFallback),
+        );
+        assert_eq!(gemini_failed.image_download_source, None);
+    }
+
+    #[test]
+    fn session_receipt_omits_absent_image_download_source_and_reads_legacy_json() {
+        let receipt =
+            SessionReceipt::new_for_provider(Provider::Gemini, 1, 128, ExpectedOutputType::Image);
+        assert_eq!(receipt.image_download_source, None);
+        let mut serialized = serde_json::to_value(&receipt).unwrap();
+        assert!(serialized.get("image_download_source").is_none());
+
+        let round_trip: SessionReceipt = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(round_trip.image_download_source, None);
+
+        serialized["image_download_source"] = Value::Null;
+        let explicit_null: SessionReceipt = serde_json::from_value(serialized).unwrap();
+        assert_eq!(explicit_null.image_download_source, None);
+
+        let mut legacy = serde_json::to_value(&receipt).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("image_download_source");
+        let legacy_round_trip: SessionReceipt = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy_round_trip.image_download_source, None);
+    }
 }
 
 fn read_clipboard() -> Result<String, String> {
@@ -10912,7 +11236,7 @@ fn download_gemini_images(
     image_output: Option<&str>,
     verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
     verbose: bool,
-) -> Result<usize, ImageDownloadError> {
+) -> Result<(usize, Option<ImageDownloadSource>), ImageDownloadError> {
     let Some((baseline, identity)) = verified_response else {
         return Err(ImageDownloadError::DownloadFailed(
             "Gemini image download requires a verified completed turn identity".to_string(),
@@ -10997,11 +11321,11 @@ fn download_gemini_images(
         )
     })?;
 
-    let files = interpret_gemini_download_output(&output, verbose)?;
+    let (files, image_download_source) = interpret_gemini_download_output(&output, verbose)?;
     for path in &files {
         println!("Downloaded and saved generated image to: {}", path);
     }
-    Ok(files.len())
+    Ok((files.len(), image_download_source))
 }
 
 fn download_images_from_latest_message(
@@ -11010,7 +11334,7 @@ fn download_images_from_latest_message(
     image_output: Option<&str>,
     verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
     verbose: bool,
-) -> Result<usize, ImageDownloadError> {
+) -> Result<(usize, Option<ImageDownloadSource>), ImageDownloadError> {
     if provider == Provider::Gemini {
         return download_gemini_images(config_path, image_output, verified_response, verbose);
     }
@@ -11264,7 +11588,7 @@ __TURN_IDENTITY_JS__
         if verbose {
             println!("No generated images found in the latest response.");
         }
-        return Ok(0);
+        return Ok((0, None));
     }
 
     let epoch = std::time::SystemTime::now()
@@ -11350,7 +11674,7 @@ __TURN_IDENTITY_JS__
         );
     }
 
-    Ok(saved_count)
+    Ok((saved_count, None))
 }
 
 /// Display an image in the terminal using kitty's icat protocol.
@@ -17111,7 +17435,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                                 command_verbose,
                             );
                             match image_result {
-                                Ok(0) if cli.image_output.is_some() => {
+                                Ok((0, _)) if cli.image_output.is_some() => {
                                     eprintln!("Error downloading images: no generated image found");
                                     std::process::exit(1);
                                 }
@@ -17191,7 +17515,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                             command_verbose,
                         );
                         match image_result {
-                            Ok(0) if cli.image_output.is_some() => {
+                            Ok((0, _)) if cli.image_output.is_some() => {
                                 eprintln!("Error downloading images: no generated image found");
                                 std::process::exit(1);
                             }
@@ -17863,6 +18187,10 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Err(ImageDownloadError::PublishRollbackIncomplete(detail)) => Some(detail.clone()),
         _ => None,
     };
+    let (download_result, image_download_source) = match download_result {
+        Ok((count, source)) => (Ok(count), source),
+        Err(error) => (Err(error), None),
+    };
     let downloaded_image_count = if expected_output_type == ExpectedOutputType::Image {
         match enforce_download_contract(expected_output_type, download_result) {
             Ok(count) => count,
@@ -17906,11 +18234,12 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     if (expected_output_type == ExpectedOutputType::Image || !strict_text_completion_gate)
         && let Some(path) = receipt_path.as_deref()
     {
-        record_session_response_outcome(
+        record_session_response_outcome_with_image_source(
             path,
             ResponseCompletion::Completed,
             downloaded_image_count,
             None,
+            image_download_source,
         )
         .map_err(|_| "Failed to persist final response receipt")?;
     }
@@ -18043,11 +18372,12 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if let Some(path) = receipt_path.as_deref() {
-            record_session_response_outcome(
+            record_session_response_outcome_with_image_source(
                 path,
                 ResponseCompletion::Completed,
                 downloaded_image_count,
                 None,
+                image_download_source,
             )
             .map_err(|_| "Failed to persist final response receipt")?;
         }

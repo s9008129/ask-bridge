@@ -14,6 +14,7 @@ const http = require('node:http');
 const https = require('node:https');
 const dns = require('node:dns');
 const net = require('node:net');
+const os = require('node:os');
 
 const [tokenArg, outputArg, expectedIdentityJsonArg] = process.argv.slice(1);
 
@@ -23,6 +24,17 @@ const MAX_REDIRECTS = 3;
 const REQUEST_TIMEOUT_MS = 30000;
 const CDP_CALL_TIMEOUT_MS = 10000;
 const CDP_OPEN_TIMEOUT_MS = 5000;
+const DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS = 20000;
+const DOWNLOAD_EVENT_GRACE_MS = 8000;
+const BROWSER_CDP_VERSION_URL = 'http://127.0.0.1:9223/json/version';
+const FULL_SIZE_FALLBACK_REASONS = new Set([
+    'button_not_found',
+    'click_no_download_event',
+    'download_timeout',
+    'download_canceled',
+    'cdp_download_behavior_unsupported',
+    'full_size_integrity_failed',
+]);
 const DEFAULT_MINIMUM_IMAGE_DIMENSION = 256;
 const MINIMUM_IMAGE_DIMENSION = (
     typeof __GEMINI_MIN_IMAGE_DIMENSION__ === 'number'
@@ -44,6 +56,7 @@ const ALLOWED_GEMINI_IMAGE_HOST_PATTERNS = [
     /^googleusercontent\.com$/i,
     /^lh\d*\.googleusercontent\.com$/i,
     /^[^.]+\.googleusercontent\.com$/i,
+    /^[^.]+\.usercontent\.google\.com$/i,
     /^ggpht\.com$/i,
     /^[^.]+\.ggpht\.com$/i,
     /^gemini\.google\.com$/i,
@@ -92,6 +105,14 @@ function isAllowedGeminiBlobUrl(blobUrl) {
     } catch (_) {
         return false;
     }
+}
+
+function isAllowedGeminiDownloadEventUrl(urlString) {
+    const raw = String(urlString || '').trim();
+    if (!raw) return false;
+    if (/^data:image\/[a-z0-9.+-]+(?:;[^,]*)?,/i.test(raw)) return true;
+    if (isAllowedGeminiBlobUrl(raw)) return true;
+    return isAllowedGeminiImageUrl(raw).ok;
 }
 
 function assertAllowedGeminiImageHost(urlString) {
@@ -443,6 +464,120 @@ function sniffImageExt(buf) {
     return null;
 }
 
+function imageValidationFailure(reason) {
+    return { ok: false, reason };
+}
+
+function validateImageHeaderAndTrailer(buffer, minDimension = MINIMUM_IMAGE_DIMENSION) {
+    if (!Buffer.isBuffer(buffer) || buffer.length <= 0 || buffer.length > MAX_IMAGE_BYTES) {
+        return imageValidationFailure('invalid_image_size');
+    }
+    const minimum = Number.isFinite(minDimension) && minDimension > 0
+        ? Math.floor(minDimension)
+        : MINIMUM_IMAGE_DIMENSION;
+    const ext = sniffImageExt(buffer);
+    if (ext === 'png') {
+        if (buffer.length < 33 || buffer.toString('ascii', 12, 16) !== 'IHDR') {
+            return imageValidationFailure('invalid_png_header');
+        }
+        const width = buffer.readUInt32BE(16);
+        const height = buffer.readUInt32BE(20);
+        if (width < minimum || height < minimum) {
+            return imageValidationFailure('image_below_minimum_dimension');
+        }
+        const trailer = buffer.subarray(buffer.length - 12);
+        if (
+            trailer.length !== 12
+            || trailer.readUInt32BE(0) !== 0
+            || trailer.toString('ascii', 4, 8) !== 'IEND'
+        ) {
+            return imageValidationFailure('invalid_png_trailer');
+        }
+        return { ok: true, ext, width, height };
+    }
+    if (ext === 'jpg') {
+        if (buffer.length < 4 || buffer[buffer.length - 2] !== 0xFF || buffer[buffer.length - 1] !== 0xD9) {
+            return imageValidationFailure('invalid_jpeg_trailer');
+        }
+        let offset = 2;
+        let dimensions = null;
+        while (offset + 3 < buffer.length - 2) {
+            if (buffer[offset] !== 0xFF) {
+                offset += 1;
+                continue;
+            }
+            while (offset < buffer.length && buffer[offset] === 0xFF) offset += 1;
+            if (offset >= buffer.length) break;
+            const marker = buffer[offset];
+            offset += 1;
+            if (marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+            if (marker === 0xD9 || marker === 0xDA) break;
+            if (offset + 1 >= buffer.length) return imageValidationFailure('invalid_jpeg_segment');
+            const segmentLength = buffer.readUInt16BE(offset);
+            if (segmentLength < 2 || offset + segmentLength > buffer.length) {
+                return imageValidationFailure('invalid_jpeg_segment');
+            }
+            if (marker === 0xC0 || marker === 0xC1 || marker === 0xC2) {
+                if (segmentLength < 7) return imageValidationFailure('invalid_jpeg_sof');
+                dimensions = {
+                    height: buffer.readUInt16BE(offset + 3),
+                    width: buffer.readUInt16BE(offset + 5),
+                };
+                break;
+            }
+            offset += segmentLength;
+        }
+        if (!dimensions) return imageValidationFailure('missing_jpeg_sof');
+        if (dimensions.width < minimum || dimensions.height < minimum) {
+            return imageValidationFailure('image_below_minimum_dimension');
+        }
+        return { ok: true, ext, width: dimensions.width, height: dimensions.height };
+    }
+    if (ext === 'webp') {
+        if (buffer.length < 20) return imageValidationFailure('invalid_webp_header');
+        const riffSize = buffer.readUInt32LE(4);
+        if (riffSize < 12 || buffer.length < 8 + riffSize) {
+            return imageValidationFailure('truncated_webp');
+        }
+        const chunkType = buffer.toString('ascii', 12, 16);
+        const chunkSize = buffer.readUInt32LE(16);
+        const dataOffset = 20;
+        if (chunkSize < 2 || dataOffset + chunkSize > buffer.length) {
+            return imageValidationFailure('invalid_webp_chunk');
+        }
+        let width = 0;
+        let height = 0;
+        if (chunkType === 'VP8 ') {
+            if (chunkSize < 10 || buffer[dataOffset + 3] !== 0x9D || buffer[dataOffset + 4] !== 0x01 || buffer[dataOffset + 5] !== 0x2A) {
+                return imageValidationFailure('invalid_webp_vp8');
+            }
+            width = buffer.readUInt16LE(dataOffset + 6) & 0x3FFF;
+            height = buffer.readUInt16LE(dataOffset + 8) & 0x3FFF;
+        } else if (chunkType === 'VP8L') {
+            if (chunkSize < 5 || buffer[dataOffset] !== 0x2F) {
+                return imageValidationFailure('invalid_webp_vp8l');
+            }
+            const b1 = buffer[dataOffset + 1];
+            const b2 = buffer[dataOffset + 2];
+            const b3 = buffer[dataOffset + 3];
+            const b4 = buffer[dataOffset + 4];
+            width = 1 + (((b2 & 0x3F) << 8) | b1);
+            height = 1 + (((b4 & 0x0F) << 10) | (b3 << 2) | ((b2 & 0xC0) >> 6));
+        } else if (chunkType === 'VP8X') {
+            if (chunkSize < 10) return imageValidationFailure('invalid_webp_vp8x');
+            width = 1 + (buffer[dataOffset + 4] | (buffer[dataOffset + 5] << 8) | (buffer[dataOffset + 6] << 16));
+            height = 1 + (buffer[dataOffset + 7] | (buffer[dataOffset + 8] << 8) | (buffer[dataOffset + 9] << 16));
+        } else {
+            return imageValidationFailure('unsupported_webp_chunk');
+        }
+        if (width < minimum || height < minimum) {
+            return imageValidationFailure('image_below_minimum_dimension');
+        }
+        return { ok: true, ext, width, height };
+    }
+    return imageValidationFailure('invalid_image_signature');
+}
+
 function writeTempPrivateFile(targetDir, prefixName, buffer) {
     const tmpPath = path.join(targetDir, `.${prefixName}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
     const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL;
@@ -501,7 +636,8 @@ function resolveOutputFilePaths(imageOutput, extList) {
     if (isFileTarget) {
         const parentDir = path.dirname(raw);
         if (total === 1) {
-            return [raw];
+            const stem = path.basename(raw, parsedExt);
+            return [path.join(parentDir, `${stem}.${extList[0]}`)];
         }
         const stem = path.basename(raw, parsedExt);
         return extList.map((ext, idx) => path.join(parentDir, `${stem}_${idx + 1}.${ext}`));
@@ -662,6 +798,482 @@ function buildVerifyProjectionExpression(expectedIdentity) {
             candidates,
         };
     })()`;
+}
+
+function geminiFallbackError(reason, message) {
+    const error = new Error(message || reason);
+    error.fallbackReason = reason;
+    error.fallbackEligible = true;
+    return error;
+}
+
+function geminiFailClosedError(message, exitCode = 1) {
+    const error = new Error(message);
+    error.fallbackEligible = false;
+    error.exitCode = exitCode;
+    return error;
+}
+
+function isSafeDownloadGuid(guid) {
+    return typeof guid === 'string' && /^[A-Za-z0-9._-]+$/.test(guid);
+}
+
+function isLoopbackBrowserWsUrl(rawUrl) {
+    let parsed;
+    try {
+        parsed = new URL(rawUrl);
+    } catch (_) {
+        return false;
+    }
+    if (parsed.protocol !== 'ws:' || parsed.username || parsed.password || parsed.port !== '9223') {
+        return false;
+    }
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)) return false;
+    return /^\/devtools\/browser\/[^/]+$/.test(parsed.pathname);
+}
+
+async function connectBrowserCdp(options = {}) {
+    const fetchImpl = options.fetch || fetch;
+    const WebSocketCtor = options.WebSocketCtor || (typeof WebSocket !== 'undefined' ? WebSocket : null);
+    const versionUrl = options.browserCdpVersionUrl || BROWSER_CDP_VERSION_URL;
+    const openTimeoutMs = Number.isFinite(options.openTimeoutMs) ? options.openTimeoutMs : CDP_OPEN_TIMEOUT_MS;
+    let info;
+    try {
+        const response = await fetchImpl(versionUrl);
+        info = response && typeof response.json === 'function' ? await response.json() : response;
+    } catch (error) {
+        throw geminiFallbackError(
+            'cdp_download_behavior_unsupported',
+            `Browser CDP version endpoint unavailable: ${error && error.message ? error.message : String(error)}`,
+        );
+    }
+    if (!info || typeof info !== 'object' || Array.isArray(info)) {
+        throw geminiFallbackError(
+            'cdp_download_behavior_unsupported',
+            'Browser CDP version endpoint did not return an object',
+        );
+    }
+    const wsUrl = info.webSocketDebuggerUrl;
+    if (typeof wsUrl !== 'string' || !wsUrl.trim()) {
+        throw geminiFallbackError(
+            'cdp_download_behavior_unsupported',
+            'Browser CDP version endpoint did not provide a WebSocket URL',
+        );
+    }
+    if (!isLoopbackBrowserWsUrl(wsUrl)) {
+        throw geminiFailClosedError('Browser CDP WebSocket must be loopback ws://...:9223/devtools/browser/...');
+    }
+    if (typeof WebSocketCtor !== 'function') {
+        throw geminiFallbackError(
+            'cdp_download_behavior_unsupported',
+            'Browser CDP WebSocket constructor is unavailable',
+        );
+    }
+    let ws;
+    try {
+        ws = new WebSocketCtor(wsUrl);
+        await waitForWebSocketOpen(ws, openTimeoutMs);
+    } catch (error) {
+        try { if (ws) ws.close(); } catch (_) {}
+        throw geminiFallbackError(
+            'cdp_download_behavior_unsupported',
+            `Browser CDP WebSocket unavailable: ${error && error.message ? error.message : String(error)}`,
+        );
+    }
+    return { ws, wsUrl };
+}
+
+function collectOwnedFrameIds(frameTree) {
+    const ids = [];
+    const visit = (tree) => {
+        if (!tree || typeof tree !== 'object') return;
+        const id = tree.frame && tree.frame.id;
+        if (typeof id === 'string' && id) ids.push(id);
+        for (const child of Array.isArray(tree.childFrames) ? tree.childFrames : []) visit(child);
+    };
+    visit(frameTree);
+    return ids;
+}
+
+function buildFullSizeClickExpression(expectedIdentity, candidate) {
+    const normalized = normalizeCandidate(candidate);
+    if (!normalized) return '(() => ({ ok: false, reason: "invalid_candidate", identityChanged: true }))()';
+    return `(() => {
+        const module = undefined;
+        ${GEMINI_TURN_PROJECTION_EMBED}
+        const expected = ${JSON.stringify(expectedIdentity)};
+        const expectedCandidate = ${JSON.stringify(normalized)};
+        if (window.location.origin !== ${JSON.stringify(GEMINI_ORIGIN)}) {
+            return { ok: false, reason: 'origin_mismatch', identityChanged: true };
+        }
+        if (!expected || !expected.turn_id || !expected.conversation_id) {
+            return { ok: false, reason: 'missing_expected_turn_identity', identityChanged: true };
+        }
+        if (expected.ownership_token && window.__ask_bridge_response_owner_v1 !== expected.ownership_token) {
+            return { ok: false, reason: 'ownership_token_mismatch', identityChanged: true };
+        }
+        const conversationId = geminiConversationId(window.location);
+        if (conversationId !== expected.conversation_id) {
+            return { ok: false, reason: 'conversation_id_mismatch', identityChanged: true };
+        }
+        const isVisible = (el) => {
+            if (!el) return false;
+            const s = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+        };
+        const stopSelectors = ['button[aria-label*="Stop" i]', 'button[aria-label*="停止"]'];
+        const assistantGroups = geminiTurnGroups(document, GEMINI_ASSISTANT_SELECTOR);
+        const userGroups = geminiTurnGroups(document, GEMINI_USER_SELECTOR);
+        const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
+        if (isGeminiGenerating(document, latestGroup, stopSelectors, isVisible)) {
+            return { ok: false, reason: 'still_generating', identityChanged: true };
+        }
+        if (expected.user_count && userGroups.length !== expected.user_count) {
+            return { ok: false, reason: 'user_count_changed', identityChanged: true };
+        }
+        if (expected.assistant_count && assistantGroups.length !== expected.assistant_count) {
+            return { ok: false, reason: 'assistant_count_changed', identityChanged: true };
+        }
+        const id = geminiTurnIdentity(latestGroup);
+        if (!id.turnId || id.turnId !== expected.turn_id) {
+            return { ok: false, reason: 'turn_id_mismatch', identityChanged: true };
+        }
+        if (Array.isArray(expected.artifact_ids) && expected.artifact_ids.length > 0) {
+            const expectedArts = [...expected.artifact_ids].sort().join('|');
+            const actualArts = [...id.artifactIds].sort().join('|');
+            if (expectedArts !== actualArts) {
+                return { ok: false, reason: 'artifact_ids_mismatch', identityChanged: true };
+            }
+        }
+        const candidates = findGeminiFinalGeneratedImages(latestGroup, ${MINIMUM_IMAGE_DIMENSION});
+        const exact = candidates.filter((item) => (
+            item.artifactId === expectedCandidate.artifactId
+            && item.src === expectedCandidate.src
+            && item.naturalWidth === expectedCandidate.naturalWidth
+            && item.naturalHeight === expectedCandidate.naturalHeight
+        ));
+        if (exact.length !== 1 || candidates.length !== (Array.isArray(expected.image_candidates) && expected.image_candidates.length > 0 ? expected.image_candidates.length : candidates.length)) {
+            return { ok: false, reason: 'image_candidates_mismatch', identityChanged: true };
+        }
+        if (Array.isArray(expected.image_candidates) && expected.image_candidates.length > 0) {
+            const exp = expected.image_candidates;
+            if (exp.length !== candidates.length || !exp.every((item, i) => {
+                const c = candidates[i];
+                const eid = String((item && (item.artifact_id || item.artifactId)) || '');
+                const esrc = String((item && item.src) || '');
+                const ew = Number((item && (item.natural_width ?? item.naturalWidth)) || 0);
+                const eh = Number((item && (item.natural_height ?? item.naturalHeight)) || 0);
+                return c && c.artifactId === eid && c.src === esrc && c.naturalWidth === ew && c.naturalHeight === eh;
+            })) {
+                return { ok: false, reason: 'image_candidates_mismatch', identityChanged: true };
+            }
+        }
+        const found = findGeminiFullSizeDownloadButton(latestGroup, expectedCandidate, ${MINIMUM_IMAGE_DIMENSION});
+        if (!found || !found.ok) {
+            return {
+                ok: false,
+                reason: found && found.reason ? found.reason : 'button_not_found',
+                identityChanged: false,
+                failClosed: found && found.reason === 'ambiguous_download_button',
+            };
+        }
+        if (!found.button || typeof found.button.click !== 'function') {
+            return { ok: false, reason: 'button_not_found', identityChanged: false };
+        }
+        try {
+            const hoverEvent = typeof MouseEvent === 'function'
+                ? new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window })
+                : new Event('mouseover', { bubbles: true });
+            if (found.container && typeof found.container.dispatchEvent === 'function') {
+                found.container.dispatchEvent(hoverEvent);
+            }
+            if (typeof found.button.dispatchEvent === 'function') {
+                found.button.dispatchEvent(new Event('mouseover', { bubbles: true }));
+            }
+            found.button.click();
+        } catch (_) {
+            return { ok: false, reason: 'button_not_clickable', identityChanged: false };
+        }
+        return { ok: true, reason: '', matchedBy: found.matchedBy || '' };
+    })()`;
+}
+
+function sleepFor(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+async function downloadFullSizeCandidateViaBrowser(pageWs, browserWs, before, candidate, expectedIdentity, options = {}) {
+    const fsOps = options.fsOps || fs;
+    const verifyTimeoutMs = Number.isFinite(options.verifyTimeoutMs) ? options.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
+    const requestedTimeoutMs = Number.isFinite(options.timeoutMs)
+        ? options.timeoutMs
+        : DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS;
+    const timeoutMs = Math.max(1, requestedTimeoutMs);
+    const configuredGraceMs = Number.isFinite(options.eventGraceMs) && options.eventGraceMs > 0
+        ? options.eventGraceMs
+        : DOWNLOAD_EVENT_GRACE_MS;
+    const eventGraceMs = Math.min(configuredGraceMs, timeoutMs);
+    const deadlineAt = Date.now() + timeoutMs;
+    const remainingMs = () => Math.max(1, deadlineAt - Date.now());
+    let tempDir = null;
+
+    let currentGuid = null;
+    const observedGuids = new Set();
+    let completed = false;
+    let succeeded = false;
+    let settled = false;
+    let firstEventTimer = null;
+    let timeoutTimer = null;
+    let removeEventListeners = () => {};
+    let resolveDownload;
+    let rejectDownload;
+    const downloadPromise = new Promise((resolve, reject) => {
+        resolveDownload = resolve;
+        rejectDownload = reject;
+    });
+    downloadPromise.catch(() => {});
+
+    const clearEventTimers = () => {
+        if (firstEventTimer !== null) clearTimeout(firstEventTimer);
+        if (timeoutTimer !== null) clearTimeout(timeoutTimer);
+        firstEventTimer = null;
+        timeoutTimer = null;
+    };
+    const finishFailure = (error) => {
+        if (settled) return;
+        settled = true;
+        clearEventTimers();
+        rejectDownload(error);
+    };
+    const firstDownloadEvent = () => {
+        if (firstEventTimer !== null) clearTimeout(firstEventTimer);
+        firstEventTimer = null;
+    };
+
+    try {
+        tempDir = fsOps.mkdtempSync(path.join(os.tmpdir(), 'ask-bridge-gemini-full-size-'));
+        fsOps.chmodSync(tempDir, 0o700);
+        let frameTreeResult;
+        try {
+            frameTreeResult = await callCdp(pageWs, 'Page.getFrameTree', {}, verifyTimeoutMs);
+        } catch (_) {
+            throw geminiFallbackError(
+                'cdp_download_behavior_unsupported',
+                'Page.getFrameTree is unavailable for full-size download',
+            );
+        }
+        const ownedFrameIds = new Set(collectOwnedFrameIds(frameTreeResult && frameTreeResult.frameTree));
+        if (ownedFrameIds.size === 0) {
+            throw geminiFallbackError(
+                'cdp_download_behavior_unsupported',
+                'Page.getFrameTree did not identify an owned frame',
+            );
+        }
+
+        try {
+            await callCdp(browserWs, 'Browser.setDownloadBehavior', {
+                behavior: 'allowAndName',
+                downloadPath: tempDir,
+                eventsEnabled: true,
+            }, remainingMs());
+        } catch (_) {
+            throw geminiFallbackError(
+                'cdp_download_behavior_unsupported',
+                'Browser.setDownloadBehavior(allowAndName) is unavailable',
+            );
+        }
+
+        const onBrowserMessage = (event) => {
+            let message;
+            try {
+                message = JSON.parse(event.data);
+            } catch (_) {
+                return;
+            }
+            const params = message && message.params;
+            if (message.method === 'Browser.downloadWillBegin') {
+                if (!params || typeof params !== 'object') return;
+                if (!ownedFrameIds.has(String(params.frameId || ''))) return;
+                firstDownloadEvent();
+                const guid = String(params.guid || '');
+                if (guid) observedGuids.add(guid);
+                if (!isSafeDownloadGuid(guid)) {
+                    finishFailure(geminiFailClosedError('Gemini full-size download returned an unsafe guid'));
+                    return;
+                }
+                if (!isAllowedGeminiDownloadEventUrl(String(params.url || ''))) {
+                    finishFailure(geminiFailClosedError('Gemini full-size download URL is not allowlisted'));
+                    return;
+                }
+                if (currentGuid !== null && guid !== currentGuid) {
+                    finishFailure(geminiFailClosedError('Gemini full-size click triggered multiple owned downloads'));
+                    return;
+                }
+                currentGuid = guid;
+                return;
+            }
+            if (message.method === 'Browser.downloadProgress') {
+                if (!params || currentGuid === null || String(params.guid || '') !== currentGuid) return;
+                const received = Number(params.receivedBytes || 0);
+                const total = Number(params.totalBytes || 0);
+                if (received > MAX_IMAGE_BYTES || total > MAX_IMAGE_BYTES) {
+                    finishFailure(geminiFailClosedError('Gemini full-size download exceeded maximum allowed bytes'));
+                    return;
+                }
+                if (params.state === 'canceled' || params.state === 'interrupted') {
+                    finishFailure(geminiFallbackError('download_canceled', 'Gemini full-size download was canceled'));
+                    return;
+                }
+                if (params.state === 'completed') {
+                    completed = true;
+                    if (!settled) {
+                        settled = true;
+                        clearEventTimers();
+                        resolveDownload();
+                    }
+                }
+            }
+        };
+        if (typeof browserWs.addEventListener !== 'function' || typeof browserWs.removeEventListener !== 'function') {
+            throw geminiFallbackError(
+                'cdp_download_behavior_unsupported',
+                'Browser CDP WebSocket does not support download events',
+            );
+        }
+        browserWs.addEventListener('message', onBrowserMessage);
+        removeEventListeners = () => {
+            try { browserWs.removeEventListener('message', onBrowserMessage); } catch (_) {}
+        };
+        timeoutTimer = setTimeout(() => {
+            if (currentGuid === null) {
+                finishFailure(geminiFallbackError(
+                    'click_no_download_event',
+                    'Gemini full-size click produced no owned download event',
+                ));
+                return;
+            }
+            finishFailure(geminiFallbackError(
+                'download_timeout',
+                'Gemini full-size download timed out',
+            ));
+        }, timeoutMs);
+
+        let clickResult;
+        try {
+            const clickRes = await callCdp(pageWs, 'Runtime.evaluate', {
+                expression: buildFullSizeClickExpression(expectedIdentity, candidate),
+                returnByValue: true,
+                userGesture: true,
+            }, remainingMs());
+            clickResult = clickRes && clickRes.result && clickRes.result.value;
+        } catch (_) {
+            throw geminiFallbackError(
+                'click_no_download_event',
+                'Gemini full-size button click did not return a verified result',
+            );
+        }
+        if (!clickResult || !clickResult.ok) {
+            const reason = clickResult && clickResult.reason ? clickResult.reason : 'button_not_found';
+            if (clickResult && clickResult.identityChanged) {
+                throw geminiFailClosedError(
+                    `Response identity changed before Gemini full-size click: ${reason}`,
+                    2,
+                );
+            }
+            if (clickResult && clickResult.failClosed) {
+                throw geminiFailClosedError(`Gemini full-size button is ambiguous: ${reason}`);
+            }
+            if (reason === 'ambiguous_download_button') {
+                throw geminiFailClosedError(`Gemini full-size button is ambiguous: ${reason}`);
+            }
+            if (reason === 'button_not_found' || reason === 'button_not_clickable') {
+                throw geminiFallbackError('button_not_found', 'Gemini full-size download button was not found');
+            }
+            throw geminiFallbackError(
+                'full_size_integrity_failed',
+                `Gemini full-size click verification failed: ${reason}`,
+            );
+        }
+
+        if (currentGuid === null && !settled) {
+            firstEventTimer = setTimeout(() => {
+                finishFailure(geminiFallbackError(
+                    'click_no_download_event',
+                    'Gemini full-size click produced no owned download event',
+                ));
+            }, Math.min(eventGraceMs, remainingMs()));
+        }
+
+        await downloadPromise;
+        const filePath = path.join(tempDir, currentGuid);
+        while (Date.now() < deadlineAt) {
+            let entries = [];
+            try {
+                entries = fsOps.readdirSync(tempDir);
+            } catch (_) {
+                entries = [];
+            }
+            if (entries.includes(currentGuid)) break;
+            await sleepFor(Math.min(20, remainingMs()));
+        }
+        let entries;
+        try {
+            entries = fsOps.readdirSync(tempDir);
+        } catch (error) {
+            throw geminiFallbackError(
+                'full_size_integrity_failed',
+                `Gemini full-size temporary directory could not be read: ${error && error.message ? error.message : String(error)}`,
+            );
+        }
+        const extraEntries = entries.filter((name) => name !== currentGuid);
+        if (extraEntries.length > 0) {
+            throw geminiFailClosedError('Gemini full-size download created unexpected temporary files');
+        }
+        let stat;
+        try {
+            stat = fsOps.lstatSync(filePath);
+        } catch (error) {
+            throw geminiFallbackError(
+                'full_size_integrity_failed',
+                `Gemini full-size download file was unavailable: ${error && error.message ? error.message : String(error)}`,
+            );
+        }
+        if (stat.isSymbolicLink() || !stat.isFile()) {
+            throw geminiFailClosedError('Gemini full-size download path is not a regular file');
+        }
+        if (stat.size <= 0 || stat.size > MAX_IMAGE_BYTES) {
+            throw geminiFailClosedError('Gemini full-size download exceeded maximum allowed bytes');
+        }
+        const buffer = fsOps.readFileSync(filePath);
+        if (buffer.length <= 0 || buffer.length > MAX_IMAGE_BYTES) {
+            throw geminiFailClosedError('Gemini full-size download exceeded maximum allowed bytes');
+        }
+        const validation = validateImageHeaderAndTrailer(buffer, options.minimumImageDimension);
+        if (!validation.ok) {
+            throw geminiFailClosedError(
+                `Gemini full-size image failed header/trailer validation: ${validation.reason}`,
+            );
+        }
+        succeeded = true;
+        return { buffer, ext: validation.ext, width: validation.width, height: validation.height };
+    } finally {
+        if (!succeeded) {
+            for (const guid of observedGuids) {
+                try {
+                    await callCdp(browserWs, 'Browser.cancelDownload', { guid }, 1000);
+                } catch (_) {}
+            }
+        }
+        try {
+            await callCdp(browserWs, 'Browser.setDownloadBehavior', { behavior: 'default' }, 1000);
+        } catch (_) {}
+        removeEventListeners();
+        clearEventTimers();
+        if (tempDir !== null) {
+            try { fsOps.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+        }
+    }
 }
 
 async function readBlobDataUrlFromBrowser(ws, blobUrl, maxBytes = MAX_IMAGE_BYTES, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -827,56 +1439,48 @@ async function tryReadCachedResourceViaCdp(cdpOrWs, frameIdOrUrl, maybeUrlOrMaxB
     }
 }
 
-async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, deps = {}) {
+async function readPreviewCandidate(ws, candidate, remainingForImage, deps = {}) {
     const readBlobFn = deps.readBlobDataUrlFromBrowser || readBlobDataUrlFromBrowser;
     const readCachedFn = deps.tryReadCachedResourceViaCdp || tryReadCachedResourceViaCdp;
     const fetchFn = deps.fetchWithValidatedRedirects || fetchWithValidatedRedirects;
-    const fsOps = deps.fsOps || fs;
+    const src = candidate && candidate.src;
+    let buffer;
 
-    const perImageTimeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS;
-    const verifyTimeoutMs = Number.isFinite(deps.verifyTimeoutMs) ? deps.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
-    const fetched = [];
-    for (let i = 0; i < before.candidates.length; i += 1) {
-        const candidate = before.candidates[i];
-        const src = candidate.src;
-        const imageDeadlineAt = Date.now() + Math.max(1, perImageTimeoutMs);
-        const remainingForImage = () => {
-            const rem = imageDeadlineAt - Date.now();
-            if (rem <= 0) {
-                throw new Error('Gemini image request timed out');
-            }
-            return rem;
-        };
-        let buffer;
-
-        if (src.startsWith('data:image/')) {
-            const decoded = decodeDataImageUrl(src, MAX_IMAGE_BYTES);
-            buffer = decoded.buffer;
-        } else if (src.startsWith('blob:')) {
-            const decoded = await readBlobFn(ws, src, MAX_IMAGE_BYTES, remainingForImage());
-            buffer = decoded.buffer;
-        } else if (src.startsWith('https://')) {
-            assertAllowedGeminiImageHost(src);
-            const cached = await readCachedFn(ws, src, MAX_IMAGE_BYTES, remainingForImage());
-            if (cached && cached.buffer && cached.buffer.length > 0) {
-                buffer = cached.buffer;
-            } else {
-                const res = await fetchFn(src, { timeoutMs: remainingForImage() });
-                buffer = res.buffer;
-            }
-        } else {
-            throw new Error(`Unsupported or insecure Gemini image URL scheme: ${src}`);
-        }
-
-        if (!buffer || buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) {
-            throw new Error('Downloaded Gemini image had invalid size');
-        }
-        const ext = sniffImageExt(buffer);
-        if (!ext) {
-            throw new Error('Downloaded bytes failed image signature verification');
-        }
-        fetched.push({ ext, buffer });
+    if (typeof src !== 'string') {
+        throw new Error('Missing Gemini preview image URL');
     }
+    if (src.startsWith('data:image/')) {
+        const decoded = decodeDataImageUrl(src, MAX_IMAGE_BYTES);
+        buffer = decoded.buffer;
+    } else if (src.startsWith('blob:')) {
+        const decoded = await readBlobFn(ws, src, MAX_IMAGE_BYTES, remainingForImage());
+        buffer = decoded.buffer;
+    } else if (src.startsWith('https://')) {
+        assertAllowedGeminiImageHost(src);
+        const cached = await readCachedFn(ws, src, MAX_IMAGE_BYTES, remainingForImage());
+        if (cached && cached.buffer && cached.buffer.length > 0) {
+            buffer = cached.buffer;
+        } else {
+            const res = await fetchFn(src, { timeoutMs: remainingForImage() });
+            buffer = res.buffer;
+        }
+    } else {
+        throw new Error(`Unsupported or insecure Gemini image URL scheme: ${src}`);
+    }
+
+    if (!buffer || buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) {
+        throw new Error('Downloaded Gemini image had invalid size');
+    }
+    const ext = sniffImageExt(buffer);
+    if (!ext) {
+        throw new Error('Downloaded bytes failed image signature verification');
+    }
+    return { ext, buffer };
+}
+
+async function publishFetchedImages(ws, before, verifyExpr, outputArgValue, fetched, deps = {}) {
+    const fsOps = deps.fsOps || fs;
+    const verifyTimeoutMs = Number.isFinite(deps.verifyTimeoutMs) ? deps.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
 
     const targetPaths = resolveOutputFilePaths(outputArgValue, fetched.map((f) => f.ext));
     const tempFiles = [];
@@ -999,6 +1603,144 @@ async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, d
     }
 }
 
+async function verifyTurnUnchanged(ws, before, verifyExpr, timeoutMs) {
+    let afterRes;
+    try {
+        afterRes = await callCdp(ws, 'Runtime.evaluate', {
+            expression: verifyExpr,
+            returnByValue: true,
+        }, timeoutMs);
+    } catch (_) {
+        throw geminiFailClosedError('Response identity could not be re-verified before preview fallback', 2);
+    }
+    const after = afterRes && afterRes.result && afterRes.result.value;
+    if (!after || !after.ok || !candidatesEqual(before.candidates, after.candidates)) {
+        throw geminiFailClosedError(
+            `Response identity changed during Gemini download: ${(after && after.reason) || 'candidates_mismatch'}`,
+            2,
+        );
+    }
+}
+
+async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, deps = {}) {
+    const perImageTimeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS;
+    const fetched = [];
+    for (let i = 0; i < before.candidates.length; i += 1) {
+        const imageDeadlineAt = Date.now() + Math.max(1, perImageTimeoutMs);
+        const remainingForImage = () => {
+            const rem = imageDeadlineAt - Date.now();
+            if (rem <= 0) {
+                throw new Error('Gemini image request timed out');
+            }
+            return rem;
+        };
+        fetched.push(await readPreviewCandidate(ws, before.candidates[i], remainingForImage, deps));
+    }
+    return publishFetchedImages(ws, before, verifyExpr, outputArgValue, fetched, deps);
+}
+
+async function downloadAndPublishBatchWithMeta(ws, before, verifyExpr, outputArgValue, expectedIdentity, deps = {}) {
+    const perImageTimeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS;
+    const verifyTimeoutMs = Number.isFinite(deps.verifyTimeoutMs) ? deps.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
+    const configuredFullSizeTimeoutMs = Number.isFinite(deps.fullSizeTimeoutMs)
+        ? deps.fullSizeTimeoutMs
+        : DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS;
+    const effectiveFullSizeTimeoutMs = Math.min(
+        configuredFullSizeTimeoutMs,
+        Math.max(1, Math.floor(perImageTimeoutMs * 2 / 3)),
+    );
+    const connectFn = deps.connectBrowserCdp || connectBrowserCdp;
+    const fullSizeFn = deps.downloadFullSizeCandidateViaBrowser || downloadFullSizeCandidateViaBrowser;
+    const fallbackReasons = [];
+    const addFallbackReason = (reason) => {
+        if (FULL_SIZE_FALLBACK_REASONS.has(reason) && !fallbackReasons.includes(reason)) {
+            fallbackReasons.push(reason);
+        }
+    };
+    const fallbackToPreview = async (reason) => {
+        addFallbackReason(reason);
+        await verifyTurnUnchanged(ws, before, verifyExpr, verifyTimeoutMs);
+        const files = await downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, deps);
+        return { files, downloadSource: 'preview_fallback', fallbackReasons };
+    };
+
+    let browserWs = deps.browserWs || null;
+    let ownsBrowserWs = false;
+    if (!browserWs) {
+        try {
+            const connected = await connectFn({
+                fetch: deps.fetch,
+                WebSocketCtor: deps.WebSocketCtor,
+                browserCdpVersionUrl: deps.browserCdpVersionUrl,
+                openTimeoutMs: deps.browserCdpOpenTimeoutMs,
+            });
+            browserWs = connected && connected.ws;
+            ownsBrowserWs = true;
+        } catch (error) {
+            if (error && error.fallbackReason === 'cdp_download_behavior_unsupported' && error.fallbackEligible === true) {
+                return fallbackToPreview('cdp_download_behavior_unsupported');
+            }
+            throw error;
+        }
+        if (!browserWs || typeof browserWs.addEventListener !== 'function') {
+            if (ownsBrowserWs && browserWs) {
+                try { browserWs.close(); } catch (_) {}
+                browserWs = null;
+                ownsBrowserWs = false;
+            }
+            return fallbackToPreview('cdp_download_behavior_unsupported');
+        }
+    }
+
+    try {
+        const fetched = [];
+        let usedPreviewFallback = false;
+        for (const candidate of before.candidates) {
+            const imageDeadlineAt = Date.now() + Math.max(1, perImageTimeoutMs);
+            const remainingForImage = () => {
+                const rem = imageDeadlineAt - Date.now();
+                if (rem <= 0) {
+                    throw new Error('Gemini image request timed out');
+                }
+                return rem;
+            };
+            try {
+                const fullSizeResult = await fullSizeFn(ws, browserWs, before, candidate, expectedIdentity, {
+                    timeoutMs: Math.min(effectiveFullSizeTimeoutMs, remainingForImage()),
+                    verifyTimeoutMs,
+                    minimumImageDimension: MINIMUM_IMAGE_DIMENSION,
+                    fsOps: deps.fsOps,
+                });
+                fetched.push({ ext: fullSizeResult.ext, buffer: fullSizeResult.buffer });
+            } catch (error) {
+                if (!error || error.fallbackEligible !== true || !FULL_SIZE_FALLBACK_REASONS.has(error.fallbackReason)) {
+                    throw error;
+                }
+                addFallbackReason(error.fallbackReason);
+                const remainingBeforeFallback = Math.max(1, imageDeadlineAt - Date.now());
+                await verifyTurnUnchanged(
+                    ws,
+                    before,
+                    verifyExpr,
+                    Math.max(1, Math.min(verifyTimeoutMs, remainingBeforeFallback)),
+                );
+                fetched.push(await readPreviewCandidate(ws, candidate, remainingForImage, deps));
+                usedPreviewFallback = true;
+            }
+        }
+        const files = await publishFetchedImages(ws, before, verifyExpr, outputArgValue, fetched, deps);
+        return {
+            files,
+            downloadSource: usedPreviewFallback ? 'preview_fallback' : 'full_size_download',
+            fallbackReasons,
+        };
+    } finally {
+        if (ownsBrowserWs && browserWs) {
+            try { browserWs.close(); } catch (_) {}
+        }
+    }
+}
+
 async function readExpectedIdentityPayload(rawArg) {
     if (rawArg !== '-') {
         return rawArg;
@@ -1069,8 +1811,15 @@ async function runCli(deps = {}) {
     const output = deps.outputArg ?? outputArg;
     const identityArg = deps.expectedIdentityJsonArg ?? expectedIdentityJsonArg;
     const fetchImpl = deps.fetch || fetch;
-    const WebSocketCtor = deps.WebSocketCtor || WebSocket;
+    const WebSocketCtor = deps.WebSocketCtor || (typeof WebSocket !== 'undefined' ? WebSocket : null);
     const perImageTimeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS;
+    const configuredFullSizeTimeoutMs = Number.isFinite(deps.fullSizeTimeoutMs)
+        ? deps.fullSizeTimeoutMs
+        : DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS;
+    const effectiveFullSizeTimeoutMs = Math.min(
+        configuredFullSizeTimeoutMs,
+        Math.max(1, Math.floor(perImageTimeoutMs * 2 / 3)),
+    );
     const verifyTimeoutMs = Number.isFinite(deps.verifyTimeoutMs) ? deps.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
     const cleanupTimeoutMs = Number.isFinite(deps.cleanupTimeoutMs) ? deps.cleanupTimeoutMs : 2000;
     const configuredOverallLimitMs = Number.isFinite(deps.overallLimitMs) && deps.overallLimitMs > 0
@@ -1154,15 +1903,35 @@ async function runCli(deps = {}) {
 
         if (configuredOverallLimitMs === null) {
             clearTimeout(deadline);
-            deadline = setTimeout(onWatchdogExit, Math.max(35000, before.candidates.length * perImageTimeoutMs + 15000));
+            deadline = setTimeout(onWatchdogExit, Math.max(
+                45000,
+                before.candidates.length * perImageTimeoutMs + verifyTimeoutMs + 15000,
+            ));
         }
 
-        const savedFiles = await downloadAndPublishBatch(ws, before, verifyExpr, output, {
+        const batchResult = await downloadAndPublishBatchWithMeta(ws, before, verifyExpr, output, expectedIdentity, {
             timeoutMs: perImageTimeoutMs,
+            fullSizeTimeoutMs: effectiveFullSizeTimeoutMs,
             verifyTimeoutMs,
             fsOps: deps.fsOps,
+            fetch: fetchImpl,
+            WebSocketCtor,
+            connectBrowserCdp: deps.connectBrowserCdp,
+            downloadFullSizeCandidateViaBrowser: deps.downloadFullSizeCandidateViaBrowser,
+            browserWs: deps.browserWs,
+            browserCdpVersionUrl: deps.browserCdpVersionUrl,
+            browserCdpOpenTimeoutMs: deps.browserCdpOpenTimeoutMs,
         });
-        await writeStdout(JSON.stringify({ ok: true, count: savedFiles.length, files: savedFiles }));
+        const resultPayload = {
+            ok: true,
+            count: batchResult.files.length,
+            files: batchResult.files,
+            download_source: batchResult.downloadSource,
+        };
+        if (batchResult.fallbackReasons.length > 0) {
+            resultPayload.fallback_reasons = batchResult.fallbackReasons;
+        }
+        await writeStdout(JSON.stringify(resultPayload));
     } catch (error) {
         const hasRemainingBackups = Array.isArray(error && error.remainingBackups)
             && error.remainingBackups.length > 0;
@@ -1200,12 +1969,16 @@ module.exports = {
     REQUEST_TIMEOUT_MS,
     CDP_CALL_TIMEOUT_MS,
     CDP_OPEN_TIMEOUT_MS,
+    DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS,
+    BROWSER_CDP_VERSION_URL,
+    FULL_SIZE_FALLBACK_REASONS,
     DEFAULT_MINIMUM_IMAGE_DIMENSION,
     MINIMUM_IMAGE_DIMENSION,
     GEMINI_TURN_PROJECTION_EMBED,
     isAllowedGeminiImageHost,
     isAllowedGeminiImageUrl,
     isAllowedGeminiBlobUrl,
+    isAllowedGeminiDownloadEventUrl,
     assertAllowedGeminiImageHost,
     isPrivateOrLoopbackIp,
     decodeDataImageUrl,
@@ -1217,11 +1990,17 @@ module.exports = {
     atomicWritePrivateFile,
     resolveOutputFilePaths,
     downloadAndPublishBatch,
+    downloadAndPublishBatchWithMeta,
     readBlobDataUrlFromBrowser,
     readExpectedIdentityPayload,
     sniffImageExt,
+    validateImageHeaderAndTrailer,
     candidatesEqual,
     buildVerifyProjectionExpression,
+    buildFullSizeClickExpression,
+    isLoopbackBrowserWsUrl,
+    connectBrowserCdp,
+    downloadFullSizeCandidateViaBrowser,
     callCdp,
     writeStreamFlushed,
     runCli,

@@ -4,13 +4,15 @@ mod ask_bridge;
 
 use ask_bridge::{
     AttachmentExpectations, AttachmentProbeSummary, ExpectedOutputType,
-    GEMINI_LIVE_PHASE0B_VERIFIED, ModelSelectionContract, ModelSelectionEvidence,
-    ModelSelectionOutcome, PromptSubmissionFailureDisposition, Provider, ResponseCompletion,
-    ResponseFailureCode, SessionReceipt, SessionReceiptEvent, TypedAttachmentProbe,
-    capabilities_value, capabilities_value_with_gemini_verified, record_auth_failed,
-    record_model_selection_failed_for_provider, record_model_selection_verified,
-    record_prompt_submission_failure, record_session_receipt_event,
-    record_session_response_outcome, write_attachment_probe_receipt, write_private_json,
+    GEMINI_LIVE_PHASE0B_VERIFIED, ImageDownloadSource, ModelSelectionContract,
+    ModelSelectionEvidence, ModelSelectionOutcome, PromptSubmissionFailureDisposition, Provider,
+    ResponseCompletion, ResponseFailureCode, SessionReceipt, SessionReceiptEvent,
+    TypedAttachmentProbe, capabilities_value, capabilities_value_with_gemini_verified,
+    record_auth_failed, record_model_selection_failed_for_provider,
+    record_model_selection_verified, record_prompt_submission_failure,
+    record_session_receipt_event, record_session_response_outcome,
+    record_session_response_outcome_with_image_source, write_attachment_probe_receipt,
+    write_private_json,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -199,8 +201,14 @@ fn build_fixtures() -> Vec<(&'static str, Value)> {
     )
     .unwrap();
     record_session_receipt_event(&gemini_image_path, SessionReceiptEvent::PromptSubmitted).unwrap();
-    record_session_response_outcome(&gemini_image_path, ResponseCompletion::Completed, 1, None)
-        .unwrap();
+    record_session_response_outcome_with_image_source(
+        &gemini_image_path,
+        ResponseCompletion::Completed,
+        1,
+        None,
+        Some(ImageDownloadSource::FullSizeDownload),
+    )
+    .unwrap();
     let gemini_image_val: Value =
         serde_json::from_slice(&std::fs::read(&gemini_image_path).unwrap()).unwrap();
 
@@ -452,6 +460,18 @@ fn contract_fixtures_serialize_valid_provider_contracts() {
             .get("verified_gemini_image_workflow_v1")
             .is_none()
     );
+    assert!(
+        !unverified_caps["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("verified_gemini_full_size_image_download_v1"))
+    );
+    assert!(
+        unverified_caps
+            .get("verified_gemini_full_size_image_download_v1")
+            .is_none()
+    );
 
     let verified_caps = fixtures
         .iter()
@@ -465,6 +485,78 @@ fn contract_fixtures_serialize_valid_provider_contracts() {
             .iter()
             .any(|v| v.as_str() == Some("verified_gemini_image_workflow_v1"))
     );
+    assert!(
+        verified_caps["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("verified_gemini_full_size_image_download_v1"))
+    );
+    let full_size = verified_caps
+        .get("verified_gemini_full_size_image_download_v1")
+        .expect("verified full-size capability payload");
+    let mut keys = full_size
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "button_scope",
+            "event_correlation",
+            "extension_policy",
+            "fallback_policy",
+            "mechanism",
+            "post_download_reverify",
+            "provider",
+            "receipt_fields",
+        ]
+    );
+    assert_eq!(full_size["provider"].as_str(), Some("gemini"));
+    assert_eq!(
+        full_size["mechanism"].as_str(),
+        Some("cdp_browser_allow_and_name_isolated_temp")
+    );
+    assert_eq!(
+        full_size["button_scope"].as_str(),
+        Some("verified_turn_unique_generated_image_container")
+    );
+    assert_eq!(
+        full_size["event_correlation"].as_str(),
+        Some("owned_frame_and_guid")
+    );
+    assert_eq!(
+        full_size["extension_policy"].as_str(),
+        Some("magic_bytes_sniffing")
+    );
+    assert_eq!(full_size["post_download_reverify"].as_bool(), Some(true));
+    assert_eq!(
+        full_size["fallback_policy"].as_str(),
+        Some("verified_preview_with_provenance")
+    );
+    assert_eq!(
+        full_size["receipt_fields"],
+        json!(["image_download_source"])
+    );
+
+    let mixed_image = fixtures
+        .iter()
+        .find(|(name, _)| *name == "receipt_gemini_mixed_image.json")
+        .map(|(_, v)| v)
+        .unwrap();
+    assert_eq!(
+        mixed_image["image_download_source"].as_str(),
+        Some("full_size_download")
+    );
+    let chatgpt_current = fixtures
+        .iter()
+        .find(|(name, _)| *name == "receipt_chatgpt_current.json")
+        .map(|(_, v)| v)
+        .unwrap();
+    assert!(chatgpt_current.get("image_download_source").is_none());
 
     let claude = fixtures
         .iter()

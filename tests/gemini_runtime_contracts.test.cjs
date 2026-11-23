@@ -16,6 +16,7 @@ const {
     isGeminiGenerating,
     geminiTurnIdentity,
     findGeminiFinalGeneratedImages,
+    findGeminiFullSizeDownloadButton,
     geminiElementToMarkdown,
 } = require('../src/gemini_turn_projection.js');
 
@@ -787,4 +788,293 @@ test('V2-R6: selectGeminiMode rejects reopened menu when duplicate mode names ap
         dispatchEscape: () => { menuOpen = false; },
     });
     assert.equal(status, 'error: Gemini model selection readback mismatch');
+});
+
+// --- Gemini full-size download button scoping contract ---
+function makeFullSizeControl(options = {}) {
+    const attrs = options.attrs || {};
+    const icons = options.icons || [];
+    const control = {
+        tagName: options.tagName || 'BUTTON',
+        textContent: options.text || '',
+        selectorMatch: Boolean(options.selectorMatch),
+        clicked: false,
+        getAttribute(name) {
+            return attrs[name] || '';
+        },
+        querySelectorAll(selector) {
+            if (String(selector).includes('mat-icon')) return icons;
+            return [];
+        },
+        dispatchEvent() { return true; },
+        click() { control.clicked = true; },
+    };
+    return control;
+}
+
+function makeFullSizeImage(spec) {
+    return {
+        tagName: 'IMG',
+        currentSrc: spec.src,
+        src: spec.src,
+        complete: true,
+        naturalWidth: spec.width ?? spec.naturalWidth,
+        naturalHeight: spec.height ?? spec.naturalHeight,
+        getAttribute(name) {
+            if (name === 'src') return spec.src;
+            return '';
+        },
+    };
+}
+
+function makeFullSizeGroup(containerSpecs) {
+    const root = {
+        tagName: 'MODEL-RESPONSE',
+        getAttribute: (name) => (name === 'id' ? 'response-art-1' : ''),
+        querySelectorAll(selector) {
+            if (String(selector).includes('generated-image')) {
+                return root.__images;
+            }
+            return [];
+        },
+        __images: [],
+    };
+    const containers = containerSpecs.map((spec) => {
+        const images = (spec.images || []).map((imageSpec) => makeFullSizeImage(imageSpec));
+        const controls = spec.controls || [];
+        const container = {
+            tagName: 'GENERATED-IMAGE',
+            querySelectorAll(selector) {
+                if (selector === 'img') return images;
+                if (selector === 'button, a, [role="button"]') return controls;
+                if (
+                    String(selector).includes('download-generated-image-button button')
+                    || String(selector).includes('button[data-test-id*="download-generated-image"]')
+                ) {
+                    return controls.filter((control) => control.selectorMatch);
+                }
+                return [];
+            },
+            getAttribute(name) {
+                if (name === 'id' || name === 'data-artifact-id') return spec.artifactId;
+                return '';
+            },
+        };
+        for (const image of images) image.parentElement = container;
+        if (spec.userQuery) {
+            const userQuery = {
+                tagName: 'USER-QUERY',
+                parentElement: root,
+                querySelectorAll() { return []; },
+                getAttribute() { return ''; },
+            };
+            container.parentElement = userQuery;
+        } else {
+            container.parentElement = root;
+        }
+        root.__images.push(...images);
+        return container;
+    });
+    return { scope: root, nodes: [root], containers };
+}
+
+const FULL_SIZE_CANDIDATE = {
+    artifactId: 'generated-image-1',
+    src: 'https://lh3.googleusercontent.com/final-2752.png',
+    naturalWidth: 2752,
+    naturalHeight: 1536,
+};
+
+test('full-size download button prefers selector, then localized labels, then a unique download icon', () => {
+    const selectorButton = makeFullSizeControl({
+        selectorMatch: true,
+        attrs: { 'data-test-id': 'download-generated-image-button' },
+    });
+    const labelButton = makeFullSizeControl({ attrs: { 'aria-label': '下載原尺寸' } });
+    const iconButton = makeFullSizeControl({
+        icons: [{ textContent: 'download', getAttribute: () => '' }],
+    });
+    const priorityGroup = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [labelButton, iconButton, selectorButton],
+    }]);
+    const priority = findGeminiFullSizeDownloadButton(priorityGroup, FULL_SIZE_CANDIDATE, 256);
+    assert.equal(priority.ok, true);
+    assert.equal(priority.button, selectorButton);
+    assert.equal(priority.matchedBy, 'selector');
+
+    for (const label of [
+        '下載原尺寸',
+        '下載完整尺寸',
+        '下载原尺寸',
+        'Download full size',
+        'Download original size',
+        'Download original image',
+        'フルサイズでダウンロード',
+        '원본 크기로 다운로드',
+    ]) {
+        const target = makeFullSizeControl({ attrs: { 'aria-label': label } });
+        const share = makeFullSizeControl({ attrs: { 'aria-label': '分享' } });
+        const group = makeFullSizeGroup([{
+            artifactId: FULL_SIZE_CANDIDATE.artifactId,
+            images: [FULL_SIZE_CANDIDATE],
+            controls: [share, target],
+        }]);
+        const result = findGeminiFullSizeDownloadButton(group, FULL_SIZE_CANDIDATE, 256);
+        assert.equal(result.ok, true, label);
+        assert.equal(result.button, target, label);
+        assert.equal(result.matchedBy, 'label', label);
+    }
+
+    const onlyIcon = makeFullSizeControl({
+        icons: [{ textContent: 'download', getAttribute: () => '' }],
+    });
+    const nonDownload = [
+        makeFullSizeControl({ attrs: { 'aria-label': 'Share' } }),
+        makeFullSizeControl({ attrs: { 'aria-label': 'Copy' } }),
+        makeFullSizeControl({ attrs: { 'aria-label': 'More options' } }),
+        makeFullSizeControl({ attrs: { 'aria-label': 'Feedback' } }),
+        makeFullSizeControl({ icons: [{ textContent: 'share', getAttribute: () => '' }] }),
+        makeFullSizeControl({ icons: [{ textContent: 'copy', getAttribute: () => '' }] }),
+        makeFullSizeControl({ icons: [{ textContent: 'more_vert', getAttribute: () => '' }] }),
+        makeFullSizeControl({ icons: [{ textContent: 'feedback', getAttribute: () => '' }] }),
+    ];
+    const iconGroup = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [...nonDownload, onlyIcon],
+    }]);
+    const iconResult = findGeminiFullSizeDownloadButton(iconGroup, FULL_SIZE_CANDIDATE, 256);
+    assert.equal(iconResult.ok, true);
+    assert.equal(iconResult.button, onlyIcon);
+    assert.equal(iconResult.matchedBy, 'icon');
+});
+
+test('full-size download button fails closed for missing, ambiguous, and multi-image containers', () => {
+    const noControls = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [],
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(noControls, FULL_SIZE_CANDIDATE, 256).reason,
+        'button_not_found'
+    );
+
+    const twoSelectors = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [
+            makeFullSizeControl({ selectorMatch: true }),
+            makeFullSizeControl({ selectorMatch: true }),
+        ],
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(twoSelectors, FULL_SIZE_CANDIDATE, 256).reason,
+        'ambiguous_download_button'
+    );
+
+    const twoLabels = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [
+            makeFullSizeControl({ attrs: { 'aria-label': 'Download full size' } }),
+            makeFullSizeControl({ attrs: { title: '下載原尺寸' } }),
+        ],
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(twoLabels, FULL_SIZE_CANDIDATE, 256).reason,
+        'ambiguous_download_button'
+    );
+
+    const twoIcons = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [
+            makeFullSizeControl({ icons: [{ textContent: 'download', getAttribute: () => '' }] }),
+            makeFullSizeControl({ icons: [{ textContent: '', getAttribute: (name) => (name === 'data-icon' ? 'download' : '') }] }),
+        ],
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(twoIcons, FULL_SIZE_CANDIDATE, 256).reason,
+        'ambiguous_download_button'
+    );
+
+    const extraImageInContainer = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [
+            FULL_SIZE_CANDIDATE,
+            { artifactId: 'generated-image-2', src: 'https://lh3.googleusercontent.com/final-2.png', width: 2752, height: 1536 },
+        ],
+        controls: [makeFullSizeControl({ selectorMatch: true })],
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(extraImageInContainer, FULL_SIZE_CANDIDATE, 256).reason,
+        'ambiguous_download_button'
+    );
+
+    const duplicateCandidate = makeFullSizeGroup([
+        {
+            artifactId: FULL_SIZE_CANDIDATE.artifactId,
+            images: [FULL_SIZE_CANDIDATE],
+            controls: [makeFullSizeControl({ selectorMatch: true })],
+        },
+        {
+            artifactId: FULL_SIZE_CANDIDATE.artifactId,
+            images: [FULL_SIZE_CANDIDATE],
+            controls: [makeFullSizeControl({ selectorMatch: true })],
+        },
+    ]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(duplicateCandidate, FULL_SIZE_CANDIDATE, 256).reason,
+        'ambiguous_download_button'
+    );
+
+    const missingCandidate = makeFullSizeGroup([{
+        artifactId: 'generated-image-2',
+        images: [{ artifactId: 'generated-image-2', src: 'https://lh3.googleusercontent.com/other.png', width: 2752, height: 1536 }],
+        controls: [makeFullSizeControl({ selectorMatch: true })],
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(missingCandidate, FULL_SIZE_CANDIDATE, 256).reason,
+        'button_not_found'
+    );
+});
+
+test('full-size download button stays inside the verified single-image container', () => {
+    const firstButton = makeFullSizeControl({ selectorMatch: true });
+    const secondButton = makeFullSizeControl({ selectorMatch: true });
+    const isolated = makeFullSizeGroup([
+        {
+            artifactId: FULL_SIZE_CANDIDATE.artifactId,
+            images: [FULL_SIZE_CANDIDATE],
+            controls: [firstButton],
+        },
+        {
+            artifactId: 'generated-image-2',
+            images: [{
+                artifactId: 'generated-image-2',
+                src: 'https://lh3.googleusercontent.com/final-2.png',
+                width: 2752,
+                height: 1536,
+            }],
+            controls: [secondButton],
+        },
+    ]);
+    const result = findGeminiFullSizeDownloadButton(isolated, FULL_SIZE_CANDIDATE, 256);
+    assert.equal(result.ok, true);
+    assert.equal(result.button, firstButton);
+    assert.notEqual(result.button, secondButton);
+
+    const userQueryOnly = makeFullSizeGroup([{
+        artifactId: FULL_SIZE_CANDIDATE.artifactId,
+        images: [FULL_SIZE_CANDIDATE],
+        controls: [makeFullSizeControl({ selectorMatch: true })],
+        userQuery: true,
+    }]);
+    assert.equal(
+        findGeminiFullSizeDownloadButton(userQueryOnly, FULL_SIZE_CANDIDATE, 256).reason,
+        'button_not_found'
+    );
 });

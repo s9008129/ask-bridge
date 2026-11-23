@@ -1,5 +1,15 @@
 const assert = require('node:assert/strict');
-const { mkdtempSync, readFileSync, rmSync, statSync } = require('node:fs');
+const {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} = require('node:fs');
 const http = require('node:http');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
@@ -8,7 +18,7 @@ const vm = require('node:vm');
 
 const repoRoot = join(__dirname, '..');
 
-const loadGeminiDownloadHelpers = () => {
+const loadGeminiDownloadHelpers = (overrides = {}) => {
   const source = readFileSync(join(repoRoot, 'src', 'gemini_download.js'), 'utf8');
   const context = {
     console,
@@ -24,8 +34,8 @@ const loadGeminiDownloadHelpers = () => {
     Buffer,
     URL,
     AbortController,
-    setTimeout,
-    clearTimeout,
+    setTimeout: overrides.setTimeout || setTimeout,
+    clearTimeout: overrides.clearTimeout || clearTimeout,
     fetch,
   };
   vm.runInNewContext(source, context, { filename: 'gemini_download.js' });
@@ -36,6 +46,204 @@ const VALID_PNG = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
 ]);
+
+function pngChunk(type, data) {
+  const chunk = Buffer.alloc(12 + data.length);
+  chunk.writeUInt32BE(data.length, 0);
+  chunk.write(type, 4, 4, 'ascii');
+  data.copy(chunk, 8);
+  return chunk;
+}
+
+function makeSyntheticPng(width = 2752, height = 1536, options = {}) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const iend = pngChunk('IEND', Buffer.alloc(0));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    options.truncateIend ? iend.subarray(0, 8) : iend,
+  ]);
+}
+
+function makeSyntheticJpeg(width = 2752, height = 1536, options = {}) {
+  const header = Buffer.from([
+    0xff, 0xd8,
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+  ]);
+  header.writeUInt16BE(height, 7);
+  header.writeUInt16BE(width, 9);
+  return options.missingEoi
+    ? header
+    : Buffer.concat([header, Buffer.from([0xff, 0xd9])]);
+}
+
+function makeSyntheticWebp(width = 2752, height = 1536) {
+  const widthMinusOne = width - 1;
+  const heightMinusOne = height - 1;
+  const b1 = widthMinusOne & 0xff;
+  const b2 = ((widthMinusOne >> 8) & 0x3f) | ((heightMinusOne & 0x03) << 6);
+  const b3 = (heightMinusOne >> 2) & 0xff;
+  const b4 = (heightMinusOne >> 10) & 0x0f;
+  const data = Buffer.from([0x2f, b1, b2, b3, b4]);
+  const chunk = Buffer.alloc(8 + data.length + 1);
+  chunk.write('VP8L', 0, 4, 'ascii');
+  chunk.writeUInt32LE(data.length, 4);
+  data.copy(chunk, 8);
+  const body = Buffer.concat([Buffer.from('WEBP', 'ascii'), chunk]);
+  const riff = Buffer.alloc(8);
+  riff.write('RIFF', 0, 4, 'ascii');
+  riff.writeUInt32LE(body.length, 4);
+  return Buffer.concat([riff, body]);
+}
+
+function makeCdpSocket(handler) {
+  const listeners = new Map();
+  const socket = {
+    readyState: 1,
+    calls: [],
+    closed: false,
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      const set = listeners.get(type);
+      if (set) set.delete(fn);
+    },
+    emit(type, event = {}) {
+      for (const fn of [...(listeners.get(type) || [])]) fn(event);
+    },
+    emitMessage(value) {
+      socket.emit('message', { data: JSON.stringify(value) });
+    },
+    close() {
+      if (socket.closed) return;
+      socket.closed = true;
+      socket.readyState = 3;
+      socket.emit('close', {});
+    },
+    send(raw) {
+      const message = JSON.parse(raw);
+      socket.calls.push(message);
+      let outcome;
+      try {
+        outcome = handler(message, socket);
+      } catch (error) {
+        socket.emitMessage({ id: message.id, error: { message: error.message } });
+        return;
+      }
+      const deliver = (result) => {
+        if (result === undefined) return;
+        queueMicrotask(() => socket.emitMessage({ id: message.id, result }));
+      };
+      if (outcome && typeof outcome.then === 'function') {
+        outcome.then(deliver).catch((error) => {
+          queueMicrotask(() => socket.emitMessage({
+            id: message.id,
+            error: { message: error && error.message ? error.message : String(error) },
+          }));
+        });
+      } else {
+        deliver(outcome);
+      }
+    },
+  };
+  return socket;
+}
+
+function makeFallbackError(reason) {
+  const error = new Error(reason);
+  error.fallbackReason = reason;
+  error.fallbackEligible = true;
+  return error;
+}
+
+function makeVerifySocket(candidates, options = {}) {
+  return makeCdpSocket((message) => {
+    if (message.method === 'Runtime.evaluate') {
+      const expression = String((message.params && message.params.expression) || '');
+      if (expression.includes('__ask_bridge_download_token ||')) {
+        return { result: { value: options.token || 'token-1' } };
+      }
+      if (expression.includes('delete window.__ask_bridge_download_token')) {
+        return { result: { value: true } };
+      }
+      return {
+        result: {
+          value: options.verifyOk === false
+            ? { ok: false, reason: 'candidates_mismatch' }
+            : { ok: true, candidates },
+        },
+      };
+    }
+    return {};
+  });
+}
+
+function makeFullSizeHarness(candidate, options = {}) {
+  const state = {
+    behaviors: [],
+    cancels: [],
+    downloadPath: null,
+    targetMethods: [],
+    clickCount: 0,
+  };
+  const browserWs = makeCdpSocket((message) => {
+    state.targetMethods.push(message.method);
+    if (message.method === 'Browser.setDownloadBehavior') {
+      state.behaviors.push(message.params.behavior);
+      if (message.params.behavior === 'allowAndName') {
+        state.downloadPath = message.params.downloadPath;
+      }
+      return {};
+    }
+    if (message.method === 'Browser.cancelDownload') {
+      state.cancels.push(message.params.guid);
+      return {};
+    }
+    return {};
+  });
+  const pageWs = makeCdpSocket((message) => {
+    state.targetMethods.push(message.method);
+    if (message.method === 'Page.getFrameTree') {
+      return {
+        frameTree: {
+          frame: {
+            id: 'main-frame',
+            childFrames: [{ frame: { id: 'child-frame' } }],
+          },
+        },
+      };
+    }
+    if (message.method === 'Runtime.evaluate') {
+      if (message.params && message.params.userGesture === true) {
+        state.clickCount += 1;
+        const clickResult = typeof options.clickResult === 'function'
+          ? options.clickResult({ state })
+          : options.clickResult;
+        if (typeof options.onClick === 'function') {
+          queueMicrotask(() => options.onClick({ browserWs, state }));
+        }
+        return { result: { value: clickResult || { ok: true } } };
+      }
+      const verifyResult = typeof options.verifyResult === 'function'
+        ? options.verifyResult({ state })
+        : options.verifyResult;
+      return {
+        result: {
+          value: verifyResult || { ok: true, candidates: [candidate] },
+        },
+      };
+    }
+    return {};
+  });
+  return { pageWs, browserWs, state };
+}
 
 test('URL allowlist rejects http, private/loopback IPs, credentials, and untrusted hosts', () => {
   const helpers = loadGeminiDownloadHelpers();
@@ -883,12 +1091,13 @@ test('V4-R7: runCli bounds blob and post-publish verification CDP waits, cleans 
         fetch: async () => ({ json: async () => [{ type: 'page', url: `${helpers.GEMINI_ORIGIN}/app/conv-1`, webSocketDebuggerUrl: 'ws://test' }] }),
         WebSocketCtor: function FakeWebSocket() { return ws; },
         timeoutMs: 80,
+        verifyTimeoutMs: 60,
         cleanupTimeoutMs: 40,
         overallLimitMs: 1500,
         onWatchdogExit: () => { watchdogFired = true; },
         writeStdout: (value) => stdout.push(value),
       }),
-      /timed out/,
+      /Response identity could not be re-verified/,
     );
     assert.ok(Date.now() - startedAt < 1000, 'runCli must finish well below the watchdog');
     assert.equal(watchdogFired, false);
@@ -928,7 +1137,7 @@ test('V4-R7: runCli bounds blob and post-publish verification CDP waits, cleans 
         onWatchdogExit: () => { watchdogFired = true; },
         writeStdout: (value) => stdout.push(value),
       }),
-      /timed out/,
+      /Response identity could not be re-verified/,
     );
     assert.ok(Date.now() - startedAt < 1000, 'runCli must finish well below the watchdog');
     assert.equal(watchdogFired, false);
@@ -1045,4 +1254,1030 @@ test('V4-R5: shared turn grouping keeps two model-response fragments in one data
   assert.equal(result.candidates.length, 1);
   assert.equal(result.candidates[0].artifactId, 'art-1');
   assert.equal(result.candidates[0].src, 'https://lh3.googleusercontent.com/generated-1.png');
+});
+
+test('full-size download allowlist accepts only single-label usercontent.google.com while rejecting nested hosts and unsafe schemes', () => {
+  const helpers = loadGeminiDownloadHelpers();
+
+  assert.equal(helpers.isAllowedGeminiImageUrl('https://abc.usercontent.google.com/download').ok, true);
+  assert.equal(helpers.isAllowedGeminiImageUrl('https://usercontent.google.com/download').ok, false);
+  assert.equal(helpers.isAllowedGeminiImageUrl('https://a.b.usercontent.google.com/download').ok, false);
+  assert.equal(helpers.isAllowedGeminiDownloadEventUrl('https://abc.usercontent.google.com/download'), true);
+  assert.equal(helpers.isAllowedGeminiDownloadEventUrl('https://lh3.googleusercontent.com/download'), true);
+  assert.equal(helpers.isAllowedGeminiDownloadEventUrl('blob:https://gemini.google.com/1234'), true);
+  assert.equal(helpers.isAllowedGeminiDownloadEventUrl('data:image/png;base64,AAAA'), true);
+
+  for (const blocked of [
+    'http://abc.usercontent.google.com/download',
+    'https://evil.example.com/download',
+    'https://a.b.usercontent.google.com/download',
+    'https://user:secret@abc.usercontent.google.com/download',
+    'javascript:alert(1)',
+    'blob:https://evil.example.com/1234',
+  ]) {
+    assert.equal(helpers.isAllowedGeminiDownloadEventUrl(blocked), false, `must reject ${blocked}`);
+  }
+
+  const source = readFileSync(join(repoRoot, 'src', 'gemini_download.js'), 'utf8');
+  assert.equal(source.includes('node:zlib'), false);
+  assert.equal(source.includes('inflateSync'), false);
+});
+
+test('validateImageHeaderAndTrailer checks PNG IHDR+IEND, JPEG SOF+EOI, WebP RIFF dimensions, and size bounds without decoding pixels', () => {
+  const helpers = loadGeminiDownloadHelpers();
+
+  const png = makeSyntheticPng(2752, 1536);
+  const pngResult = helpers.validateImageHeaderAndTrailer(png, 256);
+  assert.deepEqual(JSON.parse(JSON.stringify(pngResult)), {
+    ok: true,
+    ext: 'png',
+    width: 2752,
+    height: 1536,
+  });
+  assert.equal(
+    helpers.validateImageHeaderAndTrailer(makeSyntheticPng(2752, 1536, { truncateIend: true }), 256).reason,
+    'invalid_png_trailer',
+  );
+  assert.equal(
+    helpers.validateImageHeaderAndTrailer(makeSyntheticPng(200, 200), 256).reason,
+    'image_below_minimum_dimension',
+  );
+
+  const jpegResult = helpers.validateImageHeaderAndTrailer(makeSyntheticJpeg(2752, 1536), 256);
+  assert.equal(jpegResult.ok, true);
+  assert.equal(jpegResult.ext, 'jpg');
+  assert.equal(jpegResult.width, 2752);
+  assert.equal(jpegResult.height, 1536);
+  assert.equal(
+    helpers.validateImageHeaderAndTrailer(makeSyntheticJpeg(2752, 1536, { missingEoi: true }), 256).reason,
+    'invalid_jpeg_trailer',
+  );
+  assert.equal(
+    helpers.validateImageHeaderAndTrailer(makeSyntheticJpeg(200, 200), 256).reason,
+    'image_below_minimum_dimension',
+  );
+
+  const webpResult = helpers.validateImageHeaderAndTrailer(makeSyntheticWebp(2752, 1536), 256);
+  assert.equal(webpResult.ok, true);
+  assert.equal(webpResult.ext, 'webp');
+  assert.equal(webpResult.width, 2752);
+  assert.equal(webpResult.height, 1536);
+  assert.equal(
+    helpers.validateImageHeaderAndTrailer(makeSyntheticWebp(200, 200), 256).reason,
+    'image_below_minimum_dimension',
+  );
+
+  assert.equal(helpers.validateImageHeaderAndTrailer(Buffer.alloc(0), 256).reason, 'invalid_image_size');
+  assert.equal(
+    helpers.validateImageHeaderAndTrailer(Buffer.alloc(helpers.MAX_IMAGE_BYTES + 1), 256).reason,
+    'invalid_image_size',
+  );
+});
+
+test('connectBrowserCdp requires a loopback browser websocket and treats non-object mocks as unsupported', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+
+  for (const allowed of [
+    'ws://127.0.0.1:9223/devtools/browser/browser-1',
+    'ws://localhost:9223/devtools/browser/browser-1',
+    'ws://[::1]:9223/devtools/browser/browser-1',
+  ]) {
+    assert.equal(helpers.isLoopbackBrowserWsUrl(allowed), true, allowed);
+  }
+  for (const blocked of [
+    'ws://127.0.0.1:9222/devtools/browser/browser-1',
+    'ws://127.0.0.1:9223/devtools/page/page-1',
+    'ws://127.0.0.1:9223/json/version',
+    'wss://127.0.0.1:9223/devtools/browser/browser-1',
+    'ws://evil.example.com:9223/devtools/browser/browser-1',
+    'ws://user:pass@127.0.0.1:9223/devtools/browser/browser-1',
+  ]) {
+    assert.equal(helpers.isLoopbackBrowserWsUrl(blocked), false, blocked);
+  }
+
+  await assert.rejects(
+    () => helpers.connectBrowserCdp({ fetch: async () => ({ json: async () => [] }) }),
+    (error) => {
+      assert.equal(error.fallbackReason, 'cdp_download_behavior_unsupported');
+      assert.equal(error.fallbackEligible, true);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => helpers.connectBrowserCdp({ fetch: async () => ({ json: async () => 'not-an-object' }) }),
+    (error) => {
+      assert.equal(error.fallbackReason, 'cdp_download_behavior_unsupported');
+      assert.equal(error.fallbackEligible, true);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => helpers.connectBrowserCdp({
+      fetch: async () => ({
+        json: async () => ({ webSocketDebuggerUrl: 'ws://evil.example.com:9223/devtools/browser/browser-1' }),
+      }),
+    }),
+    (error) => {
+      assert.equal(error.fallbackEligible, false);
+      assert.match(error.message, /loopback/);
+      return true;
+    },
+  );
+
+  class OpenWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+      queueMicrotask(() => this.emit('open'));
+    }
+    addEventListener(type, fn) {
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+      this.listeners.get(type).add(fn);
+    }
+    removeEventListener(type, fn) {
+      const set = this.listeners.get(type);
+      if (set) set.delete(fn);
+    }
+    emit(type) {
+      for (const fn of [...(this.listeners.get(type) || [])]) fn({});
+    }
+    close() {}
+  }
+  const connected = await helpers.connectBrowserCdp({
+    fetch: async () => ({
+      json: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:9223/devtools/browser/browser-1' }),
+    }),
+    WebSocketCtor: OpenWebSocket,
+  });
+  assert.equal(connected.wsUrl, 'ws://127.0.0.1:9223/devtools/browser/browser-1');
+  assert.equal(connected.ws.url, connected.wsUrl);
+});
+
+// --- Gemini full-size download contracts ---
+
+function makeRunCliHarness(candidates, options = {}) {
+  const state = { behaviors: [], cancels: [], downloadPath: null, clickCount: 0 };
+  const browserWs = makeCdpSocket((message) => {
+    if (message.method === 'Browser.setDownloadBehavior') {
+      state.behaviors.push(message.params.behavior);
+      if (message.params.behavior === 'allowAndName') {
+        state.downloadPath = message.params.downloadPath;
+      }
+      return {};
+    }
+    if (message.method === 'Browser.cancelDownload') {
+      state.cancels.push(message.params.guid);
+      return {};
+    }
+    return {};
+  });
+  const pageWs = makeCdpSocket((message) => {
+    if (message.method === 'Page.enable') return {};
+    if (message.method === 'Page.getFrameTree') {
+      return { frameTree: { frame: { id: 'main-frame', childFrames: [] } } };
+    }
+    if (message.method !== 'Runtime.evaluate') return {};
+    const expression = String((message.params && message.params.expression) || '');
+    if (expression.includes('__ask_bridge_download_token ||')) {
+      return { result: { value: options.token || 'token-1' } };
+    }
+    if (expression.includes('delete window.__ask_bridge_download_token')) {
+      return { result: { value: true } };
+    }
+    if (message.params && message.params.userGesture === true) {
+      state.clickCount += 1;
+      const clickResult = typeof options.clickResult === 'function'
+        ? options.clickResult({ state })
+        : options.clickResult;
+      if (typeof options.onClick === 'function') {
+        queueMicrotask(() => options.onClick({ browserWs, state }));
+      }
+      return { result: { value: clickResult || { ok: true } } };
+    }
+    const verifyResult = typeof options.verifyResult === 'function'
+      ? options.verifyResult({ state })
+      : options.verifyResult;
+    return { result: { value: verifyResult || { ok: true, candidates } } };
+  });
+  return { pageWs, browserWs, state };
+}
+
+function makeRunCliFetch(origin) {
+  return async () => ({
+    json: async () => [{
+      type: 'page',
+      url: `${origin}/app/full-size-contract`,
+      webSocketDebuggerUrl: 'ws://page-test',
+    }],
+  });
+}
+
+function makeFullSizeCandidate(index = 1, overrides = {}) {
+  const preview = makeSyntheticPng(2752, 1536);
+  return {
+    artifactId: `generated-image-${index}`,
+    src: `data:image/png;base64,${preview.toString('base64')}`,
+    naturalWidth: 2752,
+    naturalHeight: 1536,
+    ...overrides,
+  };
+}
+
+function fullSizeIdentity() {
+  return { turn_id: 'turn-1', conversation_id: 'conversation:full-size' };
+}
+
+function emitDownloadEvent(browserWs, method, params) {
+  browserWs.emitMessage({ method, params });
+}
+
+function beginOwnedDownload(browserWs, guid = 'guid-1', frameId = 'main-frame', url = 'https://abc.usercontent.google.com/download?id=1') {
+  emitDownloadEvent(browserWs, 'Browser.downloadWillBegin', { frameId, guid, url });
+}
+
+function completeOwnedDownload(browserWs, guid = 'guid-1') {
+  emitDownloadEvent(browserWs, 'Browser.downloadProgress', {
+    guid,
+    state: 'completed',
+    receivedBytes: 100,
+    totalBytes: 100,
+  });
+}
+
+function assertFailClosed(error, pattern, exitCode) {
+  assert.ok(error && typeof error.message === 'string');
+  assert.equal(error.fallbackEligible, false, error.message);
+  if (exitCode !== undefined) assert.equal(error.exitCode, exitCode, error.message);
+  assert.match(error.message, pattern);
+  return true;
+}
+
+function makeFakeTimerHarness() {
+  const delays = [];
+  const timers = new Map();
+  let nextId = 1;
+  return {
+    delays,
+    setTimeout(fn, ms) {
+      const timer = { id: nextId, fn, ms };
+      nextId += 1;
+      delays.push(ms);
+      timers.set(timer.id, timer);
+      return timer;
+    },
+    clearTimeout(timer) {
+      if (timer) timers.delete(timer.id);
+    },
+  };
+}
+
+test('full-size download saves a 2752x1536 PNG disguised as .jpeg as .png and reports full_size_download', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-success-'));
+  try {
+    const candidate = makeFullSizeCandidate(1);
+    const expectedBytes = makeSyntheticPng(2752, 1536);
+    const harness = makeFullSizeHarness(candidate, {
+      onClick({ browserWs, state }) {
+        writeFileSync(join(state.downloadPath, 'guid-1'), expectedBytes);
+        beginOwnedDownload(browserWs, 'foreign-guid', 'unrelated-frame');
+        beginOwnedDownload(browserWs, 'guid-1');
+        completeOwnedDownload(browserWs, 'guid-1');
+      },
+    });
+    const output = join(tmpRoot, 'capture.jpeg');
+    const result = await helpers.downloadAndPublishBatchWithMeta(
+      harness.pageWs,
+      { ok: true, candidates: [candidate] },
+      'verify()',
+      output,
+      fullSizeIdentity(),
+      {
+        timeoutMs: 2000,
+        fullSizeTimeoutMs: 1000,
+        verifyTimeoutMs: 500,
+        browserWs: harness.browserWs,
+      },
+    );
+    assert.deepEqual(Array.from(result.files), [join(tmpRoot, 'capture.png')]);
+    assert.equal(result.downloadSource, 'full_size_download');
+    assert.deepEqual(Array.from(result.fallbackReasons), []);
+    assert.deepEqual(readFileSync(join(tmpRoot, 'capture.png')), expectedBytes);
+    assert.equal(statSync(join(tmpRoot, 'capture.png')).mode & 0o777, 0o600);
+    assert.equal(harness.state.behaviors[0], 'allowAndName');
+    assert.equal(harness.state.behaviors.at(-1), 'default');
+    assert.equal(existsSync(harness.state.downloadPath), false);
+    assert.deepEqual(harness.state.cancels, []);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('full-size download fails closed for multiple owned guids, extra files, unsafe URLs, and oversized downloads', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const candidate = makeFullSizeCandidate(1);
+  const identity = fullSizeIdentity();
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-guids-'));
+    try {
+      const harness = makeFullSizeHarness(candidate, {
+        onClick({ browserWs, state }) {
+          writeFileSync(join(state.downloadPath, 'guid-1'), makeSyntheticPng(2752, 1536));
+          writeFileSync(join(state.downloadPath, 'guid-2'), makeSyntheticPng(2752, 1536));
+          beginOwnedDownload(browserWs, 'guid-1');
+          beginOwnedDownload(browserWs, 'guid-2');
+        },
+      });
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'multi-guid.jpeg'),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs },
+        ),
+        (error) => assertFailClosed(error, /multiple owned downloads/),
+      );
+      assert.deepEqual(harness.state.cancels.sort(), ['guid-1', 'guid-2']);
+      assert.equal(harness.state.behaviors.at(-1), 'default');
+      assert.equal(existsSync(join(tmpRoot, 'multi-guid.png')), false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-extra-'));
+    try {
+      const harness = makeFullSizeHarness(candidate, {
+        onClick({ browserWs, state }) {
+          writeFileSync(join(state.downloadPath, 'guid-1'), makeSyntheticPng(2752, 1536));
+          writeFileSync(join(state.downloadPath, 'unexpected.bin'), 'extra');
+          beginOwnedDownload(browserWs, 'guid-1');
+          completeOwnedDownload(browserWs, 'guid-1');
+        },
+      });
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'extra-file.jpeg'),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs },
+        ),
+        (error) => assertFailClosed(error, /unexpected temporary files/),
+      );
+      assert.deepEqual(harness.state.cancels, ['guid-1']);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-evil-url-'));
+    try {
+      const harness = makeFullSizeHarness(candidate, {
+        onClick({ browserWs }) {
+          beginOwnedDownload(browserWs, 'guid-1', 'main-frame', 'https://evil.example.com/download');
+        },
+      });
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'evil-url.jpeg'),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs },
+        ),
+        (error) => assertFailClosed(error, /not allowlisted/),
+      );
+      assert.deepEqual(harness.state.cancels, ['guid-1']);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-oversize-'));
+    try {
+      const harness = makeFullSizeHarness(candidate, {
+        onClick({ browserWs, state }) {
+          writeFileSync(join(state.downloadPath, 'guid-1'), makeSyntheticPng(2752, 1536));
+          beginOwnedDownload(browserWs, 'guid-1');
+          completeOwnedDownload(browserWs, 'guid-1');
+        },
+      });
+      const fsOps = {
+        ...require('node:fs'),
+        lstatSync(target) {
+          if (harness.state.downloadPath && target.startsWith(harness.state.downloadPath)) {
+            return { isSymbolicLink: () => false, isFile: () => true, size: helpers.MAX_IMAGE_BYTES + 1 };
+          }
+          return require('node:fs').lstatSync(target);
+        },
+      };
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'oversize.jpeg'),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs, fsOps },
+        ),
+        (error) => assertFailClosed(error, /exceeded maximum allowed bytes/),
+      );
+      assert.equal(existsSync(join(tmpRoot, 'oversize.png')), false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('full-size download fails closed for a non-loopback browser websocket', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-loopback-'));
+  try {
+    const candidate = makeFullSizeCandidate(1);
+    const ws = makeVerifySocket([candidate]);
+    await assert.rejects(
+      () => helpers.downloadAndPublishBatchWithMeta(
+        ws,
+        { ok: true, candidates: [candidate] },
+        'verify()',
+        join(tmpRoot, 'loopback.jpeg'),
+        fullSizeIdentity(),
+        {
+          timeoutMs: 500,
+          fullSizeTimeoutMs: 300,
+          verifyTimeoutMs: 200,
+          fetch: async () => ({
+            json: async () => ({
+              webSocketDebuggerUrl: 'ws://evil.example.com:9223/devtools/browser/browser-1',
+            }),
+          }),
+          WebSocketCtor: function ForbiddenWebSocket() {
+            throw new Error('non-loopback websocket must never be opened');
+          },
+        },
+      ),
+      (error) => assertFailClosed(error, /loopback/),
+    );
+    assert.equal(existsSync(join(tmpRoot, 'loopback.png')), false);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('full-size download fails closed for symlinks and truncated image trailers without preview fallback', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const candidate = makeFullSizeCandidate(1);
+  const identity = fullSizeIdentity();
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-symlink-'));
+    try {
+      const outside = join(tmpRoot, 'outside.bin');
+      writeFileSync(outside, makeSyntheticPng(2752, 1536));
+      const harness = makeFullSizeHarness(candidate, {
+        onClick({ browserWs, state }) {
+          symlinkSync(outside, join(state.downloadPath, 'guid-1'));
+          beginOwnedDownload(browserWs, 'guid-1');
+          completeOwnedDownload(browserWs, 'guid-1');
+        },
+      });
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'symlink.jpeg'),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs },
+        ),
+        (error) => assertFailClosed(error, /not a regular file/),
+      );
+      assert.equal(existsSync(join(tmpRoot, 'symlink.png')), false);
+      assert.deepEqual(readFileSync(outside), makeSyntheticPng(2752, 1536));
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+
+  for (const label of ['truncated-png', 'missing-eoi-jpeg']) {
+    const tmpRoot = mkdtempSync(join(tmpdir(), `gemini-full-${label}-`));
+    try {
+      const bytes = label === 'truncated-png'
+        ? makeSyntheticPng(2752, 1536, { truncateIend: true })
+        : makeSyntheticJpeg(2752, 1536, { missingEoi: true });
+      const harness = makeFullSizeHarness(candidate, {
+        onClick({ browserWs, state }) {
+          writeFileSync(join(state.downloadPath, 'guid-1'), bytes);
+          beginOwnedDownload(browserWs, 'guid-1');
+          completeOwnedDownload(browserWs, 'guid-1');
+        },
+      });
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, `${label}.jpeg`),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs },
+        ),
+        (error) => assertFailClosed(error, /header\/trailer validation/),
+      );
+      assert.equal(existsSync(join(tmpRoot, `${label}.png`)), false);
+      assert.equal(existsSync(join(tmpRoot, `${label}.jpg`)), false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('full-size download fails closed with exitCode 2 when turn identity changes before click or before preview fallback', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const candidate = makeFullSizeCandidate(1);
+  const identity = fullSizeIdentity();
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-identity-click-'));
+    try {
+      const harness = makeFullSizeHarness(candidate, {
+        clickResult: { ok: false, reason: 'turn_id_mismatch', identityChanged: true },
+      });
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          harness.pageWs,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'identity-click.jpeg'),
+          identity,
+          { timeoutMs: 1500, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, browserWs: harness.browserWs },
+        ),
+        (error) => assertFailClosed(error, /identity changed/, 2),
+      );
+      assert.equal(existsSync(join(tmpRoot, 'identity-click.png')), false);
+      assert.equal(harness.state.behaviors.at(-1), 'default');
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+
+  {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-identity-fallback-'));
+    try {
+      const ws = makeCdpSocket((message) => {
+        if (message.method !== 'Runtime.evaluate') return {};
+        return { result: { value: { ok: false, reason: 'candidates_mismatch' } } };
+      });
+      const fullSizeFn = async () => { throw makeFallbackError('button_not_found'); };
+      await assert.rejects(
+        () => helpers.downloadAndPublishBatchWithMeta(
+          ws,
+          { ok: true, candidates: [candidate] },
+          'verify()',
+          join(tmpRoot, 'identity-fallback.jpeg'),
+          identity,
+          {
+            timeoutMs: 1500,
+            fullSizeTimeoutMs: 500,
+            verifyTimeoutMs: 200,
+            browserWs: {},
+            downloadFullSizeCandidateViaBrowser: fullSizeFn,
+          },
+        ),
+        (error) => assertFailClosed(error, /identity changed/, 2),
+      );
+      assert.equal(existsSync(join(tmpRoot, 'identity-fallback.png')), false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('full-size button_not_found falls back to exactly one verified preview per candidate and dedupes fallback reasons', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-button-missing-'));
+  try {
+    const first = makeFullSizeCandidate(1);
+    const second = makeFullSizeCandidate(2);
+    const candidates = [first, second];
+    const harness = makeFullSizeHarness(first, {
+      verifyResult: { ok: true, candidates },
+      clickResult: { ok: false, reason: 'button_not_found', identityChanged: false },
+    });
+    const outputDir = join(tmpRoot, 'out');
+    const result = await helpers.downloadAndPublishBatchWithMeta(
+      harness.pageWs,
+      { ok: true, candidates },
+      'verify()',
+      outputDir,
+      fullSizeIdentity(),
+      { timeoutMs: 2000, fullSizeTimeoutMs: 500, verifyTimeoutMs: 300, browserWs: harness.browserWs },
+    );
+    assert.equal(result.downloadSource, 'preview_fallback');
+    assert.deepEqual(Array.from(result.fallbackReasons), ['button_not_found']);
+    assert.equal(result.files.length, 2);
+    assert.equal(new Set(result.files).size, 2);
+    assert.ok(result.files.every((file) => file.endsWith('.png')));
+    assert.deepEqual(readdirSync(outputDir).length, 2);
+    for (const reason of result.fallbackReasons) {
+      assert.ok(helpers.FULL_SIZE_FALLBACK_REASONS.has(reason));
+    }
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('any full-size preview fallback marks the whole batch preview_fallback while keeping one file per candidate', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-mixed-'));
+  try {
+    const first = makeFullSizeCandidate(1);
+    const second = makeFullSizeCandidate(2);
+    const candidates = [first, second];
+    let attempt = 0;
+    const harness = makeFullSizeHarness(first, {
+      verifyResult: { ok: true, candidates },
+      clickResult: () => {
+        attempt += 1;
+        return attempt === 1
+          ? { ok: false, reason: 'button_not_found', identityChanged: false }
+          : { ok: true };
+      },
+      onClick({ browserWs, state }) {
+        if (attempt === 1) return;
+        writeFileSync(join(state.downloadPath, 'guid-2'), makeSyntheticPng(2752, 1536));
+        beginOwnedDownload(browserWs, 'guid-2');
+        completeOwnedDownload(browserWs, 'guid-2');
+      },
+    });
+    const outputDir = join(tmpRoot, 'out');
+    const result = await helpers.downloadAndPublishBatchWithMeta(
+      harness.pageWs,
+      { ok: true, candidates },
+      'verify()',
+      outputDir,
+      fullSizeIdentity(),
+      { timeoutMs: 2000, fullSizeTimeoutMs: 500, verifyTimeoutMs: 300, browserWs: harness.browserWs },
+    );
+    assert.equal(result.downloadSource, 'preview_fallback');
+    assert.deepEqual(Array.from(result.fallbackReasons), ['button_not_found']);
+    assert.equal(result.files.length, 2);
+    assert.equal(new Set(result.files).size, 2);
+    assert.deepEqual(readdirSync(outputDir).length, 2);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('click without download event, download timeout, cancellation, missing CDP behavior, and recoverable integrity failure fall back within budget', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const candidate = makeFullSizeCandidate(1);
+
+  const runBatch = async (label, harness, overrides = {}) => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), `gemini-full-${label}-`));
+    try {
+      const startedAt = Date.now();
+      const result = await helpers.downloadAndPublishBatchWithMeta(
+        harness.pageWs,
+        { ok: true, candidates: [candidate] },
+        'verify()',
+        join(tmpRoot, `${label}.jpeg`),
+        fullSizeIdentity(),
+        {
+          timeoutMs: 700,
+          fullSizeTimeoutMs: 250,
+          verifyTimeoutMs: 200,
+          browserWs: harness.browserWs,
+          ...overrides,
+        },
+      );
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 1200, `${label} fallback must complete well below the watchdog budget`);
+      assert.equal(result.downloadSource, 'preview_fallback');
+      assert.equal(result.files.length, 1);
+      assert.ok(existsSync(result.files[0]));
+      return { result, elapsed };
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  };
+
+  {
+    const harness = makeFullSizeHarness(candidate, {});
+    const { result } = await runBatch('click-no-event', harness);
+    assert.deepEqual(Array.from(result.fallbackReasons), ['click_no_download_event']);
+  }
+
+  {
+    const harness = makeFullSizeHarness(candidate, {
+      onClick({ browserWs }) {
+        beginOwnedDownload(browserWs, 'guid-1');
+      },
+    });
+    const { result } = await runBatch('download-timeout', harness);
+    assert.deepEqual(Array.from(result.fallbackReasons), ['download_timeout']);
+  }
+
+  {
+    const harness = makeFullSizeHarness(candidate, {
+      onClick({ browserWs }) {
+        beginOwnedDownload(browserWs, 'guid-1');
+        emitDownloadEvent(browserWs, 'Browser.downloadProgress', {
+          guid: 'guid-1',
+          state: 'canceled',
+          receivedBytes: 1,
+          totalBytes: 100,
+        });
+      },
+    });
+    const { result } = await runBatch('download-canceled', harness);
+    assert.deepEqual(Array.from(result.fallbackReasons), ['download_canceled']);
+  }
+
+  {
+    const harness = makeFullSizeHarness(candidate, {
+      onClick({ browserWs }) {
+        beginOwnedDownload(browserWs, 'guid-1');
+        compileOwnedDownloadCompletion(browserWs, 'guid-1');
+      },
+    });
+    const { result } = await runBatch('integrity-failed', harness, { fullSizeTimeoutMs: 180 });
+    assert.deepEqual(Array.from(result.fallbackReasons), ['full_size_integrity_failed']);
+  }
+
+  {
+    let evalCount = 0;
+    let evalsAtConnectFailure = null;
+    const ws = makeCdpSocket((message) => {
+      if (message.method !== 'Runtime.evaluate') return {};
+      evalCount += 1;
+      return { result: { value: { ok: true, candidates: [candidate] } } };
+    });
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-cdp-unsupported-'));
+    try {
+      const result = await helpers.downloadAndPublishBatchWithMeta(
+        ws,
+        { ok: true, candidates: [candidate] },
+        'verify()',
+        join(tmpRoot, 'cdp-unsupported.jpeg'),
+        fullSizeIdentity(),
+        {
+          timeoutMs: 1000,
+          fullSizeTimeoutMs: 500,
+          verifyTimeoutMs: 200,
+          connectBrowserCdp: async () => {
+            evalsAtConnectFailure = evalCount;
+            throw makeFallbackError('cdp_download_behavior_unsupported');
+          },
+        },
+      );
+      assert.equal(evalsAtConnectFailure, 0);
+      assert.ok(evalCount >= 2, 'fallback must re-verify the turn before preview publishing');
+      assert.equal(result.downloadSource, 'preview_fallback');
+      assert.deepEqual(Array.from(result.fallbackReasons), ['cdp_download_behavior_unsupported']);
+      assert.equal(result.files.length, 1);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+function compileOwnedDownloadCompletion(browserWs, guid) {
+  emitDownloadEvent(browserWs, 'Browser.downloadProgress', {
+    guid,
+    state: 'completed',
+    receivedBytes: 100,
+    totalBytes: 100,
+  });
+}
+
+test('downloadAndPublishBatch keeps its array return while timeout overrides follow the locked formula', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-formula-'));
+  try {
+    assert.equal(helpers.DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS, 20000);
+    const candidate = makeFullSizeCandidate(1);
+    const ws = makeVerifySocket([candidate]);
+
+    const legacyOutput = join(tmpRoot, 'legacy.png');
+    const legacy = await helpers.downloadAndPublishBatch(
+      ws,
+      { ok: true, candidates: [candidate] },
+      'verify()',
+      legacyOutput,
+      { timeoutMs: 1000 },
+    );
+    assert.ok(Array.isArray(legacy));
+    assert.deepEqual(Array.from(legacy), [legacyOutput]);
+    assert.ok(existsSync(legacyOutput));
+
+    const capturedTimeouts = [];
+    const fakeFullSize = async (_ws, _browserWs, _before, _candidate, _identity, options) => {
+      capturedTimeouts.push(options.timeoutMs);
+      return { buffer: makeSyntheticPng(2752, 1536), ext: 'png' };
+    };
+    for (const [perImageTimeoutMs, configuredFullSizeTimeoutMs, expectedTimeoutMs] of [
+      [300, 20000, 200],
+      [300, 50, 50],
+      [2, 20000, 1],
+    ]) {
+      capturedTimeouts.length = 0;
+      const result = await helpers.downloadAndPublishBatchWithMeta(
+        ws,
+        { ok: true, candidates: [candidate] },
+        'verify()',
+        join(tmpRoot, `formula-${perImageTimeoutMs}-${configuredFullSizeTimeoutMs}.png`),
+        fullSizeIdentity(),
+        {
+          timeoutMs: perImageTimeoutMs,
+          fullSizeTimeoutMs: configuredFullSizeTimeoutMs,
+          verifyTimeoutMs: 50,
+          browserWs: {},
+          downloadFullSizeCandidateViaBrowser: fakeFullSize,
+        },
+      );
+      assert.equal(capturedTimeouts[0], expectedTimeoutMs);
+      assert.equal(result.downloadSource, 'full_size_download');
+    }
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('runCli reports full_size_download without fallback_reasons and preserves the output extension contract', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-cli-success-'));
+  try {
+    const candidate = makeFullSizeCandidate(1);
+    const expectedBytes = makeSyntheticPng(2752, 1536);
+    const harness = makeRunCliHarness([candidate], {
+      onClick({ browserWs, state }) {
+        writeFileSync(join(state.downloadPath, 'guid-1'), expectedBytes);
+        beginOwnedDownload(browserWs, 'guid-1');
+        completeOwnedDownload(browserWs, 'guid-1');
+      },
+    });
+    const stdout = [];
+    let watchdogFired = false;
+    const output = join(tmpRoot, 'cli.jpeg');
+    await helpers.runCli({
+      tokenArg: 'token-1',
+      outputArg: output,
+      expectedIdentityJsonArg: JSON.stringify(fullSizeIdentity()),
+      fetch: makeRunCliFetch(helpers.GEMINI_ORIGIN),
+      WebSocketCtor: function FakeWebSocket() { return harness.pageWs; },
+      browserWs: harness.browserWs,
+      timeoutMs: 1000,
+      fullSizeTimeoutMs: 500,
+      verifyTimeoutMs: 200,
+      cleanupTimeoutMs: 40,
+      overallLimitMs: 3000,
+      onWatchdogExit: () => { watchdogFired = true; },
+      writeStdout: (value) => { stdout.push(value); },
+    });
+    assert.equal(watchdogFired, false);
+    assert.equal(stdout.length, 1);
+    const payload = JSON.parse(stdout[0]);
+    assert.deepEqual(Object.keys(payload).sort(), ['count', 'download_source', 'files', 'ok']);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.count, 1);
+    assert.deepEqual(payload.files, [join(tmpRoot, 'cli.png')]);
+    assert.equal(payload.download_source, 'full_size_download');
+    assert.equal(harness.state.behaviors.at(-1), 'default');
+    assert.equal(existsSync(harness.state.downloadPath), false);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('runCli completes a preview fallback inside the watchdog budget and reports fallback_reasons', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-cli-timeout-'));
+  try {
+    const candidate = makeFullSizeCandidate(1);
+    const harness = makeRunCliHarness([candidate], {
+      onClick({ browserWs }) {
+        beginOwnedDownload(browserWs, 'guid-1');
+      },
+    });
+    const stdout = [];
+    let watchdogFired = false;
+    const startedAt = Date.now();
+    await helpers.runCli({
+      tokenArg: 'token-1',
+      outputArg: join(tmpRoot, 'cli-timeout.jpeg'),
+      expectedIdentityJsonArg: JSON.stringify(fullSizeIdentity()),
+      fetch: makeRunCliFetch(helpers.GEMINI_ORIGIN),
+      WebSocketCtor: function FakeWebSocket() { return harness.pageWs; },
+      browserWs: harness.browserWs,
+      timeoutMs: 300,
+      fullSizeTimeoutMs: 150,
+      verifyTimeoutMs: 200,
+      cleanupTimeoutMs: 40,
+      overallLimitMs: 1500,
+      onWatchdogExit: () => { watchdogFired = true; },
+      writeStdout: (value) => { stdout.push(value); },
+    });
+    assert.ok(Date.now() - startedAt < 1400, 'preview fallback must finish before the watchdog');
+    assert.equal(watchdogFired, false);
+    const payload = JSON.parse(stdout[0]);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.count, 1);
+    assert.equal(payload.download_source, 'preview_fallback');
+    assert.deepEqual(payload.fallback_reasons, ['download_timeout']);
+    assert.deepEqual(payload.files, [join(tmpRoot, 'cli-timeout.png')]);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('runCli returns the fail-closed exitCode 2 and publishes nothing when the turn changes before click', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-cli-identity-'));
+  try {
+    const candidate = makeFullSizeCandidate(1);
+    const harness = makeRunCliHarness([candidate], {
+      clickResult: { ok: false, reason: 'turn_id_mismatch', identityChanged: true },
+    });
+    const stdout = [];
+    let failure = null;
+    try {
+      await helpers.runCli({
+        tokenArg: 'token-1',
+        outputArg: join(tmpRoot, 'cli-identity.jpeg'),
+        expectedIdentityJsonArg: JSON.stringify(fullSizeIdentity()),
+        fetch: makeRunCliFetch(helpers.GEMINI_ORIGIN),
+        WebSocketCtor: function FakeWebSocket() { return harness.pageWs; },
+        browserWs: harness.browserWs,
+        timeoutMs: 1000,
+        fullSizeTimeoutMs: 500,
+        verifyTimeoutMs: 200,
+        cleanupTimeoutMs: 40,
+        overallLimitMs: 2000,
+        onWatchdogExit: () => {},
+        writeStdout: (value) => { stdout.push(value); },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, 'runCli must reject on identity change');
+    assert.equal(failure.exitCode, 2);
+    assert.equal(failure.fallbackEligible, false);
+    assert.match(failure.message, /identity changed/);
+    assert.deepEqual(stdout, []);
+    assert.equal(existsSync(join(tmpRoot, 'cli-identity.png')), false);
+    assert.equal(harness.state.behaviors.at(-1), 'default');
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('runCli watchdog uses the locked formula and honors the overallLimitMs override', async () => {
+  const candidate = makeFullSizeCandidate(1);
+  const fakeFullSize = async () => ({ buffer: makeSyntheticPng(2752, 1536), ext: 'png' });
+
+  const runOnce = async (overrides) => {
+    const timers = makeFakeTimerHarness();
+    const helpers = loadGeminiDownloadHelpers({
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+    });
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-watchdog-'));
+    try {
+      const stdout = [];
+      await helpers.runCli({
+        tokenArg: 'token-1',
+        outputArg: join(tmpRoot, 'watchdog.png'),
+        expectedIdentityJsonArg: JSON.stringify(fullSizeIdentity()),
+        fetch: makeRunCliFetch(helpers.GEMINI_ORIGIN),
+        WebSocketCtor: function FakeWebSocket() { return makeVerifySocket([candidate]); },
+        browserWs: {},
+        downloadFullSizeCandidateViaBrowser: fakeFullSize,
+        cleanupTimeoutMs: 40,
+        onWatchdogExit: () => {},
+        writeStdout: (value) => { stdout.push(value); },
+        ...overrides,
+      });
+      assert.equal(JSON.parse(stdout[0]).ok, true);
+      return timers.delays.slice();
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  };
+
+  const formulaDelays = await runOnce({ timeoutMs: 40000, fullSizeTimeoutMs: 20000, verifyTimeoutMs: 500 });
+  assert.ok(formulaDelays.includes(45000), 'initial watchdog must remain 45000ms');
+  assert.ok(formulaDelays.includes(55500), 'candidate-aware watchdog must be 40000 + 500 + 15000');
+
+  const overrideDelays = await runOnce({ timeoutMs: 1000, fullSizeTimeoutMs: 500, verifyTimeoutMs: 200, overallLimitMs: 1234 });
+  assert.ok(overrideDelays.includes(1234), 'overallLimitMs must override the watchdog');
+  assert.equal(overrideDelays.includes(55500), false);
 });

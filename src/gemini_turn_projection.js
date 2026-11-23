@@ -334,6 +334,202 @@ function findGeminiFinalGeneratedImages(latestGroup, minimumImageDimension = 200
     return results;
 }
 
+const GEMINI_FULL_SIZE_LABEL_PATTERN = /(?:\u4e0b(?:\u8f09|\u8f7d)(?:\u539f\u5c3a\u5bf8|\u5b8c\u6574\u5c3a\u5bf8)|\u30d5\u30eb\u30b5\u30a4\u30ba\u3067\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9|\uc6d0\ubcf8\s*\ud06c\uae30\ub85c\s*\ub2e4\uc6b4\ub85c\ub4dc|download\s+(?:full[\s-]*size|original(?:\s+(?:size|image))?))/i;
+const GEMINI_NON_DOWNLOAD_CONTROL_PATTERN = /(?:share|copy|more|feedback|\u5206\u4eab|\u8907\u88fd|\u590d\u5236|\u66f4\u591a|\u56de\u994b|\u56de\u9988)/i;
+
+function geminiElementText(element) {
+    if (!element) return '';
+    const attributes = ['aria-label', 'mattooltip', 'matTooltip', 'title', 'data-tooltip', 'aria-description'];
+    const parts = [];
+    for (const name of attributes) {
+        if (typeof element.getAttribute === 'function') {
+            const value = String(element.getAttribute(name) || '').trim();
+            if (value) parts.push(value);
+        }
+    }
+    const text = String(element.textContent || '').trim();
+    if (text) parts.push(text);
+    return parts.join(' ').trim();
+}
+
+function geminiControlMarker(element) {
+    if (!element) return '';
+    const attrs = ['data-test-id', 'data-testid', 'aria-label', 'mattooltip', 'matTooltip', 'title', 'class', 'id'];
+    const values = [];
+    for (const name of attrs) {
+        if (typeof element.getAttribute === 'function') {
+            const value = String(element.getAttribute(name) || '').trim();
+            if (value) values.push(value);
+        }
+    }
+    if (element.classList && typeof Array.from === 'function') {
+        values.push(Array.from(element.classList).join(' '));
+    }
+    if (typeof element.querySelectorAll === 'function') {
+        for (const icon of Array.from(element.querySelectorAll('mat-icon, [class*="icon"], [data-icon]'))) {
+            values.push(String(icon.textContent || '').trim());
+            if (typeof icon.getAttribute === 'function') {
+                values.push(String(icon.getAttribute('data-icon') || '').trim());
+            }
+        }
+    }
+    values.push(String(element.textContent || '').trim());
+    return values.filter(Boolean).join(' ');
+}
+
+function geminiNodeContains(container, node) {
+    if (!container || !node) return false;
+    if (container === node) return true;
+    if (typeof container.contains === 'function') {
+        try { return container.contains(node); } catch (_) {}
+    }
+    let cursor = node.parentElement || null;
+    let steps = 0;
+    while (cursor && steps < 64) {
+        if (cursor === container) return true;
+        cursor = cursor.parentElement || null;
+        steps += 1;
+    }
+    return false;
+}
+
+function geminiDedupeControls(elements) {
+    const unique = [];
+    for (const element of elements) {
+        if (!element || unique.includes(element)) continue;
+        unique.push(element);
+    }
+    return unique.filter((element) => !unique.some((other) => (
+        other !== element
+        && geminiNodeContains(element, other)
+        && String(element.tagName || '').toLowerCase() !== 'button'
+    )));
+}
+
+function findGeminiFullSizeDownloadButton(latestGroup, candidate, minimumImageDimension = 200) {
+    const nodes = latestGroup && Array.isArray(latestGroup.nodes) ? latestGroup.nodes : [];
+    if (nodes.length === 0 || !candidate || typeof candidate !== 'object') {
+        return { ok: false, reason: 'button_not_found' };
+    }
+    const expectedArtifactId = String(candidate.artifactId || candidate.artifact_id || '').trim();
+    const expectedSrc = String(candidate.src || '').trim();
+    const expectedWidth = Number(candidate.naturalWidth ?? candidate.natural_width ?? 0);
+    const expectedHeight = Number(candidate.naturalHeight ?? candidate.natural_height ?? 0);
+    if (!expectedArtifactId || !expectedSrc || expectedWidth <= 0 || expectedHeight <= 0) {
+        return { ok: false, reason: 'button_not_found' };
+    }
+
+    const containerSelector = [
+        'generated-image img',
+        'single-image img',
+        '[data-test-id*="generated-image"] img',
+        '[data-testid*="generated-image"] img',
+        '[class*="generated-image"] img',
+        '[class*="image-generation"] img',
+    ].join(', ');
+    const matches = [];
+    const seen = new Set();
+    for (const node of nodes) {
+        if (!node || typeof node.querySelectorAll !== 'function') continue;
+        for (const img of Array.from(node.querySelectorAll(containerSelector))) {
+            if (!img || seen.has(img) || isWithinUserQuery(img)) continue;
+            seen.add(img);
+            const src = String(img.currentSrc || img.src || (typeof img.getAttribute === 'function' ? img.getAttribute('src') : '') || '').trim();
+            const naturalWidth = Number(img.naturalWidth || 0);
+            const naturalHeight = Number(img.naturalHeight || 0);
+            if (!img.complete || naturalWidth < minimumImageDimension || naturalHeight < minimumImageDimension) continue;
+            if (src !== expectedSrc || naturalWidth !== expectedWidth || naturalHeight !== expectedHeight) continue;
+            if (resolveGeminiImageArtifactId(img) !== expectedArtifactId) continue;
+            matches.push(img);
+        }
+    }
+    if (matches.length === 0) return { ok: false, reason: 'button_not_found' };
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous_download_button' };
+
+    const targetImg = matches[0];
+    const boundaryNodes = new Set(nodes);
+    if (latestGroup && latestGroup.scope) boundaryNodes.add(latestGroup.scope);
+    const isGeneratedContainer = (element) => {
+        if (!element) return false;
+        const tag = String(element.tagName || '').toLowerCase();
+        if (tag === 'generated-image' || tag === 'single-image') return true;
+        if (typeof element.getAttribute !== 'function') return false;
+        const marker = `${element.getAttribute('data-test-id') || ''} ${element.getAttribute('data-testid') || ''} ${element.getAttribute('class') || ''}`;
+        return /generated-image|image-generation/i.test(marker);
+    };
+    const imagesInside = (element) => {
+        if (!element || typeof element.querySelectorAll !== 'function') return [];
+        return Array.from(element.querySelectorAll('img'));
+    };
+    let cursor = targetImg.parentElement || null;
+    let generatedContainer = null;
+    let multiImageContainer = null;
+    while (cursor && !boundaryNodes.has(cursor)) {
+        const tag = String(cursor.tagName || '').toLowerCase();
+        if (tag === 'model-response') break;
+        if (isGeneratedContainer(cursor)) {
+            const imgs = imagesInside(cursor);
+            if (imgs.length !== 1 || imgs[0] !== targetImg) {
+                multiImageContainer = multiImageContainer || cursor;
+            } else {
+                generatedContainer = cursor;
+            }
+        }
+        cursor = cursor.parentElement || null;
+    }
+    if (!generatedContainer) {
+        return { ok: false, reason: multiImageContainer ? 'ambiguous_download_button' : 'button_not_found' };
+    }
+
+    const scopeQuery = (selector) => (
+        typeof generatedContainer.querySelectorAll === 'function'
+            ? Array.from(generatedContainer.querySelectorAll(selector))
+            : []
+    );
+    const actionable = (element) => Boolean(element)
+        && (['button', 'a'].includes(String(element.tagName || '').toLowerCase())
+            || (typeof element.getAttribute === 'function' && element.getAttribute('role') === 'button')
+            || typeof element.click === 'function');
+    const buttonSelector = [
+        'download-generated-image-button button',
+        'button[data-test-id*="download-generated-image"]',
+        'button[data-testid*="download-generated-image"]',
+        'download-generated-image-button[role="button"]',
+    ].join(', ');
+    const selectorMatches = geminiDedupeControls(scopeQuery(buttonSelector).filter(actionable));
+    if (selectorMatches.length === 1) {
+        return { ok: true, reason: '', button: selectorMatches[0], container: generatedContainer, matchedBy: 'selector' };
+    }
+    if (selectorMatches.length > 1) {
+        return { ok: false, reason: 'ambiguous_download_button' };
+    }
+
+    const controls = geminiDedupeControls(scopeQuery('button, a, [role="button"]').filter(actionable));
+    const labelMatches = controls.filter((element) => {
+        const text = geminiElementText(element);
+        return text && !GEMINI_NON_DOWNLOAD_CONTROL_PATTERN.test(text) && GEMINI_FULL_SIZE_LABEL_PATTERN.test(text);
+    });
+    if (labelMatches.length === 1) {
+        return { ok: true, reason: '', button: labelMatches[0], container: generatedContainer, matchedBy: 'label' };
+    }
+    if (labelMatches.length > 1) {
+        return { ok: false, reason: 'ambiguous_download_button' };
+    }
+
+    const iconMatches = controls.filter((element) => {
+        const marker = geminiControlMarker(element);
+        if (!marker || GEMINI_NON_DOWNLOAD_CONTROL_PATTERN.test(marker)) return false;
+        return /(?:^|[^a-z])(?:download|\u4e0b(?:\u8f09|\u8f7d))(?:[^a-z]|$)/i.test(marker);
+    });
+    if (iconMatches.length === 1) {
+        return { ok: true, reason: '', button: iconMatches[0], container: generatedContainer, matchedBy: 'icon' };
+    }
+    if (iconMatches.length > 1) {
+        return { ok: false, reason: 'ambiguous_download_button' };
+    }
+    return { ok: false, reason: 'button_not_found' };
+}
+
 function geminiElementToMarkdown(element) {
     if (!element) return '';
     let markdown = '';
@@ -444,6 +640,7 @@ if (typeof module !== 'undefined' && module && module.exports) {
         isGeminiGenerating,
         geminiTurnIdentity,
         findGeminiFinalGeneratedImages,
+        findGeminiFullSizeDownloadButton,
         geminiElementToMarkdown,
     };
 }
