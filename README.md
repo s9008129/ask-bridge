@@ -36,7 +36,7 @@
 - **思考動畫**：等待 provider 回覆時，在終端機顯示旋轉 spinner，開始輸出內容後自動清除。
 - **智慧分頁管理**：可重用既有 provider 分頁、聚焦分頁，或開啟新分頁，避免分頁過度增加。
 - **Pipe 與 stdin 支援**：支援透過 standard input 傳入 prompt，例如 `cat report.txt | ask-bridge "summarize this"`。
-- **圖片與文件上傳**：可透過 `--image` 附上圖片（支援 ChatGPT 與 Claude），或透過 `--file` 附上文件（PDF、Word、Excel、純文字、Markdown、JSON 等皆可），一次可指定多個檔案；Gemini 目前支援 `--file`，不支援 `--image` 圖片輸入。
+- **圖片與文件上傳**：可透過 `--image` 附上圖片（支援 ChatGPT、Gemini 與 Claude），或透過 `--file` 附上文件（PDF、Word、Excel、純文字、Markdown、JSON 等皆可），一次可指定多個檔案；支援混合附件（`--file` 搭配 `--image`）。
 - **模型切換**：使用 `--model` 在送出 prompt 前自動切換 provider 模型（如 ChatGPT 的 `GPT-5.4`、`o3`，Gemini 的 `3.5 Flash`、`3.1 Pro`，或 Claude 的 `Sonnet`、`Opus`）。
 - **回應超時**：使用 `--timeout <秒數>` 設定等待回應上限，預設為 `300` 秒。
 - **預設安靜模式與 verbose 模式**：預設只輸出最終回覆；加上 `--verbose` 可顯示背景瀏覽器控制流程。
@@ -233,7 +233,7 @@ ask-bridge capabilities --json
 
 安全附件工作至少需要 `isolated_new_tab_v1` 與 `verified_file_upload_v1`；要求
 生成圖片並下載的整合工具還必須檢查
-`verified_image_response_completion_v1`。不得搶佔使用者前景焦點的自動化工作還必須
+`verified_image_response_completion_v1`；使用 Gemini 安全模式工作流（含 CDP Trusted 圖片／混合附件上傳、正向登入閘、`gemini_mode_menu_v1` 嚴格模式選擇、零未授權跳轉取圖與寫檔後完成收據）時，另需檢查 `verified_gemini_image_workflow_v1`（注意：此能力僅在 Phase 0B 實頁驗收通過後才會由執行期 `capabilities` 正式宣告，候選版於實頁驗收前預設不宣告），且 receipt 的 `provider` 欄位會寫入實際執行的引擎（`chatgpt`／`gemini`／`claude`）。不得搶佔使用者前景焦點的自動化工作還必須
 檢查 `background_isolated_tab_v1`，且 payload 必須是
 `new_page_background=headless`、`foreground=visible`、
 `scope=isolated-new-tab-only`；若 payload 同時宣告
@@ -366,11 +366,12 @@ cat src/main.rs | ask-bridge "這段 Rust code 有記憶體洩漏風險嗎？"
 
 #### 附上圖片
 
-使用 `--image` 附上一或多張本機圖片（可重複指定）。此功能目前支援 ChatGPT 與 Claude；Gemini 圖片輸入尚未支援，搭配 `--provider gemini` 使用會立即回報錯誤。
+使用 `--image` 附上一或多張本機圖片（可重複指定）。支援 ChatGPT、Gemini 與 Claude（Gemini 透過兩階段 target-locked CDP Trusted 上傳，不回退 DataTransfer）。
 
 ```bash
 ask-bridge "請描述這張圖片的內容。" --image screenshot.png
 ask-bridge "比較這兩張圖的差異。" --image v1.png --image v2.png
+ask-bridge --provider gemini "請參考這張風格圖產生新圖。" --image style.png --file spec.md
 ask-bridge --provider claude "請描述這張圖片的內容。" --image screenshot.png
 ```
 
@@ -437,7 +438,7 @@ ask-bridge --provider claude open
 ask-bridge close
 ```
 
-`close` 只會關閉使用 `~/.config/ask-bridge/chrome-profile` 且監聽 debug port `9223` 的 `ask-bridge` Chrome instance；若該 port 被非 `ask-bridge` Chrome 程序占用，會回報錯誤而不會關閉它。
+`close` 只會關閉使用 `~/.config/ask-bridge/chrome-profile` 且監聽 debug port `9223` 的 `ask-bridge` Chrome instance；若該 port 被非 `ask-bridge` Chrome 程序占用，會回報錯誤而不會關閉它。所有使用 Chrome 的命令都會持有跨程序共享鎖 `~/.config/ask-bridge/leases/chrome-instance.flock`（`LOCK_SH`），若另一個同協定的 `ask-bridge` 工作仍在執行中，`close` 會安全略過關閉 Chrome 並正常結束，避免中斷活躍中的工作。
 
 ### 12. 更新 ask-bridge
 

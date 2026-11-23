@@ -37,7 +37,7 @@ Unlike typical API clients, `ask-bridge` operates inside a real Chrome browser w
 - **🌀 TUI Thinking Animation**: Displays a rotating spinner while waiting for the provider to reply, then clears it once output starts.
 - **🧠 Intelligent Tab Management**: Reuses existing provider tabs if open, focuses them, or opens new ones, avoiding tab clutter.
 - **🖥️ Pipe & Stdin Support**: Supports piping prompts via `stdin` (e.g. `cat report.txt | ask-bridge "summarize this"`).
-- **📎 Image & File Attachments**: Attach local images with `--image` (supported on ChatGPT and Claude), or documents (PDF, Word, Excel, plain text, Markdown, JSON, etc.) with `--file`; Gemini currently supports `--file` and rejects `--image`.
+- **📎 Image & File Attachments**: Attach local images with `--image` (supported on ChatGPT, Gemini, and Claude), or documents (PDF, Word, Excel, plain text, Markdown, JSON, etc.) with `--file`, including mixed attachments (`--file` + `--image`). Gemini uses two-phase target-locked CDP trusted upload and records provider-scoped `provider` fields in session receipts; the Phase-0B-unverified candidate keeps `verified_gemini_image_workflow_v1` disabled in `capabilities --json` until live Phase 0B verification passes.
 - **🔀 Model Switching**: Use `--model` to switch the provider model before the prompt is sent, such as ChatGPT `GPT-5.4`, Gemini `3.5 Flash`, or Claude `Sonnet`.
 - **Response Timeout**: Use `--timeout <seconds>` to control how long to wait for a provider response, defaulting to `300` seconds.
 - **🔍 Quiet by Default & Verbose Mode**: Quiet and clean output by default (displaying only the generated response), with an optional `--verbose` flag to display full browser state logs if needed.
@@ -284,11 +284,12 @@ Instead of piping file contents into the prompt, you can upload local files as a
 
 #### Attach images
 
-Use `--image` (repeatable) to attach one or more local images. This currently supports ChatGPT and Claude; Gemini image input is not enabled and exits with an explicit error when used with `--provider gemini`.
+Use `--image` (repeatable) to attach one or more local images. Supported on ChatGPT, Gemini (implementation in place via two-phase target-locked CDP upload with no DataTransfer fallback; `verified_gemini_image_workflow_v1` remains unadvertised until live Phase 0B verification passes), and Claude.
 
 ```bash
 ask-bridge "Describe this image." --image screenshot.png
 ask-bridge "Compare these two images." --image v1.png --image v2.png
+ask-bridge --provider gemini "Generate a visual following this reference." --image style.png --file spec.md
 ask-bridge --provider claude "Describe this image." --image screenshot.png
 ```
 
@@ -352,7 +353,7 @@ To close the Chrome debug profile instance managed by `ask-bridge`:
 ask-bridge close
 ```
 
-`close` only shuts down the `ask-bridge` Chrome instance that uses `~/.config/ask-bridge/chrome-profile` and listens on debug port `9223`. If that port is occupied by a non-`ask-bridge` Chrome process, it reports an error instead of closing it.
+`close` only shuts down the `ask-bridge` Chrome instance that uses `~/.config/ask-bridge/chrome-profile` and listens on debug port `9223`. If that port is occupied by a non-`ask-bridge` Chrome process, it reports an error instead of closing it. All Chrome-using commands hold a shared cross-process lock (`~/.config/ask-bridge/leases/chrome-instance.flock`), so if another `ask-bridge` session is currently active, `close` safely skips shutting down Chrome and exits cleanly without interrupting the active session.
 
 ---
 

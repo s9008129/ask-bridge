@@ -170,7 +170,7 @@ prompt + "\n\n" + stdin
 | `--verbose` | 顯示瀏覽器自動化流程 | 用於診斷 provider UI、登入、上傳、模型切換或等待回覆問題 |
 | `-o`, `--output <FILE>` | 將最終 Markdown 回覆寫入檔案 | 同時仍會在終端機輸出渲染結果；適合保留研究紀錄 |
 | `-i`, `--image-output <IMAGE_PATH>` | 下載 provider 回覆中的生成圖片 | 可指定資料夾或檔案路徑；可搭配一般 prompt、`get` 或 `open <url>` |
-| `--image <IMAGE_FILE>` | 附加圖片檔，可重複指定 | 支援 ChatGPT 與 Claude；搭配 Gemini 會失敗 |
+| `--image <IMAGE_FILE>` | 附加圖片檔，可重複指定 | 支援 ChatGPT、Gemini 與 Claude（Gemini 走兩階段 target-locked CDP Trusted 上傳；Phase 0B 實頁驗收完成後才由執行期宣告 `verified_gemini_image_workflow_v1`） |
 | `--file <FILE>` | 附加文件檔，可重複指定 | 支援 PDF、Word、Excel、PowerPoint、純文字、Markdown、CSV、JSON、程式碼等；ChatGPT、Gemini 與 Claude 都可用 |
 | `--model <MODEL>` | 送出 prompt 前切換模型 | 比對不分大小寫與標點；模型名稱取決於 provider UI 與帳號權限；ChatGPT 思考強度會與頁面公告的推理強度標籤比對（2 到 8 個位置），需要升級的鎖定位置不會被選取 |
 | `-h`, `--help` | 顯示 help | 可用 `ask-bridge --help` 或 `ask-bridge help <COMMAND>` |
@@ -251,15 +251,16 @@ ask-bridge '請比較這兩份文件的差異。' --file old.md --file new.md
 ask-bridge --provider gemini '請摘要這份 PDF。' --file report.pdf
 ```
 
-對圖片使用 `--image`，目前支援 ChatGPT 與 Claude：
+對圖片使用 `--image`，支援 ChatGPT、Gemini 與 Claude：
 
 ```sh
 ask-bridge '請描述這張截圖中的 UI 問題，並列出可能的 CSS 原因。' --image screenshot.png
 ask-bridge '請比較這兩張圖的差異。' --image before.png --image after.png
+ask-bridge --provider gemini '請參考這張風格圖產生簡報頁面。' --image style.png --file spec.md
 ask-bridge --provider claude '請描述這張截圖中的 UI 問題。' --image screenshot.png
 ```
 
-同時附加圖片與文件時，使用 ChatGPT 或 Claude：
+同時附加圖片與文件時，ChatGPT、Gemini 與 Claude 都可使用：
 
 ```sh
 ask-bridge '請對照設計圖與規格文件，列出不一致處。' --image design.png --file spec.md
@@ -324,7 +325,7 @@ ask-bridge '請回覆 ok' --verbose --headless=false
 ask-bridge close
 ```
 
-`close` 只應關閉 ask-bridge 使用的 debug profile 與 debug port instance。若 port 被非 ask-bridge Chrome 程序占用，工具應回報錯誤而不是關閉它。
+`close` 只應關閉 ask-bridge 使用的 debug profile 與 debug port instance。若 port 被非 ask-bridge Chrome 程序占用，工具應回報錯誤而不是關閉它；若仍有其他使用 `chrome-instance.flock` 共享鎖的 `ask-bridge` 工作在執行中，`close` 會安全略過關閉 Chrome 並正常結束，不會中斷活躍工作。
 
 ## 子命令速查
 
@@ -369,7 +370,7 @@ ask-bridge dump --verbose
 ask-bridge screenshot --headless=false
 ```
 
-Gemini 圖片輸入不支援時，改用 ChatGPT 或 Claude，或改以文字描述圖片內容。不要把同一個失敗命令無限制重試。
+Gemini 安全模式要求正向登入閘（`GEMINI_AUTH_NOT_CONFIRMED`）與嚴格模式切換（`GEMINI_MODEL_SELECTION_FAILED`）；失敗時依錯誤訊息確認登入狀態或移除 `--model` 重試，不要把同一個失敗命令無限制重試。
 
 模型切換失敗時，移除 `--model` 或改用 provider 預設模型，不要猜測替代模型名稱。ChatGPT 回報 `CHATGPT_MODEL_SELECTION_FAILED` 代表頁面契約未通過驗證，命令已在附件上傳與送出 prompt 前停止；重試前先以 `--verbose` 診斷，不要用猜測的等級名稱硬試。
 

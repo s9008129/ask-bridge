@@ -31,13 +31,18 @@ const VERIFIED_MODEL_SELECTION_V6_CAPABILITY: &str = "verified_model_selection_v
 const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_submission_outcome_v1";
 const VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY: &str = "verified_text_response_backend_v1";
 const VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY: &str = "verified_logical_turn_image_v1";
+const VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY: &str = "verified_gemini_image_workflow_v1";
+pub(crate) const GEMINI_LIVE_PHASE0B_VERIFIED: bool = false;
 const STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY: &str = "structured_failure_diagnostics_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
 const BACKGROUND_LOGIN_LAUNCH_CAPABILITY: &str = "background_login_launch_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
+const AUTH_FAILURE_STAGE: &str = "auth";
+const GEMINI_AUTH_FAILURE_CODE: &str = "GEMINI_AUTH_NOT_CONFIRMED";
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
+const GEMINI_MODEL_SELECTION_FAILURE_CODE: &str = "GEMINI_MODEL_SELECTION_FAILED";
 const MODEL_SELECTION_FAILURE_STAGE: &str = "model_selection";
 const PROMPT_SUBMISSION_FAILURE_STAGE: &str = "prompt_submission";
 const PROMPT_SUBMISSION_PRECLICK_FAILURE_CODE: &str = "PROMPT_SUBMISSION_PRECLICK_FAILED";
@@ -216,20 +221,33 @@ const TURN_IDENTITY_JS: &str = r#"
                     ? (scope.closest('section[data-turn="assistant"][data-turn-id]') ||
                         scope.closest('[data-turn="assistant"][data-turn-id]') ||
                         scope.closest('[data-turn-key]') ||
+                        scope.closest('[data-response-id]') ||
                         scope)
                     : null;
                 const turnId = (turn
-                    ? (turn.getAttribute('data-turn-id') || turn.getAttribute('data-turn-key'))
+                    ? (turn.getAttribute('data-turn-id') ||
+                        turn.getAttribute('data-turn-key') ||
+                        turn.getAttribute('data-response-id') ||
+                        (turn.tagName && turn.tagName.toLowerCase() === 'model-response'
+                            ? (turn.getAttribute('id') || '')
+                            : ''))
                     : '') ||
-                    (fallback ? (fallback.getAttribute('data-chatgpt-selection-message-id') || '') : '') ||
+                    (fallback ? (fallback.getAttribute('data-chatgpt-selection-message-id') || fallback.getAttribute('data-response-id') || '') : '') ||
                     '';
-                const artifactIds = turn
+                let artifactIds = turn
                     ? Array.from(turn.querySelectorAll('[id^="image-"]'))
                         .map((element) => element.id)
                         .filter(Boolean)
                         .filter((id, index, all) => all.indexOf(id) === index)
                         .sort()
                     : [];
+                if (artifactIds.length === 0 && turn && (turn.tagName && turn.tagName.toLowerCase() === 'model-response' || turn.closest('model-response'))) {
+                    artifactIds = Array.from(turn.querySelectorAll('[data-response-id], generated-image, single-image'))
+                        .map((element) => element.getAttribute('id') || element.getAttribute('data-response-id') || element.tagName.toLowerCase())
+                        .filter(Boolean)
+                        .filter((id, index, all) => all.indexOf(id) === index)
+                        .sort();
+                }
                 return { turnId, artifactIds };
             };
 "#;
@@ -260,9 +278,19 @@ struct LoginSignals {
 }
 
 impl LoginSignals {
-    fn state(self, _provider: Provider) -> LoginState {
+    fn state(self, provider: Provider) -> LoginState {
         if self.auth_path {
             LoginState::LoggedOut
+        } else if provider == Provider::Gemini {
+            if self.account && self.composer && !self.auth_control && self.stable {
+                LoginState::LoggedIn
+            } else if !self.stable {
+                LoginState::Unknown
+            } else if self.auth_control && !self.account {
+                LoginState::LoggedOut
+            } else {
+                LoginState::Unknown
+            }
         } else if self.account {
             LoginState::LoggedIn
         } else if !self.stable {
@@ -276,7 +304,7 @@ impl LoginSignals {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum Provider {
+pub(crate) enum Provider {
     #[value(name = "chatgpt")]
     ChatGpt,
     #[value(name = "gemini")]
@@ -468,37 +496,11 @@ impl Provider {
                 }"#
             }
             Provider::Gemini => {
-                r#"() => {
-                    const isVisible = (el) => {
-                        if (!el) return false;
-                        const style = window.getComputedStyle(el);
-                        const rect = el.getBoundingClientRect();
-                        return style.display !== 'none' &&
-                            style.visibility !== 'hidden' &&
-                            style.opacity !== '0' &&
-                            rect.width > 0 &&
-                            rect.height > 0;
-                    };
-                    const composer = document.querySelector('div[role="textbox"][aria-label*="Gemini"]') ||
-                        document.querySelector('rich-textarea [contenteditable="true"]') ||
-                        document.querySelector('.ql-editor[contenteditable="true"]');
-                    const account = document.querySelector('a[href*="accounts.google.com/SignOutOptions"]') ||
-                        document.querySelector('[aria-label*="Google 帳戶"]') ||
-                        document.querySelector('[aria-label*="Google Account"]');
-                    const signIn = Array.from(document.querySelectorAll('a, button'))
-                        .some((el) => isVisible(el) && /Sign in|登入/.test([
-                                el.getAttribute('aria-label'),
-                                el.textContent
-                            ].filter(Boolean).join(' ')));
-                    const authPath = /\/(auth|login|signin|signup)(\/|$)/i.test(window.location.pathname);
-                    return {
-                        account: isVisible(account),
-                        auth_control: Boolean(signIn),
-                        auth_path: authPath,
-                        composer: Boolean(composer),
-                        stable: true
-                    };
-                }"#
+                concat!(
+                    "async () => {\nconst module = undefined;\n",
+                    include_str!("gemini_login_probe.js"),
+                    "\nreturn await probeGeminiLoginStability();\n}"
+                )
             }
             Provider::Claude => {
                 r#"() => {
@@ -889,6 +891,12 @@ fn provider_lease_path(provider: Provider) -> Result<PathBuf, String> {
     Ok(ask_bridge_state_dir()?.join(format!("{}.lease", provider)))
 }
 
+fn chrome_instance_lock_path() -> Result<PathBuf, String> {
+    Ok(ask_bridge_state_dir()?
+        .join("leases")
+        .join("chrome-instance.flock"))
+}
+
 fn validate_session_id(value: &str) -> Result<String, String> {
     Uuid::parse_str(value)
         .map(|uuid| uuid.to_string())
@@ -922,12 +930,13 @@ enum ModelSelection {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum ModelSelectionContract {
+pub(crate) enum ModelSelectionContract {
     LegacyMenuV1,
     ReasoningSliderV1,
     ReasoningCalibratedControlV2,
     ReasoningOrderedControlV3,
     ReasoningLabeledOrderedControlV4,
+    GeminiModeMenuV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -970,7 +979,7 @@ fn normalize_model_selection_label(value: &str) -> String {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum ModelSelectionEvidence {
+pub(crate) enum ModelSelectionEvidence {
     CheckedStateV1,
     AccessibleLabelV1,
     BoundedOrdinalV1,
@@ -978,23 +987,24 @@ enum ModelSelectionEvidence {
     ClosedSetCalibrationV1,
     OrderedBoundedEffortV1,
     LabeledEffortPositionMapV1,
+    GeminiMenuCheckedV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ModelSelectionOutcome {
-    contract: ModelSelectionContract,
-    evidence: ModelSelectionEvidence,
+pub(crate) struct ModelSelectionOutcome {
+    pub(crate) contract: ModelSelectionContract,
+    pub(crate) evidence: ModelSelectionEvidence,
     /// v5/v6 only: number of positions carrying a directly observed semantic
     /// label within the verified selection window.
-    direct_semantic_count: Option<u8>,
+    pub(crate) direct_semantic_count: Option<u8>,
     /// v6 only: span (`max - min + 1`) of the window that carried the verified
     /// selection. `None` for every legacy contract.
-    position_count: Option<u8>,
+    pub(crate) position_count: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum ExpectedOutputType {
+pub(crate) enum ExpectedOutputType {
     #[default]
     Text,
     Image,
@@ -1002,7 +1012,7 @@ enum ExpectedOutputType {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum ResponseCompletion {
+pub(crate) enum ResponseCompletion {
     #[default]
     Pending,
     Completed,
@@ -1011,7 +1021,7 @@ enum ResponseCompletion {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum ResponseFailureCode {
+pub(crate) enum ResponseFailureCode {
     AssistantCountChanged,
     PageOwnershipChanged,
     PageUrlChanged,
@@ -1022,6 +1032,7 @@ enum ResponseFailureCode {
     PromptSubmissionStateUnknown,
     ImageDownloadEmpty,
     ImageDownloadFailed,
+    TextExtractionFailed,
 }
 
 impl fmt::Display for ResponseFailureCode {
@@ -1037,6 +1048,7 @@ impl fmt::Display for ResponseFailureCode {
             ResponseFailureCode::PromptSubmissionStateUnknown => "prompt_submission_state_unknown",
             ResponseFailureCode::ImageDownloadEmpty => "image_download_empty",
             ResponseFailureCode::ImageDownloadFailed => "image_download_failed",
+            ResponseFailureCode::TextExtractionFailed => "text_extraction_failed",
         })
     }
 }
@@ -1064,6 +1076,18 @@ impl From<String> for ImageDownloadError {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct VerifiedImageCandidate {
+    #[serde(alias = "artifact_id")]
+    artifact_id: String,
+    src: String,
+    #[serde(alias = "natural_width")]
+    natural_width: u64,
+    #[serde(alias = "natural_height")]
+    natural_height: u64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 struct ResponseDomProbe {
     ownership_token_matches: bool,
@@ -1080,6 +1104,8 @@ struct ResponseDomProbe {
     provider_failure_visible: bool,
     provider_failure_signature: String,
     loaded_large_image_count: usize,
+    #[serde(default)]
+    image_candidates: Vec<VerifiedImageCandidate>,
     dom_signature: String,
 }
 
@@ -1191,6 +1217,7 @@ struct VerifiedResponseIdentity {
     user_count: usize,
     assistant_count: usize,
     dom_signature: String,
+    image_candidates: Vec<VerifiedImageCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1205,9 +1232,11 @@ struct ResponseCompletionTracker {
     expected_output_type: ExpectedOutputType,
     initial_user_count: usize,
     initial_assistant_count: usize,
+    require_non_empty_turn_identity: bool,
     response_conversation_id: Option<String>,
     response_turn_id: Option<String>,
     response_artifact_ids: Option<Vec<String>>,
+    response_image_candidates: Option<Vec<VerifiedImageCandidate>>,
     stable_signature: Option<String>,
     stable_probes: usize,
     provider_failure_signature: Option<String>,
@@ -1217,18 +1246,49 @@ struct ResponseCompletionTracker {
 }
 
 impl ResponseCompletionTracker {
+    #[cfg(test)]
     fn new(
         expected_output_type: ExpectedOutputType,
         initial_user_count: usize,
         initial_assistant_count: usize,
     ) -> Self {
+        Self::new_with_identity_policy(
+            expected_output_type,
+            initial_user_count,
+            initial_assistant_count,
+            false,
+        )
+    }
+
+    fn new_for_provider(
+        provider: Provider,
+        expected_output_type: ExpectedOutputType,
+        initial_user_count: usize,
+        initial_assistant_count: usize,
+    ) -> Self {
+        Self::new_with_identity_policy(
+            expected_output_type,
+            initial_user_count,
+            initial_assistant_count,
+            provider == Provider::Gemini,
+        )
+    }
+
+    fn new_with_identity_policy(
+        expected_output_type: ExpectedOutputType,
+        initial_user_count: usize,
+        initial_assistant_count: usize,
+        require_non_empty_turn_identity: bool,
+    ) -> Self {
         Self {
             expected_output_type,
             initial_user_count,
             initial_assistant_count,
+            require_non_empty_turn_identity,
             response_conversation_id: None,
             response_turn_id: None,
             response_artifact_ids: None,
+            response_image_candidates: None,
             stable_signature: None,
             stable_probes: 0,
             provider_failure_signature: None,
@@ -1356,6 +1416,9 @@ impl ResponseCompletionTracker {
             if !probe.artifact_ids.is_empty() {
                 self.response_artifact_ids = Some(probe.artifact_ids.clone());
             }
+            if !probe.image_candidates.is_empty() {
+                self.response_image_candidates = Some(probe.image_candidates.clone());
+            }
             self.was_generating = true;
             self.reset_stability();
             return ResponseTrackerDecision::Pending;
@@ -1372,6 +1435,9 @@ impl ResponseCompletionTracker {
             }
             if !probe.artifact_ids.is_empty() {
                 self.response_artifact_ids = Some(probe.artifact_ids.clone());
+            }
+            if !probe.image_candidates.is_empty() {
+                self.response_image_candidates = Some(probe.image_candidates.clone());
             }
             self.was_generating = false;
         }
@@ -1394,12 +1460,44 @@ impl ResponseCompletionTracker {
                 Some(_) => {}
             }
         }
+        if self.require_non_empty_turn_identity
+            && self.expected_output_type == ExpectedOutputType::Image
+            && !probe.image_candidates.is_empty()
+        {
+            match &self.response_image_candidates {
+                Some(current) if current != &probe.image_candidates => {
+                    return self.finish_unknown(ResponseFailureCode::ResponseIdentityChanged);
+                }
+                None => self.response_image_candidates = Some(probe.image_candidates.clone()),
+                Some(_) => {}
+            }
+        }
+
+        if self.require_non_empty_turn_identity {
+            let has_turn_identity = !self.response_turn_id.as_deref().unwrap_or("").is_empty();
+            let has_conversation_identity = self
+                .response_conversation_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("conversation:"));
+            let has_image_candidates = self.expected_output_type != ExpectedOutputType::Image
+                || self
+                    .response_image_candidates
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty());
+            if !has_turn_identity || !has_conversation_identity || !has_image_candidates {
+                self.reset_stability();
+                return ResponseTrackerDecision::Pending;
+            }
+        }
 
         let artifact_ready = match self.expected_output_type {
             ExpectedOutputType::Text => {
                 probe.content_present && probe.content_text_length >= MINIMUM_TEXT_RESPONSE_BYTES
             }
-            ExpectedOutputType::Image => probe.loaded_large_image_count > 0,
+            ExpectedOutputType::Image => {
+                probe.loaded_large_image_count > 0
+                    && (!self.require_non_empty_turn_identity || !probe.image_candidates.is_empty())
+            }
         };
         if !artifact_ready || probe.dom_signature.is_empty() {
             self.reset_stability();
@@ -1424,6 +1522,7 @@ impl ResponseCompletionTracker {
             user_count: probe.user_count,
             assistant_count: probe.assistant_count,
             dom_signature: probe.dom_signature,
+            image_candidates: self.response_image_candidates.clone().unwrap_or_default(),
         });
         self.terminal = Some(decision.clone());
         decision
@@ -1467,8 +1566,10 @@ fn enforce_download_contract(
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-struct SessionReceipt {
+pub(crate) struct SessionReceipt {
     schema_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     capability: String,
     capabilities: Vec<String>,
     attachment_verification: AttachmentVerification,
@@ -1513,15 +1614,64 @@ impl SessionReceipt {
         )
     }
 
-    fn new_for_output(
+    #[allow(dead_code)]
+    pub(crate) fn new_for_output(
         attachment_count: usize,
         attachment_total_bytes: u64,
         expected_output_type: ExpectedOutputType,
     ) -> Self {
-        Self {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
-            capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
-            capabilities: vec![
+        Self::new_for_provider_with_optional_tag(
+            None,
+            Provider::ChatGpt,
+            attachment_count,
+            attachment_total_bytes,
+            expected_output_type,
+            GEMINI_LIVE_PHASE0B_VERIFIED,
+        )
+    }
+
+    pub(crate) fn new_for_provider(
+        provider: Provider,
+        attachment_count: usize,
+        attachment_total_bytes: u64,
+        expected_output_type: ExpectedOutputType,
+    ) -> Self {
+        Self::new_for_provider_with_gemini_verified(
+            provider,
+            attachment_count,
+            attachment_total_bytes,
+            expected_output_type,
+            GEMINI_LIVE_PHASE0B_VERIFIED,
+        )
+    }
+
+    pub(crate) fn new_for_provider_with_gemini_verified(
+        provider: Provider,
+        attachment_count: usize,
+        attachment_total_bytes: u64,
+        expected_output_type: ExpectedOutputType,
+        gemini_verified: bool,
+    ) -> Self {
+        Self::new_for_provider_with_optional_tag(
+            Some(provider.to_string()),
+            provider,
+            attachment_count,
+            attachment_total_bytes,
+            expected_output_type,
+            gemini_verified,
+        )
+    }
+
+    fn new_for_provider_with_optional_tag(
+        provider_tag: Option<String>,
+        capability_provider: Provider,
+        attachment_count: usize,
+        attachment_total_bytes: u64,
+        expected_output_type: ExpectedOutputType,
+        gemini_verified: bool,
+    ) -> Self {
+        let capabilities = match capability_provider {
+            Provider::ChatGpt => vec![
                 ISOLATED_NEW_TAB_CAPABILITY.to_string(),
                 BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string(),
                 VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
@@ -1537,6 +1687,34 @@ impl SessionReceipt {
                 VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY.to_string(),
                 VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY.to_string(),
             ],
+            Provider::Gemini => {
+                let mut caps = vec![
+                    ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+                    BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string(),
+                    VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
+                    VERIFIED_MIXED_ATTACHMENT_CAPABILITY.to_string(),
+                    VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY.to_string(),
+                    VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY.to_string(),
+                ];
+                if gemini_verified {
+                    caps.push(VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string());
+                }
+                caps
+            }
+            Provider::Claude => vec![
+                ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+                BACKGROUND_ISOLATED_TAB_CAPABILITY.to_string(),
+                VERIFIED_FILE_UPLOAD_CAPABILITY.to_string(),
+                VERIFIED_MIXED_ATTACHMENT_CAPABILITY.to_string(),
+                VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY.to_string(),
+                VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY.to_string(),
+            ],
+        };
+        Self {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            provider: provider_tag,
+            capability: ISOLATED_NEW_TAB_CAPABILITY.to_string(),
+            capabilities,
             attachment_verification: AttachmentVerification::Pending,
             attachment_count,
             attachment_total_bytes,
@@ -1557,7 +1735,7 @@ impl SessionReceipt {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionReceiptEvent {
+pub(crate) enum SessionReceiptEvent {
     AttachmentsVerified,
     AttachmentsFailed,
     PromptIntentRecorded,
@@ -1565,7 +1743,7 @@ enum SessionReceiptEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PromptSubmissionFailureDisposition {
+pub(crate) enum PromptSubmissionFailureDisposition {
     SafeBeforeClick,
     UnknownAfterClick,
 }
@@ -1617,6 +1795,72 @@ struct AttachmentSummary {
 impl AttachmentSummary {
     fn count(&self) -> usize {
         self.file_names.len()
+    }
+}
+
+struct ChromeInstanceLock {
+    file: std::fs::File,
+}
+
+impl Drop for ChromeInstanceLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn open_private_flock_file(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        ensure_private_directory(parent)?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("chrome-instance.flock 路徑不是可信任的 regular file".to_string());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("無法開啟 {}：{}", path.display(), error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("無法設定 chrome-instance.flock 權限：{}", error))?;
+    }
+    Ok(file)
+}
+
+fn acquire_chrome_instance_shared_lock() -> Result<ChromeInstanceLock, String> {
+    let path = chrome_instance_lock_path()?;
+    acquire_chrome_instance_shared_lock_at(&path)
+}
+
+fn acquire_chrome_instance_shared_lock_at(path: &Path) -> Result<ChromeInstanceLock, String> {
+    let file = open_private_flock_file(path)?;
+    file.lock_shared()
+        .map_err(|error| format!("無法取得 chrome-instance 共享鎖：{}", error))?;
+    Ok(ChromeInstanceLock { file })
+}
+
+fn try_acquire_chrome_instance_exclusive_lock() -> Result<Option<ChromeInstanceLock>, String> {
+    let path = chrome_instance_lock_path()?;
+    try_acquire_chrome_instance_exclusive_lock_at(&path)
+}
+
+fn try_acquire_chrome_instance_exclusive_lock_at(
+    path: &Path,
+) -> Result<Option<ChromeInstanceLock>, String> {
+    let file = open_private_flock_file(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ChromeInstanceLock { file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1721,7 +1965,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+pub(crate) fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("無法判定 receipt 目錄：{}", path.display()))?;
@@ -1792,7 +2036,7 @@ fn read_session_receipt(path: &Path) -> Result<SessionReceipt, String> {
     Ok(receipt)
 }
 
-fn write_attachment_probe_receipt(
+pub(crate) fn write_attachment_probe_receipt(
     path: &Path,
     probe: &AttachmentProbeSummary,
 ) -> Result<(), String> {
@@ -1833,7 +2077,7 @@ fn write_session_receipt_preserving_attachment_probe(
     write_private_json(path, &updated)
 }
 
-fn record_model_selection_verified(
+pub(crate) fn record_model_selection_verified(
     path: &Path,
     outcome: ModelSelectionOutcome,
 ) -> Result<(), String> {
@@ -1873,7 +2117,8 @@ fn record_model_selection_verified(
         }
         ModelSelectionContract::LegacyMenuV1
         | ModelSelectionContract::ReasoningSliderV1
-        | ModelSelectionContract::ReasoningCalibratedControlV2 => {
+        | ModelSelectionContract::ReasoningCalibratedControlV2
+        | ModelSelectionContract::GeminiModeMenuV1 => {
             receipt.model_selection_direct_semantic_count = None;
             receipt.model_selection_position_count = None;
         }
@@ -1888,7 +2133,10 @@ fn record_model_selection_verified(
     Ok(())
 }
 
-fn record_model_selection_failed(path: &Path) -> Result<(), String> {
+pub(crate) fn record_model_selection_failed_for_provider(
+    path: &Path,
+    provider: Provider,
+) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     if receipt.prompt_submission != PromptSubmission::NotStarted {
         return Err("prompt 已開始後不得標記模型選擇安全失敗".to_string());
@@ -1899,7 +2147,13 @@ fn record_model_selection_failed(path: &Path) -> Result<(), String> {
     receipt.model_selection_direct_semantic_count = None;
     receipt.model_selection_position_count = None;
     receipt.failure_stage = Some(MODEL_SELECTION_FAILURE_STAGE.to_string());
-    receipt.failure_code = Some(MODEL_SELECTION_FAILURE_CODE.to_string());
+    receipt.failure_code = Some(
+        match provider {
+            Provider::Gemini => GEMINI_MODEL_SELECTION_FAILURE_CODE,
+            Provider::ChatGpt | Provider::Claude => MODEL_SELECTION_FAILURE_CODE,
+        }
+        .to_string(),
+    );
     write_session_receipt_preserving_attachment_probe(path, &receipt)?;
     let persisted = read_session_receipt(path)?;
     if persisted != receipt {
@@ -1908,7 +2162,34 @@ fn record_model_selection_failed(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Result<(), String> {
+#[cfg(test)]
+fn record_model_selection_failed(path: &Path) -> Result<(), String> {
+    record_model_selection_failed_for_provider(path, Provider::ChatGpt)
+}
+
+pub(crate) fn record_auth_failed(path: &Path, failure_code: &str) -> Result<(), String> {
+    let mut receipt = read_session_receipt(path)?;
+    if receipt.prompt_submission != PromptSubmission::NotStarted {
+        return Err("prompt 已開始後不得標記 auth 失敗".to_string());
+    }
+    receipt.failure_stage = Some(AUTH_FAILURE_STAGE.to_string());
+    receipt.failure_code = Some(failure_code.to_string());
+    receipt.attachment_verification = AttachmentVerification::Pending;
+    receipt.prompt_submission = PromptSubmission::NotStarted;
+    receipt.response_completion = ResponseCompletion::Pending;
+    receipt.downloaded_image_count = 0;
+    write_session_receipt_preserving_attachment_probe(path, &receipt)?;
+    let persisted = read_session_receipt(path)?;
+    if persisted != receipt {
+        return Err("auth failed receipt 原子更新後驗證失敗".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn record_session_receipt_event(
+    path: &Path,
+    event: SessionReceiptEvent,
+) -> Result<(), String> {
     let mut receipt = read_session_receipt(path)?;
     match event {
         SessionReceiptEvent::AttachmentsVerified => {
@@ -1952,7 +2233,7 @@ fn record_session_receipt_event(path: &Path, event: SessionReceiptEvent) -> Resu
     Ok(())
 }
 
-fn record_prompt_submission_failure(
+pub(crate) fn record_prompt_submission_failure(
     path: &Path,
     disposition: PromptSubmissionFailureDisposition,
     response_failure_code: Option<ResponseFailureCode>,
@@ -1990,7 +2271,7 @@ fn record_prompt_submission_failure(
     Ok(())
 }
 
-fn record_session_response_outcome(
+pub(crate) fn record_session_response_outcome(
     path: &Path,
     completion: ResponseCompletion,
     downloaded_image_count: usize,
@@ -2032,6 +2313,7 @@ fn record_session_response_outcome(
 }
 
 fn write_session_receipt(
+    provider: Provider,
     session_id: &str,
     attachment_count: usize,
     attachment_total_bytes: u64,
@@ -2048,7 +2330,8 @@ fn write_session_receipt(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("無法檢查 session receipt：{}", error)),
     }
-    let receipt = SessionReceipt::new_for_output(
+    let receipt = SessionReceipt::new_for_provider(
+        provider,
         attachment_count,
         attachment_total_bytes,
         expected_output_type,
@@ -2062,29 +2345,37 @@ fn write_session_receipt(
     Ok(path)
 }
 
-fn capabilities_value() -> Value {
-    serde_json::json!({
+pub(crate) fn capabilities_value() -> Value {
+    capabilities_value_with_gemini_verified(GEMINI_LIVE_PHASE0B_VERIFIED)
+}
+
+pub(crate) fn capabilities_value_with_gemini_verified(gemini_verified: bool) -> Value {
+    let mut advertised = vec![
+        ISOLATED_NEW_TAB_CAPABILITY,
+        BACKGROUND_ISOLATED_TAB_CAPABILITY,
+        BACKGROUND_LAUNCH_ISOLATION_CAPABILITY,
+        BACKGROUND_LOGIN_LAUNCH_CAPABILITY,
+        VERIFIED_FILE_UPLOAD_CAPABILITY,
+        VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
+        VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
+        VERIFIED_MODEL_SELECTION_CAPABILITY,
+        VERIFIED_MODEL_SELECTION_V2_CAPABILITY,
+        VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
+        VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
+        VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
+        VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
+        VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
+        VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY,
+        VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY,
+    ];
+    if gemini_verified {
+        advertised.push(VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY);
+    }
+    advertised.push(STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY);
+    let mut root = serde_json::json!({
         "schema_version": 2,
         "version": env!("CARGO_PKG_VERSION"),
-        "capabilities": [
-            ISOLATED_NEW_TAB_CAPABILITY,
-            BACKGROUND_ISOLATED_TAB_CAPABILITY,
-            BACKGROUND_LAUNCH_ISOLATION_CAPABILITY,
-            BACKGROUND_LOGIN_LAUNCH_CAPABILITY,
-            VERIFIED_FILE_UPLOAD_CAPABILITY,
-            VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
-            VERIFIED_IMAGE_RESPONSE_COMPLETION_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V2_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V3_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V4_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V5_CAPABILITY,
-            VERIFIED_MODEL_SELECTION_V6_CAPABILITY,
-            VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
-            VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY,
-            VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY,
-            STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY
-        ],
+        "capabilities": advertised,
         "isolated_new_tab_v1": {
             "flag": "--new-tab-preserve-existing",
             "session_id_flag": "--session-id",
@@ -2392,7 +2683,26 @@ fn capabilities_value() -> Value {
                 "failure_code"
             ]
         }
-    })
+    });
+    if gemini_verified && let Some(obj) = root.as_object_mut() {
+        obj.insert(
+            VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string(),
+            serde_json::json!({
+                "provider": "gemini",
+                "receipt_provider_field": "provider",
+                "login_gate": "positive_logged_in_required",
+                "upload_mechanism": "two_phase_target_locked_cdp_native",
+                "mixed_attachment_upload": VERIFIED_MIXED_ATTACHMENT_CAPABILITY,
+                "prompt_submission_outcome": VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY,
+                "image_download_contract": "allowlisted_https_or_cdp_cached_zero_untrusted_redirect",
+                "text_completion_gate": "verified_output_flush_before_completed",
+                "model_selection_contract": "gemini_mode_menu_v1",
+                "model_selection_evidence": "gemini_menu_checked_v1",
+                "shared_chrome_close_coordination": "chrome_instance_flock_v1"
+            }),
+        );
+    }
+    root
 }
 
 fn print_capabilities(json_output: bool) -> Result<(), String> {
@@ -2418,6 +2728,9 @@ fn print_capabilities(json_output: bool) -> Result<(), String> {
         println!("  {}", VERIFIED_MODEL_SELECTION_V6_CAPABILITY);
         println!("  {}", VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY);
         println!("  {}", VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY);
+        if GEMINI_LIVE_PHASE0B_VERIFIED {
+            println!("  {}", VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY);
+        }
         println!("  {}", STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY);
         println!("  safe flag: --new-tab-preserve-existing");
     }
@@ -4487,14 +4800,7 @@ fn render_markdown(markdown: &str, use_glow: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_provider_feature_support(provider: Provider, cli: &Cli) -> Result<(), String> {
-    if provider == Provider::Gemini && !cli.images.is_empty() {
-        return Err(
-            "Gemini image attachments are not supported yet. Use --file for Gemini document attachments."
-                .to_string(),
-        );
-    }
-
+fn validate_provider_feature_support(_provider: Provider, _cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
@@ -4948,6 +5254,7 @@ mod tests {
             provider_failure_visible: false,
             provider_failure_signature: String::new(),
             loaded_large_image_count,
+            image_candidates: Vec::new(),
             dom_signature: signature.to_string(),
         }
     }
@@ -7379,6 +7686,91 @@ mod tests {
     }
 
     #[test]
+    fn gemini_document_only_probe_forwards_image_baseline_and_rejects_unexpected_new_images() {
+        let baseline = AttachmentBaseline {
+            image_srcs: vec!["https://example.invalid/baseline.png".to_string()],
+            ..AttachmentBaseline::default()
+        };
+        let script = build_attachment_probe_script_with_baseline(
+            Provider::Gemini,
+            &["report.md".to_string()],
+            &baseline,
+        )
+        .unwrap();
+        let js = format!(
+            r#"
+const makeNode = (text, imgs = []) => ({{
+  textContent: text,
+  innerText: text,
+  getAttribute: () => '',
+  getBoundingClientRect: () => ({{ width: 50, height: 24 }}),
+  matches: () => false,
+  closest: () => null,
+  querySelector: (sel) => (sel === 'img' && imgs.length > 0 ? imgs[0] : null),
+  querySelectorAll: (sel) => (sel === 'img' ? imgs : []),
+  children: [],
+  parentElement: null,
+}});
+const makeRoot = (imgSrcs) => {{
+  const imgs = imgSrcs.map((s) => ({{
+    currentSrc: s,
+    src: s,
+    complete: true,
+    naturalWidth: 100,
+    naturalHeight: 100,
+    getBoundingClientRect: () => ({{ width: 50, height: 50 }}),
+  }}));
+  const docChip = makeNode('report.md');
+  const imgContainers = imgs.map((im) => makeNode('', [im]));
+  return {{
+    querySelectorAll: (sel) => {{
+      if (sel.includes('img')) return imgContainers;
+      if (sel.includes('chip') || sel.includes('attachment')) return [docChip, ...imgContainers];
+      return [];
+    }},
+  }};
+}};
+global.window = {{
+  getComputedStyle: () => ({{ display: 'block', visibility: 'visible', opacity: '1' }}),
+}};
+const runProbe = (imgSrcs) => {{
+  const root = makeRoot(imgSrcs);
+  const composerEl = {{
+    getBoundingClientRect: () => ({{ width: 300, height: 80 }}),
+    closest: () => null,
+    parentElement: root,
+  }};
+  global.document = {{
+    body: {{}},
+    documentElement: {{}},
+    querySelector: (sel) => (sel.includes('rich-textarea') ? composerEl : null),
+  }};
+  return ({script})();
+}};
+const okRes = runProbe(['https://example.invalid/baseline.png']);
+const badRes = runProbe(['https://example.invalid/baseline.png', 'https://example.invalid/unexpected.png']);
+console.log(JSON.stringify({{ okRes, badRes }}));
+"#,
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run node probe test");
+        assert!(
+            output.status.success(),
+            "node probe test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse probe output json");
+        assert_eq!(parsed["okRes"]["complete"], true, "parsed={parsed}");
+        assert_eq!(parsed["okRes"]["unexpected_count"], 0);
+        assert_eq!(parsed["badRes"]["complete"], false);
+        assert!(parsed["badRes"]["unexpected_count"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
     fn native_upload_success_skips_fallback_and_failure_uses_it_once() {
         let calls = std::cell::RefCell::new(Vec::new());
         run_native_then_fallback(
@@ -7553,6 +7945,7 @@ mod tests {
                         image_loaded: true,
                         uploading: true,
                         provider_error: false,
+                        ..Default::default()
                     },
                     &expectations,
                 )
@@ -7569,6 +7962,7 @@ mod tests {
                         image_loaded: true,
                         uploading: false,
                         provider_error: false,
+                        ..Default::default()
                     },
                     &expectations,
                 )
@@ -7581,6 +7975,26 @@ mod tests {
                 .observe(
                     &TypedAttachmentProbe {
                         document_count: 2,
+                        image_count: 1,
+                        image_loaded: true,
+                        uploading: false,
+                        provider_error: false,
+                        ..Default::default()
+                    },
+                    &expectations,
+                )
+                .unwrap()
+        );
+
+        // Missing/unexpected document mismatch must reject even when count == 2.
+        let mut tracker_mismatch = TypedAttachmentTracker::new(&expectations);
+        assert!(
+            !tracker_mismatch
+                .observe(
+                    &TypedAttachmentProbe {
+                        document_count: 2,
+                        missing_documents: 1,
+                        unexpected_documents: 1,
                         image_count: 1,
                         image_loaded: true,
                         uploading: false,
@@ -7602,6 +8016,7 @@ mod tests {
                         image_loaded: false,
                         uploading: false,
                         provider_error: false,
+                        ..Default::default()
                     },
                     &expectations,
                 )
@@ -7617,6 +8032,7 @@ mod tests {
                 image_loaded: true,
                 uploading: false,
                 provider_error: true,
+                ..Default::default()
             },
             &expectations,
         );
@@ -7635,6 +8051,7 @@ mod tests {
             image_loaded: true,
             uploading: false,
             provider_error: false,
+            ..Default::default()
         };
         let summary = AttachmentProbeSummary::new(&expectations, &probe);
         let json = serde_json::to_string(&summary).unwrap();
@@ -7665,6 +8082,7 @@ mod tests {
             image_loaded: true,
             uploading: false,
             provider_error: false,
+            ..Default::default()
         };
         write_attachment_probe_receipt(&path, &AttachmentProbeSummary::new(&expectations, &probe))
             .unwrap();
@@ -8449,17 +8867,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gemini_image_attachments() {
+    fn allows_gemini_image_and_file_attachments() {
         let cli = Cli::try_parse_from([
             "ask-bridge",
             "--provider",
             "gemini",
             "--image",
             "token.png",
+            "--file",
+            "token.txt",
             "read",
         ])
         .unwrap();
-        assert!(validate_provider_feature_support(Provider::Gemini, &cli).is_err());
+        assert!(validate_provider_feature_support(Provider::Gemini, &cli).is_ok());
     }
 
     #[test]
@@ -8969,6 +9389,435 @@ mod tests {
 
         assert_eq!(owner, None);
     }
+
+    #[test]
+    fn gemini_positive_login_gate_and_auth_failure_receipt() {
+        let missing_account = LoginSignals {
+            account: false,
+            auth_control: false,
+            auth_path: false,
+            composer: true,
+            stable: true,
+        };
+        assert_eq!(missing_account.state(Provider::Gemini), LoginState::Unknown);
+
+        let missing_composer = LoginSignals {
+            account: true,
+            auth_control: false,
+            auth_path: false,
+            composer: false,
+            stable: true,
+        };
+        assert_eq!(
+            missing_composer.state(Provider::Gemini),
+            LoginState::Unknown
+        );
+
+        let unstable = LoginSignals {
+            account: true,
+            auth_control: false,
+            auth_path: false,
+            composer: true,
+            stable: false,
+        };
+        assert_eq!(unstable.state(Provider::Gemini), LoginState::Unknown);
+
+        let positive = LoginSignals {
+            account: true,
+            auth_control: false,
+            auth_path: false,
+            composer: true,
+            stable: true,
+        };
+        assert_eq!(positive.state(Provider::Gemini), LoginState::LoggedIn);
+
+        let root = make_test_dir("gemini_auth_failed_receipt");
+        let path = root.join("receipt.json");
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_provider(Provider::Gemini, 1, 128, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        record_auth_failed(&path, GEMINI_AUTH_FAILURE_CODE).unwrap();
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.provider.as_deref(), Some("gemini"));
+        assert_eq!(receipt.failure_stage.as_deref(), Some("auth"));
+        assert_eq!(
+            receipt.failure_code.as_deref(),
+            Some(GEMINI_AUTH_FAILURE_CODE)
+        );
+        assert_eq!(
+            receipt.attachment_verification,
+            AttachmentVerification::Pending
+        );
+        assert_eq!(receipt.prompt_submission, PromptSubmission::NotStarted);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Pending);
+        assert_eq!(receipt.downloaded_image_count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gemini_upload_and_download_contracts_forbid_legacy_fallbacks() {
+        assert_eq!(
+            document_upload_policy(Provider::Gemini),
+            DocumentUploadPolicy::NativeOnly
+        );
+        assert_eq!(
+            document_upload_policy(Provider::Claude),
+            DocumentUploadPolicy::NativeThenDataTransferFallback
+        );
+        let upload_src = shipped_function_source("upload_attachments_to_provider");
+        assert!(
+            !upload_src.contains("Provider::Gemini => {\n                run_native_then_fallback")
+        );
+        let download_src = shipped_function_source("download_images_from_latest_message");
+        assert!(download_src.contains("if provider == Provider::Gemini"));
+        assert!(download_src.contains("download_gemini_images"));
+        let gemini_dl_js = include_str!("gemini_download.js");
+        assert!(!gemini_dl_js.contains("toDataURL"));
+        assert!(gemini_dl_js.contains("[301, 302, 303, 307, 308]"));
+        assert!(gemini_dl_js.contains("isPrivateOrLoopbackIp"));
+    }
+
+    #[test]
+    fn gemini_mode_menu_selection_and_receipt_contracts() {
+        const {
+            assert!(!GEMINI_LIVE_PHASE0B_VERIFIED);
+        }
+        let capabilities = capabilities_value();
+        let advertised = capabilities["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(!advertised.contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY));
+        assert!(
+            capabilities
+                .get("verified_gemini_image_workflow_v1")
+                .is_none()
+        );
+
+        let verified_caps = capabilities_value_with_gemini_verified(true);
+        let verified_advertised = verified_caps["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(verified_advertised.contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY));
+        assert_eq!(
+            verified_caps["verified_gemini_image_workflow_v1"]["model_selection_contract"].as_str(),
+            Some("gemini_mode_menu_v1")
+        );
+        assert_eq!(
+            verified_caps["verified_gemini_image_workflow_v1"]["model_selection_evidence"].as_str(),
+            Some("gemini_menu_checked_v1")
+        );
+
+        let switch_src = shipped_function_source("switch_model");
+        let gemini_selector_js = include_str!("gemini_model_selector.js");
+        assert!(switch_src.contains("gemini_model_selector.js"));
+        assert!(gemini_selector_js.contains("matches.length > 1"));
+        assert!(gemini_selector_js.contains("isGeminiModeItemLockedOrDisabled"));
+        assert!(gemini_selector_js.contains("success:gemini_mode_menu_v1"));
+        assert!(!gemini_selector_js.contains("flashlite"));
+
+        let root = make_test_dir("gemini_model_receipt");
+        let ok_path = root.join("ok.json");
+        write_private_json(
+            &ok_path,
+            &SessionReceipt::new_for_provider(Provider::Gemini, 1, 64, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        record_model_selection_verified(
+            &ok_path,
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::GeminiModeMenuV1,
+                evidence: ModelSelectionEvidence::GeminiMenuCheckedV1,
+                direct_semantic_count: None,
+                position_count: None,
+            },
+        )
+        .unwrap();
+        let ok_receipt = read_session_receipt(&ok_path).unwrap();
+        assert_eq!(ok_receipt.model_selection, ModelSelection::Verified);
+        assert_eq!(
+            ok_receipt.model_selection_contract,
+            Some(ModelSelectionContract::GeminiModeMenuV1)
+        );
+        assert_eq!(
+            ok_receipt.model_selection_evidence,
+            Some(ModelSelectionEvidence::GeminiMenuCheckedV1)
+        );
+        assert_eq!(ok_receipt.model_selection_direct_semantic_count, None);
+        assert_eq!(ok_receipt.model_selection_position_count, None);
+
+        let fail_path = root.join("fail.json");
+        write_private_json(
+            &fail_path,
+            &SessionReceipt::new_for_provider(Provider::Gemini, 1, 64, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        record_model_selection_failed_for_provider(&fail_path, Provider::Gemini).unwrap();
+        let fail_receipt = read_session_receipt(&fail_path).unwrap();
+        assert_eq!(fail_receipt.model_selection, ModelSelection::Failed);
+        assert_eq!(
+            fail_receipt.failure_stage.as_deref(),
+            Some("model_selection")
+        );
+        assert_eq!(
+            fail_receipt.failure_code.as_deref(),
+            Some(GEMINI_MODEL_SELECTION_FAILURE_CODE)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_receipt_scopes_capabilities_and_preserves_claude_provider() {
+        let claude =
+            SessionReceipt::new_for_provider(Provider::Claude, 0, 0, ExpectedOutputType::Text);
+        assert_eq!(claude.provider.as_deref(), Some("claude"));
+        assert!(
+            !claude
+                .capabilities
+                .contains(&VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY.to_string())
+        );
+        assert!(
+            !claude
+                .capabilities
+                .contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string())
+        );
+
+        let gemini_unverified =
+            SessionReceipt::new_for_provider(Provider::Gemini, 2, 256, ExpectedOutputType::Image);
+        assert_eq!(gemini_unverified.provider.as_deref(), Some("gemini"));
+        assert!(
+            !gemini_unverified
+                .capabilities
+                .contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string())
+        );
+
+        let gemini_verified = SessionReceipt::new_for_provider_with_gemini_verified(
+            Provider::Gemini,
+            2,
+            256,
+            ExpectedOutputType::Image,
+            true,
+        );
+        assert!(
+            gemini_verified
+                .capabilities
+                .contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string())
+        );
+        assert!(
+            !gemini_verified
+                .capabilities
+                .contains(&VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY.to_string())
+        );
+        assert!(
+            !gemini_verified
+                .capabilities
+                .contains(&VERIFIED_MODEL_SELECTION_V5_CAPABILITY.to_string())
+        );
+        assert!(
+            !gemini_verified
+                .capabilities
+                .contains(&BACKGROUND_LAUNCH_ISOLATION_CAPABILITY.to_string())
+        );
+        assert!(
+            !gemini_verified
+                .capabilities
+                .contains(&BACKGROUND_LOGIN_LAUNCH_CAPABILITY.to_string())
+        );
+
+        let chatgpt =
+            SessionReceipt::new_for_provider(Provider::ChatGpt, 1, 128, ExpectedOutputType::Text);
+        assert_eq!(chatgpt.provider.as_deref(), Some("chatgpt"));
+        assert!(
+            chatgpt
+                .capabilities
+                .contains(&VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY.to_string())
+        );
+    }
+
+    #[test]
+    fn gemini_download_fails_closed_without_verified_identity_and_text_script_is_clipboard_free() {
+        let missing_identity = download_gemini_images("missing-config.json", None, None, false);
+        assert!(missing_identity.is_err());
+
+        let baseline = ResponseBaseline {
+            initial_user_count: 1,
+            initial_assistant_count: 1,
+            ownership_token: "tok-123".to_string(),
+        };
+        let identity = VerifiedResponseIdentity {
+            conversation_id: "conversation:conv-1".to_string(),
+            turn_id: "resp-1".to_string(),
+            artifact_ids: vec![],
+            user_count: 2,
+            assistant_count: 2,
+            dom_signature: "100:abc".to_string(),
+            image_candidates: vec![],
+        };
+        let empty_candidates_download = download_gemini_images(
+            "missing-config.json",
+            Some("/tmp/unused"),
+            Some((&baseline, &identity)),
+            false,
+        );
+        assert!(matches!(
+            empty_candidates_download,
+            Err(ImageDownloadError::ResponseIdentityChanged)
+        ));
+        let md_script = build_verified_gemini_markdown_script(&baseline, &identity).unwrap();
+        assert!(md_script.contains("geminiElementToMarkdown"));
+        assert!(md_script.contains("domSignature"));
+        assert!(md_script.contains("verifySnapshot"));
+
+        let ask_src = shipped_function_source("run_cli");
+        assert!(ask_src.contains("extract_verified_gemini_markdown"));
+    }
+
+    #[test]
+    fn gemini_response_completion_requires_non_empty_turn_identity_while_chatgpt_preserves_legacy()
+    {
+        let mut gemini = ResponseCompletionTracker::new_for_provider(
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        let mut empty_identity = response_probe(1, false, 1, "gemini-img-sig");
+        empty_identity.url = "https://gemini.google.com/app/abc123".to_string();
+        empty_identity.conversation_id = "conversation:abc123".to_string();
+        empty_identity.turn_id = String::new();
+        empty_identity.artifact_ids = vec![];
+        for _ in 0..4 {
+            assert_eq!(
+                gemini.observe(empty_identity.clone()),
+                ResponseTrackerDecision::Pending
+            );
+        }
+
+        let mut with_identity = empty_identity.clone();
+        with_identity.turn_id = "resp-1".to_string();
+        with_identity.image_candidates = vec![VerifiedImageCandidate {
+            artifact_id: "img-artifact-1".to_string(),
+            src: "https://lh3.googleusercontent.com/generated.png".to_string(),
+            natural_width: 1024,
+            natural_height: 1024,
+        }];
+        assert_eq!(
+            gemini.observe(with_identity.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            gemini.observe(with_identity.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        let completed = gemini.observe(with_identity);
+        assert!(matches!(completed, ResponseTrackerDecision::Completed(_)));
+        if let ResponseTrackerDecision::Completed(id) = completed {
+            assert_eq!(id.image_candidates.len(), 1);
+            assert_eq!(id.image_candidates[0].artifact_id, "img-artifact-1");
+        }
+
+        // Changing candidate image across stable ticks fails closed as ResponseIdentityChanged.
+        let mut drift_tracker = ResponseCompletionTracker::new_for_provider(
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        let mut tick1 = response_probe(1, false, 1, "gemini-img-sig");
+        tick1.url = "https://gemini.google.com/app/abc123".to_string();
+        tick1.conversation_id = "conversation:abc123".to_string();
+        tick1.turn_id = "resp-1".to_string();
+        tick1.image_candidates = vec![VerifiedImageCandidate {
+            artifact_id: "img-1".to_string(),
+            src: "https://lh3.googleusercontent.com/first.png".to_string(),
+            natural_width: 1024,
+            natural_height: 1024,
+        }];
+        assert_eq!(
+            drift_tracker.observe(tick1.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        tick1.image_candidates[0].src = "https://lh3.googleusercontent.com/second.png".to_string();
+        assert_eq!(
+            drift_tracker.observe(tick1),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ResponseIdentityChanged)
+        );
+
+        let mut chatgpt = ResponseCompletionTracker::new_for_provider(
+            Provider::ChatGpt,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        let mut chatgpt_empty_id = response_probe(1, false, 1, "cgpt-img-sig");
+        chatgpt_empty_id.turn_id = String::new();
+        chatgpt_empty_id.artifact_ids = vec![];
+        assert_eq!(
+            chatgpt.observe(chatgpt_empty_id.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            chatgpt.observe(chatgpt_empty_id.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            chatgpt.observe(chatgpt_empty_id),
+            ResponseTrackerDecision::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn atomic_text_output_rejects_empty_and_persists_non_empty() {
+        let root = make_test_dir("atomic_text_out");
+        let out_path = root.join("nested").join("result.md");
+        assert!(atomic_write_text_output(&out_path, "   \n").is_err());
+        assert!(!out_path.exists());
+
+        atomic_write_text_output(&out_path, "# Hello Gemini\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&out_path).unwrap(),
+            "# Hello Gemini\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chrome_instance_flock_blocks_close_when_shared_holder_active() {
+        let root = make_test_dir("chrome_instance_flock");
+        let lock_path = root.join("leases").join("chrome-instance.flock");
+        let shared = acquire_chrome_instance_shared_lock_at(&lock_path).unwrap();
+        let second_shared = acquire_chrome_instance_shared_lock_at(&lock_path).unwrap();
+        assert!(
+            try_acquire_chrome_instance_exclusive_lock_at(&lock_path)
+                .unwrap()
+                .is_none()
+        );
+        drop(shared);
+        assert!(
+            try_acquire_chrome_instance_exclusive_lock_at(&lock_path)
+                .unwrap()
+                .is_none()
+        );
+        drop(second_shared);
+        let exclusive = try_acquire_chrome_instance_exclusive_lock_at(&lock_path)
+            .unwrap()
+            .expect("exclusive lock should succeed once all shared holders drop");
+        drop(exclusive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn read_clipboard() -> Result<String, String> {
@@ -9407,6 +10256,140 @@ fn scrape_latest_markdown_from_dom(
     Ok(content)
 }
 
+fn download_gemini_images(
+    config_path: &str,
+    image_output: Option<&str>,
+    verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
+    verbose: bool,
+) -> Result<usize, ImageDownloadError> {
+    let Some((baseline, identity)) = verified_response else {
+        return Err(ImageDownloadError::DownloadFailed(
+            "Gemini image download requires a verified completed turn identity".to_string(),
+        ));
+    };
+    if identity.turn_id.trim().is_empty()
+        || identity.conversation_id.trim().is_empty()
+        || identity.image_candidates.is_empty()
+    {
+        return Err(ImageDownloadError::ResponseIdentityChanged);
+    }
+
+    let token = Uuid::new_v4().to_string();
+    let token_json = serde_json::to_string(&token)
+        .map_err(|_| ImageDownloadError::DownloadFailed("Download token failed".to_string()))?;
+    let marker = format!(
+        "() => {{ window.__ask_bridge_download_token = {}; return true; }}",
+        token_json
+    );
+    call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": marker }),
+    )
+    .map_err(ImageDownloadError::DownloadFailed)?;
+
+    let expected_identity = serde_json::json!({
+        "ownership_token": baseline.ownership_token,
+        "conversation_id": identity.conversation_id,
+        "turn_id": identity.turn_id,
+        "artifact_ids": identity.artifact_ids,
+        "user_count": identity.user_count,
+        "assistant_count": identity.assistant_count,
+        "image_candidates": identity.image_candidates,
+    });
+    let expected_identity_json = serde_json::to_string(&expected_identity).map_err(|_| {
+        ImageDownloadError::DownloadFailed(
+            "Failed to serialize verified response identity".to_string(),
+        )
+    })?;
+    let projection_raw_json = serde_json::to_string(include_str!("gemini_turn_projection.js"))
+        .map_err(|_| {
+            ImageDownloadError::DownloadFailed(
+                "Failed to serialize Gemini turn projection helper".to_string(),
+            )
+        })?;
+    let script = format!(
+        "const __GEMINI_MIN_IMAGE_DIMENSION__ = {};\nconst __GEMINI_TURN_PROJECTION_RAW__ = {};\n{}",
+        GENERATED_IMAGE_MIN_DIMENSION,
+        projection_raw_json,
+        include_str!("gemini_download.js")
+    );
+
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(&token)
+        .arg(image_output.unwrap_or(""))
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| {
+            ImageDownloadError::DownloadFailed(
+                "Gemini safe image downloader unavailable".to_string(),
+            )
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(expected_identity_json.as_bytes())
+            .map_err(|_| {
+                ImageDownloadError::DownloadFailed(
+                    "Failed to write verified response identity to downloader stdin".to_string(),
+                )
+            })?;
+    }
+    let output = child.wait_with_output().map_err(|_| {
+        ImageDownloadError::DownloadFailed(
+            "Gemini safe image downloader failed waiting for output".to_string(),
+        )
+    })?;
+
+    if output.status.code() == Some(2) {
+        return Err(ImageDownloadError::ResponseIdentityChanged);
+    }
+    if !output.status.success() {
+        if verbose {
+            eprintln!(
+                "Gemini image download diagnostic: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Err(ImageDownloadError::DownloadFailed(
+            "Gemini safe image download failed".to_string(),
+        ));
+    }
+
+    let parsed: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        ImageDownloadError::DownloadFailed(
+            "Gemini image downloader returned invalid JSON".to_string(),
+        )
+    })?;
+    if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
+        if parsed.get("error").and_then(Value::as_str) == Some("response_identity_changed") {
+            return Err(ImageDownloadError::ResponseIdentityChanged);
+        }
+        return Err(ImageDownloadError::DownloadFailed(
+            "Gemini safe image download failed".to_string(),
+        ));
+    }
+    let files = parsed
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ImageDownloadError::DownloadFailed(
+                "Gemini image downloader missing files array".to_string(),
+            )
+        })?;
+    for file in files {
+        if let Some(path) = file.as_str() {
+            println!("Downloaded and saved generated image to: {}", path);
+        }
+    }
+    Ok(files.len())
+}
+
 fn download_images_from_latest_message(
     config_path: &str,
     provider: Provider,
@@ -9414,6 +10397,9 @@ fn download_images_from_latest_message(
     verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
     verbose: bool,
 ) -> Result<usize, ImageDownloadError> {
+    if provider == Provider::Gemini {
+        return download_gemini_images(config_path, image_output, verified_response, verbose);
+    }
     if verbose {
         println!("Checking for generated images in the latest assistant response...");
     }
@@ -9806,13 +10792,13 @@ struct AttachmentProbe {
 /// evidence (preview count delta relative to a baseline + non-zero natural
 /// dimensions).
 #[derive(Clone, Debug)]
-struct AttachmentExpectations {
+pub(crate) struct AttachmentExpectations {
     document_names: Vec<String>,
     image_count: usize,
 }
 
 impl AttachmentExpectations {
-    fn new(file_paths: &[String], image_paths: &[String]) -> Result<Self, String> {
+    pub(crate) fn new(file_paths: &[String], image_paths: &[String]) -> Result<Self, String> {
         let mut document_names = Vec::with_capacity(file_paths.len());
         for path in file_paths {
             let name = Path::new(path)
@@ -9830,19 +10816,23 @@ impl AttachmentExpectations {
 }
 
 /// Typed DOM probe result for mixed attachment verification.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-struct TypedAttachmentProbe {
-    document_count: usize,
-    image_count: usize,
-    image_loaded: bool,
-    uploading: bool,
-    provider_error: bool,
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct TypedAttachmentProbe {
+    pub(crate) document_count: usize,
+    #[serde(default)]
+    pub(crate) missing_documents: usize,
+    #[serde(default)]
+    pub(crate) unexpected_documents: usize,
+    pub(crate) image_count: usize,
+    pub(crate) image_loaded: bool,
+    pub(crate) uploading: bool,
+    pub(crate) provider_error: bool,
 }
 
 /// Sanitized receipt diagnostics for a typed attachment probe.  Contains only
 /// count/enum-safe fields — no filenames, paths, DOM text or prompts.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-struct AttachmentProbeSummary {
+pub(crate) struct AttachmentProbeSummary {
     mode: &'static str,
     failure_stage: Option<String>,
     failure_reason: Option<String>,
@@ -9857,7 +10847,7 @@ struct AttachmentProbeSummary {
 }
 
 impl AttachmentProbeSummary {
-    fn new(expectations: &AttachmentExpectations, probe: &TypedAttachmentProbe) -> Self {
+    pub(crate) fn new(expectations: &AttachmentExpectations, probe: &TypedAttachmentProbe) -> Self {
         Self {
             mode: "typed_mixed_v1",
             failure_stage: None,
@@ -9866,13 +10856,17 @@ impl AttachmentProbeSummary {
             observed_documents: probe.document_count,
             expected_images: expectations.image_count,
             observed_images: probe.image_count,
-            missing_documents: expectations
-                .document_names
-                .len()
-                .saturating_sub(probe.document_count),
-            unexpected_documents: probe
-                .document_count
-                .saturating_sub(expectations.document_names.len()),
+            missing_documents: probe.missing_documents.max(
+                expectations
+                    .document_names
+                    .len()
+                    .saturating_sub(probe.document_count),
+            ),
+            unexpected_documents: probe.unexpected_documents.max(
+                probe
+                    .document_count
+                    .saturating_sub(expectations.document_names.len()),
+            ),
             uploading: probe.uploading,
             provider_error: probe.provider_error,
         }
@@ -9912,8 +10906,11 @@ impl TypedAttachmentTracker {
             self.stable_probes = 0;
             return Ok(false);
         }
-        let docs_ok = probe.document_count == self.expected_documents;
-        let images_ok = probe.image_count == self.expected_images && probe.image_loaded;
+        let docs_ok = probe.document_count == self.expected_documents
+            && probe.missing_documents == 0
+            && probe.unexpected_documents == 0;
+        let images_ok = probe.image_count == self.expected_images
+            && (self.expected_images == 0 || probe.image_loaded);
         if docs_ok && images_ok {
             self.stable_probes += 1;
             return Ok(self.stable_probes >= ATTACHMENT_REQUIRED_STABLE_PROBES);
@@ -9957,19 +10954,24 @@ impl AttachmentVerificationTracker {
     }
 }
 
-fn build_attachment_probe_script(
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct AttachmentBaseline {
+    document_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    unmatched_doc_count: usize,
+    image_count: usize,
+    #[serde(default)]
+    image_srcs: Vec<String>,
+}
+
+fn build_attachment_baseline_script(
     provider: Provider,
-    expected_file_names: &[String],
+    expected_document_names: &[String],
 ) -> Result<String, String> {
-    let expected_names = serde_json::to_string(expected_file_names)
-        .map_err(|_| "無法建立附件驗證 probe".to_string())?;
-    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
-        "[class*=\"group/composer-attachment\"]"
-    } else {
-        "[class*=\"attachment\"]"
-    })
-    .map_err(|_| "無法建立附件 class probe".to_string())?;
-    let script = r#"() => {
+    let expected_names = serde_json::to_string(expected_document_names)
+        .map_err(|_| "無法建立附件基線 probe".to_string())?;
+    if provider == Provider::Gemini {
+        return Ok(r#"() => {
         const expectedNames = __EXPECTED_NAMES__;
         const composerSelectors = __COMPOSER_SELECTORS__;
         const isVisible = (el) => {
@@ -9982,8 +10984,189 @@ fn build_attachment_probe_script(
                 rect.width > 0 &&
                 rect.height > 0;
         };
-        const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+        const module = undefined;
+__GEMINI_ATTACHMENT_PROJECTION_JS__
+        const owned = resolveGeminiComposerRoot(document, composerSelectors, isVisible);
+        if (!owned) {
+            return { document_counts: {}, unmatched_doc_count: 0, image_count: 0, image_srcs: [] };
+        }
+        const proj = projectGeminiAttachments(owned.root, expectedNames, {}, isVisible);
+        return {
+            document_counts: proj.documentCounts,
+            unmatched_doc_count: proj.unmatchedDocCount,
+            image_count: proj.imageSrcs.length,
+            image_srcs: proj.imageSrcs,
+        };
+    }"#
+        .replace("__EXPECTED_NAMES__", &expected_names)
+        .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
+        .replace(
+            "__GEMINI_ATTACHMENT_PROJECTION_JS__",
+            include_str!("gemini_attachment_projection.js"),
+        ));
+    }
+    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
+        "[class*=\"group/composer-attachment\"]"
+    } else {
+        "[class*=\"attachment\"]"
+    })
+    .map_err(|_| "無法建立附件 class probe".to_string())?;
+    Ok(r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const composer = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
         if (!composer) {
+            return { document_counts: {}, unmatched_doc_count: 0, image_count: 0, image_srcs: [] };
+        }
+        const rawRoot = composer.closest('[data-testid*="composer"]') ||
+            composer.closest('input-area-v2') ||
+            composer.closest('form') ||
+            composer.parentElement;
+        const root = (rawRoot && rawRoot !== document.body && rawRoot !== document.documentElement) ? rawRoot : null;
+        if (!root) {
+            return { document_counts: {}, unmatched_doc_count: 0, image_count: 0, image_srcs: [] };
+        }
+        const docSelector = [
+            '[class*="file-tile"]',
+            '[data-testid*="file-chip"]',
+            '[data-testid*="file-pill"]',
+            '[data-testid*="file-preview"]',
+            '[data-testid*="file-thumbnail"]',
+            '[data-test-id*="file"]',
+            'uploader-file-preview',
+            'file-preview-chip',
+            '[class*="file-chip"]',
+            '[class*="file-pill"]',
+            '[class*="file-preview"]',
+            '[class*="file-thumbnail"]',
+            __ATTACHMENT_CLASS_SELECTOR__
+        ].join(',');
+        const allTiles = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
+        const docCandidates = allTiles.filter((t) =>
+            !allTiles.some((o) => o !== t && t.contains(o))
+        ).filter((l) => {
+            const ariaLabel = (l.getAttribute('aria-label') || '').toLowerCase();
+            return !ariaLabel.startsWith('移除') && !ariaLabel.startsWith('remove');
+        });
+        const textFor = (el) => [
+            el.innerText, el.textContent,
+            el.getAttribute('aria-label'), el.getAttribute('title')
+        ].filter(Boolean).join(' ').trim();
+        const document_counts = {};
+        let unmatched_doc_count = 0;
+        for (const candidate of docCandidates) {
+            const text = textFor(candidate);
+            const matches = expectedNames
+                .filter((name) => text.includes(name))
+                .sort((a, b) => b.length - a.length);
+            if (matches.length > 0) {
+                const name = matches[0];
+                document_counts[name] = (document_counts[name] || 0) + 1;
+            } else {
+                unmatched_doc_count += 1;
+            }
+        }
+        const imgContainerSelector = [
+            '[data-testid*="attachment"]',
+            '[data-testid*="file-"]',
+            '[data-testid*="image"]',
+            '[data-test-id*="file"]',
+            '[class*="attachment"]',
+            '[class*="file-"]',
+            '[class*="preview"]',
+            '[class*="thumbnail"]',
+            'uploader-file-preview',
+            'uploader-image-preview',
+            'file-preview-chip',
+            __ATTACHMENT_CLASS_SELECTOR__
+        ].join(',');
+        const scopedImgs = [];
+        const seenImg = new Set();
+        for (const container of Array.from(root.querySelectorAll(imgContainerSelector)).filter(isVisible)) {
+            for (const img of Array.from(container.querySelectorAll('img')).filter(isVisible)) {
+                if (seenImg.has(img)) continue;
+                seenImg.add(img);
+                const src = String(img.currentSrc || img.src || '');
+                if (/avatar|profile/i.test(src)) continue;
+                scopedImgs.push(src);
+            }
+        }
+        return { document_counts, unmatched_doc_count, image_count: scopedImgs.length, image_srcs: scopedImgs };
+    }"#
+    .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
+    .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json()))
+}
+
+fn capture_attachment_baseline(
+    config_path: &str,
+    provider: Provider,
+    expected_document_names: &[String],
+) -> Result<AttachmentBaseline, String> {
+    let script = build_attachment_baseline_script(provider, expected_document_names)?;
+    let res = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": script }),
+    )?;
+    let value = parse_script_result(&res)?;
+    serde_json::from_value(value).map_err(|_| "附件基線解析失敗".to_string())
+}
+
+#[cfg(test)]
+fn build_attachment_probe_script(
+    provider: Provider,
+    expected_file_names: &[String],
+) -> Result<String, String> {
+    build_attachment_probe_script_with_baseline(
+        provider,
+        expected_file_names,
+        &AttachmentBaseline::default(),
+    )
+}
+
+fn build_attachment_probe_script_with_baseline(
+    provider: Provider,
+    expected_file_names: &[String],
+    baseline: &AttachmentBaseline,
+) -> Result<String, String> {
+    let expected_names = serde_json::to_string(expected_file_names)
+        .map_err(|_| "無法建立附件驗證 probe".to_string())?;
+    let baseline_doc_counts = serde_json::to_string(&baseline.document_counts)
+        .map_err(|_| "無法建立附件基線計數".to_string())?;
+    let baseline_image_srcs = serde_json::to_string(&baseline.image_srcs)
+        .map_err(|_| "無法建立附件圖片基線".to_string())?;
+    if provider == Provider::Gemini {
+        return Ok(r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const baselineDocCounts = __BASELINE_DOC_COUNTS__;
+        const baselineUnmatchedDocCount = __BASELINE_UNMATCHED_DOC_COUNT__;
+        const baselineImageSrcs = __BASELINE_IMAGE_SRCS__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const module = undefined;
+__GEMINI_ATTACHMENT_PROJECTION_JS__
+        const owned = resolveGeminiComposerRoot(document, composerSelectors, isVisible);
+        if (!owned) {
             return {
                 expected_count: expectedNames.length,
                 observed_count: 0,
@@ -9994,17 +11177,101 @@ fn build_attachment_probe_script(
                 complete: false
             };
         }
-        const root = composer.closest('[data-testid*="composer"]') ||
-            composer.closest('form') ||
-            composer.parentElement?.parentElement?.parentElement ||
-            composer.parentElement ||
-            document.body;
+        const proj = projectGeminiAttachments(
+            owned.root,
+            expectedNames,
+            { document_counts: baselineDocCounts, unmatched_doc_count: baselineUnmatchedDocCount, image_srcs: baselineImageSrcs },
+            isVisible,
+        );
+        const unmatchedDelta = Math.max(0, proj.unmatchedDocCount - baselineUnmatchedDocCount);
+        const observedCount = proj.observedDocuments + unmatchedDelta;
+        const unexpectedImages = proj.newImageCount || 0;
+        const complete = proj.missingDocuments === 0
+            && proj.unexpectedDocuments === 0
+            && unexpectedImages === 0
+            && observedCount === expectedNames.length
+            && !proj.uploading
+            && !proj.hasError;
+        return {
+            expected_count: expectedNames.length,
+            observed_count: observedCount,
+            missing_count: proj.missingDocuments,
+            unexpected_count: proj.unexpectedDocuments + unexpectedImages,
+            unexpected_image_count: unexpectedImages,
+            new_image_count: unexpectedImages,
+            uploading: proj.uploading,
+            has_error: proj.hasError,
+            complete
+        };
+    }"#
+        .replace("__EXPECTED_NAMES__", &expected_names)
+        .replace("__BASELINE_DOC_COUNTS__", &baseline_doc_counts)
+        .replace(
+            "__BASELINE_UNMATCHED_DOC_COUNT__",
+            &baseline.unmatched_doc_count.to_string(),
+        )
+        .replace("__BASELINE_IMAGE_SRCS__", &baseline_image_srcs)
+        .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
+        .replace(
+            "__GEMINI_ATTACHMENT_PROJECTION_JS__",
+            include_str!("gemini_attachment_projection.js"),
+        ));
+    }
+    let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
+        "[class*=\"group/composer-attachment\"]"
+    } else {
+        "[class*=\"attachment\"]"
+    })
+    .map_err(|_| "無法建立附件 class probe".to_string())?;
+    let is_gemini = if provider == Provider::Gemini {
+        "true"
+    } else {
+        "false"
+    };
+    let script = r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const baselineDocCounts = __BASELINE_DOC_COUNTS__;
+        const baselineUnmatchedDocCount = __BASELINE_UNMATCHED_DOC_COUNT__;
+        const isGemini = __IS_GEMINI__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const composer = composerSelectors.map((selector) => document.querySelector(selector)).find(Boolean);
+        const rawRoot = composer
+            ? (composer.closest('[data-testid*="composer"]') ||
+                composer.closest('input-area-v2') ||
+                composer.closest('form') ||
+                composer.parentElement)
+            : null;
+        const root = (rawRoot && rawRoot !== document.body && rawRoot !== document.documentElement) ? rawRoot : null;
+        if (!composer || !root) {
+            return {
+                expected_count: expectedNames.length,
+                observed_count: 0,
+                missing_count: expectedNames.length,
+                unexpected_count: 0,
+                uploading: false,
+                has_error: true,
+                complete: false
+            };
+        }
         const candidateSelector = [
             '[data-testid*="attachment"]',
             '[data-testid*="file-chip"]',
             '[data-testid*="file-pill"]',
             '[data-testid*="file-preview"]',
             '[data-testid*="file-thumbnail"]',
+            '[data-test-id*="file"]',
+            'uploader-file-preview',
+            'file-preview-chip',
             __ATTACHMENT_CLASS_SELECTOR__,
             '[class*="file-tile"]',
             '[class*="file-chip"]',
@@ -10052,7 +11319,7 @@ fn build_attachment_probe_script(
                 unmatchedVisibleCandidates += 1;
             }
         }
-        if (observedCounts.size === 0) {
+        if (!isGemini && observedCounts.size === 0) {
             const rootText = root.innerText || root.textContent || '';
             for (const [name] of expectedCounts) {
                 let count = 0;
@@ -10065,17 +11332,19 @@ fn build_attachment_probe_script(
             }
             unmatchedVisibleCandidates = 0;
         }
+        const unmatchedDelta = Math.max(0, unmatchedVisibleCandidates - baselineUnmatchedDocCount);
         let missingCount = 0;
-        let unexpectedCount = unmatchedVisibleCandidates;
-        let observedCount = unmatchedVisibleCandidates;
+        let unexpectedCount = unmatchedDelta;
+        let observedCount = unmatchedDelta;
         for (const [name, expected] of expectedCounts) {
-            const observed = observedCounts.get(name) || 0;
+            const baseCount = Number(baselineDocCounts[name] || 0);
+            const observed = Math.max(0, (observedCounts.get(name) || 0) - baseCount);
             observedCount += observed;
             missingCount += Math.max(0, expected - observed);
             unexpectedCount += Math.max(0, observed - expected);
         }
         const uploadingState = Array.from(root.querySelectorAll(
-            '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i], [data-testid*="progress" i]'
+            '[aria-busy="true"], [role="progressbar"], mat-progress-spinner, mat-progress-bar, [data-state*="uploading" i], [data-status*="uploading" i], [data-testid*="progress" i]'
         )).some(isVisible);
         const uploadingText = filteredLeaves.some((candidate) =>
             /uploading|upload in progress|上傳中|正在上傳|上传中|正在上传/i.test(textFor(candidate))
@@ -10104,6 +11373,12 @@ fn build_attachment_probe_script(
         };
     }"#
     .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__BASELINE_DOC_COUNTS__", &baseline_doc_counts)
+    .replace(
+        "__BASELINE_UNMATCHED_DOC_COUNT__",
+        &baseline.unmatched_doc_count.to_string(),
+    )
+    .replace("__IS_GEMINI__", is_gemini)
     .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
     .replace(
         "__COMPOSER_SELECTORS__",
@@ -10116,12 +11391,14 @@ fn verify_attachment_completion(
     config_path: &str,
     provider: Provider,
     expected_file_names: &[String],
+    baseline: &AttachmentBaseline,
     verbose: bool,
 ) -> Result<(), String> {
     if expected_file_names.is_empty() {
         return Ok(());
     }
-    let script = build_attachment_probe_script(provider, expected_file_names)?;
+    let script =
+        build_attachment_probe_script_with_baseline(provider, expected_file_names, baseline)?;
     let verify_timeout = attachment_verify_timeout_for_count(expected_file_names.len());
     let deadline = McpOperationDeadline::from_timeout(verify_timeout)
         .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
@@ -10167,12 +11444,93 @@ fn verify_attachment_completion(
 /// by non-zero natural dimensions.  Image previews in ChatGPT do not expose
 /// their original filename, so we count visible ``<img>`` elements inside the
 /// composer root whose naturalWidth/naturalHeight are positive.
+#[allow(dead_code)]
 fn build_typed_attachment_probe_script(
     provider: Provider,
     expected_document_names: &[String],
 ) -> Result<String, String> {
+    build_typed_attachment_probe_script_with_baseline(
+        provider,
+        expected_document_names,
+        &AttachmentBaseline::default(),
+    )
+}
+
+fn build_typed_attachment_probe_script_with_baseline(
+    provider: Provider,
+    expected_document_names: &[String],
+    baseline: &AttachmentBaseline,
+) -> Result<String, String> {
     let expected_names = serde_json::to_string(expected_document_names)
         .map_err(|_| "無法建立 typed 附件驗證 probe".to_string())?;
+    let baseline_doc_counts = serde_json::to_string(&baseline.document_counts)
+        .map_err(|_| "無法建立 typed 附件基線計數".to_string())?;
+    let baseline_image_srcs = serde_json::to_string(&baseline.image_srcs)
+        .map_err(|_| "無法建立 typed 圖片基線清單".to_string())?;
+    if provider == Provider::Gemini {
+        return Ok(r#"() => {
+        const expectedNames = __EXPECTED_NAMES__;
+        const baselineDocCounts = __BASELINE_DOC_COUNTS__;
+        const baselineUnmatchedDocCount = __BASELINE_UNMATCHED_DOC_COUNT__;
+        const baselineImageSrcs = __BASELINE_IMAGE_SRCS__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0;
+        };
+        const module = undefined;
+__GEMINI_ATTACHMENT_PROJECTION_JS__
+        const owned = resolveGeminiComposerRoot(document, composerSelectors, isVisible);
+        if (!owned) {
+            return {
+                document_count: 0,
+                missing_documents: expectedNames.length,
+                unexpected_documents: 0,
+                image_count: 0,
+                image_loaded: false,
+                uploading: false,
+                provider_error: true
+            };
+        }
+        const proj = projectGeminiAttachments(
+            owned.root,
+            expectedNames,
+            {
+                document_counts: baselineDocCounts,
+                unmatched_doc_count: baselineUnmatchedDocCount,
+                image_srcs: baselineImageSrcs,
+            },
+            isVisible,
+        );
+        return {
+            document_count: proj.observedDocuments,
+            missing_documents: proj.missingDocuments,
+            unexpected_documents: proj.unexpectedDocuments,
+            image_count: proj.imageCount,
+            image_loaded: proj.allImagesLoaded && proj.imageCount > 0,
+            uploading: proj.uploading,
+            provider_error: proj.hasError
+        };
+    }"#
+        .replace("__EXPECTED_NAMES__", &expected_names)
+        .replace("__BASELINE_DOC_COUNTS__", &baseline_doc_counts)
+        .replace(
+            "__BASELINE_UNMATCHED_DOC_COUNT__",
+            &baseline.unmatched_doc_count.to_string(),
+        )
+        .replace("__BASELINE_IMAGE_SRCS__", &baseline_image_srcs)
+        .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
+        .replace(
+            "__GEMINI_ATTACHMENT_PROJECTION_JS__",
+            include_str!("gemini_attachment_projection.js"),
+        ));
+    }
     let attachment_class_selector = serde_json::to_string(if provider == Provider::ChatGpt {
         "[class*=\"group/composer-attachment\"]"
     } else {
@@ -10181,6 +11539,9 @@ fn build_typed_attachment_probe_script(
     .map_err(|_| "無法建立附件 class probe".to_string())?;
     let script = r#"() => {
         const expectedNames = __EXPECTED_NAMES__;
+        const baselineDocCounts = __BASELINE_DOC_COUNTS__;
+        const baselineUnmatchedDocCount = __BASELINE_UNMATCHED_DOC_COUNT__;
+        const baselineImageSrcs = __BASELINE_IMAGE_SRCS__;
         const composerSelectors = __COMPOSER_SELECTORS__;
         const isVisible = (el) => {
             if (!el) return false;
@@ -10193,24 +11554,33 @@ fn build_typed_attachment_probe_script(
                 rect.height > 0;
         };
         const composer = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
-        if (!composer) {
-            return { document_count: 0, image_count: 0, image_loaded: false, uploading: false, provider_error: false };
+        const rawRoot = composer
+            ? (composer.closest('[data-testid*="composer"]') ||
+                composer.closest('input-area-v2') ||
+                composer.closest('form') ||
+                composer.parentElement)
+            : null;
+        const root = (rawRoot && rawRoot !== document.body && rawRoot !== document.documentElement) ? rawRoot : null;
+        if (!composer || !root) {
+            return {
+                document_count: 0,
+                missing_documents: expectedNames.length,
+                unexpected_documents: 0,
+                image_count: 0,
+                image_loaded: false,
+                uploading: false,
+                provider_error: true
+            };
         }
-        const root = composer.closest('[data-testid*="composer"]') ||
-            composer.closest('form') ||
-            composer.parentElement?.parentElement?.parentElement ||
-            composer.parentElement ||
-            document.body;
-        // ChatGPT file attachments use class "group/file-tile" (and legacy
-        // data-testid/class patterns).  Each tile's textContent contains the
-        // filename.  Image tiles contain an <img> with positive natural
-        // dimensions but no filename text.
         const docSelector = [
             '[class*="file-tile"]',
             '[data-testid*="file-chip"]',
             '[data-testid*="file-pill"]',
             '[data-testid*="file-preview"]',
             '[data-testid*="file-thumbnail"]',
+            '[data-test-id*="file"]',
+            'uploader-file-preview',
+            'file-preview-chip',
             '[class*="file-chip"]',
             '[class*="file-pill"]',
             '[class*="file-preview"]',
@@ -10218,7 +11588,6 @@ fn build_typed_attachment_probe_script(
             __ATTACHMENT_CLASS_SELECTOR__
         ].join(',');
         const allTiles = Array.from(root.querySelectorAll(docSelector)).filter(isVisible);
-        // Only keep tiles that are leaf-level (no child tile inside them).
         const docCandidates = allTiles.filter((t) =>
             !allTiles.some((o) => o !== t && t.contains(o))
         ).filter((l) => {
@@ -10241,35 +11610,83 @@ fn build_typed_attachment_probe_script(
             return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
         };
         const observedCounts = new Map();
-        let documentCount = 0;
-        // A tile counts as a document if its text contains one of the
-        // expected filenames.  Otherwise it's an image tile.
+        let unmatchedDocs = 0;
         for (const candidate of docCandidates) {
+            const hasOnlyImageChild = Boolean(candidate.querySelector('img'))
+                && !expectedNames.some((n) => matchesExpected(textFor(candidate), n))
+                && !/\.([a-z0-9]{1,8})\b/i.test(textFor(candidate));
+            if (hasOnlyImageChild) continue;
             const text = textFor(candidate);
             const matches = Array.from(expectedCounts.keys())
                 .filter((name) => matchesExpected(text, name))
                 .sort((a, b) => b.length - a.length);
             if (matches.length > 0) {
                 const name = matches[0];
-                const prev = observedCounts.get(name) || 0;
-                observedCounts.set(name, prev + 1);
-                documentCount += 1;
+                observedCounts.set(name, (observedCounts.get(name) || 0) + 1);
+            } else {
+                unmatchedDocs += 1;
             }
         }
-        // Count image previews: visible <img> inside the composer root with
-        // positive natural dimensions.  These are the ChatGPT image-attachment
-        // thumbnails that do not expose a filename.
-        const imgCandidates = Array.from(root.querySelectorAll('img')).filter(isVisible);
+        let documentCount = 0;
+        let missingDocuments = 0;
+        let unexpectedDocuments = Math.max(0, unmatchedDocs - baselineUnmatchedDocCount);
+        for (const [name, expected] of expectedCounts) {
+            const baseCount = Number(baselineDocCounts[name] || 0);
+            const observed = Math.max(0, (observedCounts.get(name) || 0) - baseCount);
+            documentCount += observed;
+            missingDocuments += Math.max(0, expected - observed);
+            unexpectedDocuments += Math.max(0, observed - expected);
+        }
+        const imgContainerSelector = [
+            '[data-testid*="attachment"]',
+            '[data-testid*="file-"]',
+            '[data-testid*="image"]',
+            '[data-test-id*="file"]',
+            '[class*="attachment"]',
+            '[class*="file-"]',
+            '[class*="preview"]',
+            '[class*="thumbnail"]',
+            'uploader-file-preview',
+            'uploader-image-preview',
+            'file-preview-chip',
+            __ATTACHMENT_CLASS_SELECTOR__
+        ].join(',');
+        const scopedImgs = [];
+        const seenImg = new Set();
+        for (const container of Array.from(root.querySelectorAll(imgContainerSelector)).filter(isVisible)) {
+            for (const img of Array.from(container.querySelectorAll('img')).filter(isVisible)) {
+                if (seenImg.has(img)) continue;
+                seenImg.add(img);
+                const src = String(img.currentSrc || img.src || '');
+                if (/avatar|profile/i.test(src)) continue;
+                scopedImgs.push(img);
+            }
+        }
+        const baseImageMultiset = new Map();
+        for (const src of baselineImageSrcs) {
+            baseImageMultiset.set(src, (baseImageMultiset.get(src) || 0) + 1);
+        }
+        const newImgCandidates = [];
+        for (const img of scopedImgs) {
+            const src = String(img.currentSrc || img.src || '');
+            const rem = baseImageMultiset.get(src) || 0;
+            if (rem > 0) {
+                baseImageMultiset.set(src, rem - 1);
+            } else {
+                newImgCandidates.push(img);
+            }
+        }
         let imageCount = 0;
-        let imageLoaded = false;
-        for (const img of imgCandidates) {
-            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+        let allNewLoaded = newImgCandidates.length > 0;
+        for (const img of newImgCandidates) {
+            if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
                 imageCount += 1;
-                imageLoaded = true;
+            } else {
+                allNewLoaded = false;
             }
         }
         const uploadingState = Array.from(root.querySelectorAll(
-            '[aria-busy="true"], [role="progressbar"], [data-state*="uploading" i], [data-status*="uploading" i]'
+            '[aria-busy="true"], [role="progressbar"], mat-progress-spinner, mat-progress-bar, [data-state*="uploading" i], [data-status*="uploading" i]'
         )).some(isVisible);
         const uploadingText = docCandidates.some((c) =>
             /uploading|upload in progress|上傳中|正在上傳/i.test(textFor(c))
@@ -10282,13 +11699,21 @@ fn build_typed_attachment_probe_script(
         );
         return {
             document_count: documentCount,
+            missing_documents: missingDocuments,
+            unexpected_documents: unexpectedDocuments,
             image_count: imageCount,
-            image_loaded: imageLoaded,
+            image_loaded: allNewLoaded && imageCount > 0,
             uploading: uploadingState || uploadingText,
             provider_error: errorState || errorText
         };
     }"#
     .replace("__EXPECTED_NAMES__", &expected_names)
+    .replace("__BASELINE_DOC_COUNTS__", &baseline_doc_counts)
+    .replace(
+        "__BASELINE_UNMATCHED_DOC_COUNT__",
+        &baseline.unmatched_doc_count.to_string(),
+    )
+    .replace("__BASELINE_IMAGE_SRCS__", &baseline_image_srcs)
     .replace("__ATTACHMENT_CLASS_SELECTOR__", &attachment_class_selector)
     .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json());
     Ok(script)
@@ -10301,6 +11726,7 @@ fn verify_typed_attachment_completion(
     config_path: &str,
     provider: Provider,
     expectations: &AttachmentExpectations,
+    baseline: &AttachmentBaseline,
     verbose: bool,
 ) -> Result<AttachmentProbeSummary, String> {
     if expectations.document_names.is_empty() && expectations.image_count == 0 {
@@ -10318,7 +11744,11 @@ fn verify_typed_attachment_completion(
             provider_error: false,
         });
     }
-    let script = build_typed_attachment_probe_script(provider, &expectations.document_names)?;
+    let script = build_typed_attachment_probe_script_with_baseline(
+        provider,
+        &expectations.document_names,
+        baseline,
+    )?;
     let total_count = expectations.document_names.len() + expectations.image_count;
     let verify_timeout = attachment_verify_timeout_for_count(total_count);
     let deadline = McpOperationDeadline::from_timeout(verify_timeout)
@@ -10383,6 +11813,40 @@ fn upload_attachments_via_file_chooser(
         let canonical_path = std::fs::canonicalize(path)
             .map_err(|_| "Failed to resolve an attachment for native upload".to_string())?;
         let file_path = canonical_path.to_string_lossy().to_string();
+
+        if provider == Provider::Gemini {
+            let is_image = index < image_paths.len();
+            let token = uuid::Uuid::new_v4().to_string();
+            let token_json =
+                serde_json::to_string(&token).map_err(|_| "Upload token failed".to_string())?;
+            let marker = format!(
+                "() => {{ window.__ask_bridge_upload_token = {}; return true; }}",
+                token_json
+            );
+            call_mcp_tool(
+                config_path,
+                "evaluate_script",
+                serde_json::json!({ "function": marker }),
+            )?;
+            let output = Command::new("node")
+                .arg("-e")
+                .arg(include_str!("gemini_upload.js"))
+                .arg(&token)
+                .arg(&file_path)
+                .arg(if is_image { "image" } else { "document" })
+                .output()
+                .map_err(|_| "Gemini native upload helper unavailable".to_string())?;
+            if !output.status.success() {
+                if verbose {
+                    eprintln!(
+                        "Gemini upload diagnostic: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                return Err("Gemini native file upload failed".to_string());
+            }
+            continue;
+        }
 
         if provider == Provider::ChatGpt {
             let is_image = index < image_paths.len();
@@ -10507,14 +11971,13 @@ where
 enum DocumentUploadPolicy {
     NativeOnly,
     NativeThenDataTransferFallback,
-    DataTransferOnly,
 }
 
 fn document_upload_policy(provider: Provider) -> DocumentUploadPolicy {
     match provider {
         Provider::ChatGpt => DocumentUploadPolicy::NativeOnly,
         Provider::Claude => DocumentUploadPolicy::NativeThenDataTransferFallback,
-        Provider::Gemini => DocumentUploadPolicy::DataTransferOnly,
+        Provider::Gemini => DocumentUploadPolicy::NativeOnly,
     }
 }
 
@@ -10780,7 +12243,7 @@ fn upload_attachments_to_provider(
     file_paths: &[String],
     summary: &AttachmentSummary,
     verbose: bool,
-) -> Result<Option<AttachmentProbeSummary>, String> {
+) -> Result<(Option<AttachmentProbeSummary>, AttachmentBaseline), String> {
     if summary.count() != image_paths.len() + file_paths.len() {
         return Err("附件摘要數量不一致".to_string());
     }
@@ -10796,6 +12259,11 @@ fn upload_attachments_to_provider(
     let has_images = !image_paths.is_empty();
     let expectations = AttachmentExpectations::new(file_paths, image_paths)
         .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
+    let baseline = if image_paths.is_empty() && file_paths.is_empty() {
+        AttachmentBaseline::default()
+    } else {
+        capture_attachment_baseline(config_path, provider, &expectations.document_names)?
+    };
 
     // 1. Documents first.
     match document_upload_policy(provider) {
@@ -10834,37 +12302,12 @@ fn upload_attachments_to_provider(
                 )?;
             }
         }
-        DocumentUploadPolicy::DataTransferOnly => {
-            upload_attachments_via_data_transfer(config_path, provider, &[], file_paths, verbose)?;
-        }
     }
 
-    // 2. If there are images, upload them via DataTransfer after documents.
+    // 2. Images after documents (Gemini & ChatGPT strictly native CDP, Claude DataTransfer).
     if has_images {
         match provider {
-            Provider::Gemini => {
-                run_native_then_fallback(
-                    || {
-                        upload_attachments_via_file_chooser(
-                            config_path,
-                            provider,
-                            image_paths,
-                            &[],
-                            verbose,
-                        )
-                    },
-                    || {
-                        upload_attachments_via_data_transfer(
-                            config_path,
-                            provider,
-                            image_paths,
-                            &[],
-                            verbose,
-                        )
-                    },
-                )?;
-            }
-            Provider::ChatGpt => {
+            Provider::Gemini | Provider::ChatGpt => {
                 upload_attachments_via_file_chooser(
                     config_path,
                     provider,
@@ -10884,13 +12327,24 @@ fn upload_attachments_to_provider(
             }
         }
         // 3. Typed verification for the mixed set.
-        let typed_summary =
-            verify_typed_attachment_completion(config_path, provider, &expectations, verbose)?;
-        Ok(Some(typed_summary))
+        let typed_summary = verify_typed_attachment_completion(
+            config_path,
+            provider,
+            &expectations,
+            &baseline,
+            verbose,
+        )?;
+        Ok((Some(typed_summary), baseline))
     } else {
-        // Documents-only: use the legacy filename-multiset verifier.
-        verify_attachment_completion(config_path, provider, &summary.file_names, verbose)?;
-        Ok(None)
+        // Documents-only: use the filename-multiset verifier against pre-upload baseline.
+        verify_attachment_completion(
+            config_path,
+            provider,
+            &summary.file_names,
+            &baseline,
+            verbose,
+        )?;
+        Ok((None, baseline))
     }
 }
 
@@ -11951,6 +13405,7 @@ fn best_effort_close_reasoning_menu(config_path: &str, target_json: &str) {
     }
 }
 
+#[allow(clippy::needless_borrow)]
 fn select_chatgpt_accessible_label(
     config_path: &str,
     target_json: &str,
@@ -12032,53 +13487,24 @@ fn switch_model(
         Provider::ChatGpt => build_chatgpt_model_selection_script(&target_json),
         Provider::Gemini => {
             let template = r#"() => {
+                const module = undefined;
+                __GEMINI_MODEL_SELECTOR_JS__
                 window.__switch_model_status = 'pending';
                 (async () => {
                     try {
-                        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                        const norm = (s) => (s || '').toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '');
-                        const canonical = (s) => {
-                            const n = norm(s).replace(/^已選取/, '');
-                            if (n.includes('flashlite') || n.includes('31flashlite')) return 'flashlite';
-                            if (n.includes('35flash') || (n.endsWith('flash') && !n.includes('lite'))) return 'flash';
-                            if (n.includes('31pro') || n === 'pro') return 'pro';
-                            return n;
-                        };
-                        const target = canonical(__TARGET_MODEL__);
-                        if (!target) { window.__switch_model_status = 'error: empty target'; return; }
-                        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
-                        await sleep(250);
-                        const buttons = Array.from(document.querySelectorAll('button'));
-                        const modeButton = buttons.find((button) => /模式挑選器|model picker|mode picker/i.test([
-                            button.getAttribute('aria-label'),
-                            button.textContent
-                        ].filter(Boolean).join(' ')));
-                        if (!modeButton) { window.__switch_model_status = 'error: Gemini mode picker not found'; return; }
-                        modeButton.click();
-                        await sleep(800);
-                        const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"]'));
-                        let chosen = null;
-                        for (const item of items) {
-                            const label = item.innerText || item.textContent || item.getAttribute('aria-label') || '';
-                            if (canonical(label) === target || norm(label) === norm(__TARGET_MODEL__)) {
-                                chosen = item;
-                                break;
-                            }
-                        }
-                        if (!chosen) {
-                            window.__switch_model_status = 'error: model not found in menu';
-                            return;
-                        }
-                        chosen.click();
-                        await sleep(500);
-                        window.__switch_model_status = 'success:' + (chosen.innerText || chosen.textContent || '').trim();
+                        window.__switch_model_status = await selectGeminiMode(__TARGET_MODEL__);
                     } catch (e) {
-                        window.__switch_model_status = 'error: ' + e.message;
+                        window.__switch_model_status = 'error: ' + (e && e.message ? e.message : String(e));
                     }
                 })();
                 return true;
             }"#;
-            template.replace("__TARGET_MODEL__", &target_json)
+            template
+                .replace(
+                    "__GEMINI_MODEL_SELECTOR_JS__",
+                    include_str!("gemini_model_selector.js"),
+                )
+                .replace("__TARGET_MODEL__", &target_json)
         }
         Provider::Claude => {
             let template = r#"() => {
@@ -12181,7 +13607,7 @@ fn switch_model(
 
     let outcome = if provider == Provider::ChatGpt {
         if status == "slider_ready" {
-            let state = read_chatgpt_slider_state(&config_path, &target_json)?;
+            let state = read_chatgpt_slider_state(config_path, &target_json)?;
             if state.requires_bounded_ordinal() {
                 let target = ReasoningEffort::from_label(model.trim()).ok_or_else(|| {
                     "Model switch failed: reasoning target has no bounded ordinal mapping"
@@ -12189,14 +13615,14 @@ fn switch_model(
                 })?;
                 select_chatgpt_labeled_ordered_control(
                     &mut LiveChatGptSliderPage {
-                        config_path: &config_path,
+                        config_path,
                         target_json: &target_json,
                     },
                     target,
                     state,
                 )?
             } else {
-                select_chatgpt_accessible_label(&config_path, &target_json, state)?
+                select_chatgpt_accessible_label(config_path, &target_json, state)?
             }
         } else if status == "success:legacy_menu_v1" {
             ModelSelectionOutcome {
@@ -12207,6 +13633,19 @@ fn switch_model(
             }
         } else {
             return Err("Model switch failed: selector contract was not verified".to_string());
+        }
+    } else if provider == Provider::Gemini {
+        if status == "success:gemini_mode_menu_v1" {
+            ModelSelectionOutcome {
+                contract: ModelSelectionContract::GeminiModeMenuV1,
+                evidence: ModelSelectionEvidence::GeminiMenuCheckedV1,
+                direct_semantic_count: None,
+                position_count: None,
+            }
+        } else {
+            return Err(
+                "Model switch failed: Gemini mode menu contract was not verified".to_string(),
+            );
         }
     } else {
         ModelSelectionOutcome {
@@ -13134,10 +14573,297 @@ fn submit_chatgpt_regular_prompt(
     wait_for_chatgpt_submit_status(config_path)
 }
 
+fn insert_gemini_prompt_text(config_path: &str, prompt: &str, verbose: bool) -> Result<(), String> {
+    let token = Uuid::new_v4().to_string();
+    let token_json = serde_json::to_string(&token)
+        .map_err(|_| "Failed to serialize Gemini prompt token".to_string())?;
+    let marker_js = format!(
+        "() => {{ window.__ask_bridge_gemini_prompt_token = {}; return true; }}",
+        token_json
+    );
+    let marked = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": marker_js }),
+    )?;
+    if !parse_script_result(&marked)?.as_bool().unwrap_or(false) {
+        return Err("Failed to mark the owned Gemini page for prompt input".to_string());
+    }
+
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(include_str!("gemini_prompt_submission.js"))
+        .arg(&token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "Gemini native prompt input helper unavailable".to_string())?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Gemini prompt input pipe unavailable".to_string())?
+        .write_all(prompt.as_bytes());
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Gemini prompt input could not be sent: {}", error));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "Gemini native prompt input did not finish".to_string())?;
+    if !output.status.success() || output.stdout.as_slice() != b"prompt-inserted\n" {
+        if verbose {
+            let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !diagnostic.is_empty() {
+                eprintln!("Gemini prompt input diagnostic: {}", diagnostic);
+            }
+        }
+        return Err("Gemini native prompt input failed".to_string());
+    }
+    Ok(())
+}
+
+fn build_gemini_prompt_submission_script(
+    prompt: &str,
+    baseline: &AttachmentBaseline,
+    expected_document_names: &[String],
+    expected_image_count: usize,
+) -> Result<String, String> {
+    let prompt_json =
+        serde_json::to_string(prompt).map_err(|_| "Failed to serialize prompt text".to_string())?;
+    let user_selector_json = serde_json::to_string(Provider::Gemini.user_selector())
+        .map_err(|_| "Failed to serialize Gemini user message selector".to_string())?;
+    let expected_docs_json = serde_json::to_string(expected_document_names)
+        .map_err(|_| "Failed to serialize expected attachment names".to_string())?;
+    let baseline_doc_counts_json = serde_json::to_string(&baseline.document_counts)
+        .map_err(|_| "Failed to serialize baseline doc counts".to_string())?;
+    let baseline_image_srcs_json = serde_json::to_string(&baseline.image_srcs)
+        .map_err(|_| "Failed to serialize baseline image srcs".to_string())?;
+    let send_selectors_json = Provider::Gemini.send_button_selectors_json();
+    let echo_verifier = include_str!("chatgpt_prompt_echo_verifier.js");
+
+    Ok(r#"() => {
+        const prompt = __PROMPT__;
+        const userSelector = __USER_SELECTOR__;
+        const sendSelectors = __SEND_SELECTORS__;
+        const composerSelectors = __COMPOSER_SELECTORS__;
+        const stopSelectors = __STOP_SELECTORS__;
+        const expectedDocs = __EXPECTED_DOCS__;
+        const baselineDocCounts = __BASELINE_DOC_COUNTS__;
+        const baselineUnmatchedDocCount = __BASELINE_UNMATCHED_DOC_COUNT__;
+        const baselineImageSrcs = __BASELINE_IMAGE_SRCS__;
+        const expectedImageCount = __EXPECTED_IMAGE_COUNT__;
+        const verifyPromptEcho = __PROMPT_ECHO_VERIFIER__;
+        const normalize = (value) => String(value || '')
+            .normalize('NFC')
+            .replace(/[\u200B-\u200D\uFEFF]/g, '')
+            .replace(/\s+/gu, ' ')
+            .trim();
+        const readText = (element) => typeof element.value === 'string'
+            ? element.value
+            : (element.innerText || element.textContent || '');
+        const isVisible = (element) => {
+            if (!element) return false;
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const isVisibleAndEnabled = (element) => {
+            if (!isVisible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+            return true;
+        };
+        const isStopButton = (element) => stopSelectors.some((selector) => {
+            try { return element.matches(selector); } catch (_) { return false; }
+        });
+        const module = undefined;
+__GEMINI_ATTACHMENT_PROJECTION_JS__
+        const resolveOwnedComposer = () => {
+            const owned = resolveGeminiComposerRoot(document, composerSelectors, isVisibleAndEnabled);
+            return owned;
+        };
+        const verifyLiveAttachmentsBeforeClick = (root) => geminiPreClickVerify(
+            root,
+            expectedDocs,
+            expectedImageCount,
+            {
+                document_counts: baselineDocCounts,
+                unmatched_doc_count: baselineUnmatchedDocCount,
+                image_srcs: baselineImageSrcs,
+            },
+            isVisible,
+        );
+        const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制|something went wrong|發生錯誤)/i;
+        const providerFailureVisible = () => Array.from(document.querySelectorAll('[role="alert"]'))
+            .filter(isVisibleAndEnabled)
+            .some((element) => providerFailurePattern.test(String(element.innerText || element.textContent || '')));
+        const expectedText = normalize(prompt);
+        const initialUserCount = document.querySelectorAll(userSelector).length;
+
+        window.__submit_status = 'pending';
+        (async () => {
+            let submitClicked = false;
+            try {
+                if (window.location.origin !== 'https://gemini.google.com') {
+                    window.__submit_status = 'safe: Gemini page origin mismatch before click';
+                    return;
+                }
+                if (!expectedText) {
+                    window.__submit_status = 'safe: Gemini prompt was empty';
+                    return;
+                }
+                const initialOwned = resolveOwnedComposer();
+                if (!initialOwned || normalize(readText(initialOwned.composer)) !== expectedText) {
+                    window.__submit_status = 'safe: Gemini composer or prompt text mismatch before click';
+                    return;
+                }
+
+                let button = null;
+                let ownedNow = null;
+                for (let attempt = 0; attempt < 150; attempt += 1) {
+                    ownedNow = resolveOwnedComposer();
+                    if (ownedNow) {
+                        button = sendSelectors
+                            .map((selector) => ownedNow.root.querySelector(selector))
+                            .find((element) => isVisibleAndEnabled(element) && !isStopButton(element) && ownedNow.root.contains(element));
+                        if (button) break;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                if (!button || !ownedNow) {
+                    window.__submit_status = 'safe: Gemini send button did not become active in composer';
+                    return;
+                }
+                // Synchronous pre-click verification barrier: re-check origin, owned composer,
+                // normalized prompt, attachments, and in-composer send button immediately before click.
+                if (window.location.origin !== 'https://gemini.google.com') {
+                    window.__submit_status = 'safe: Gemini origin changed right before click';
+                    return;
+                }
+                const preClickOwned = resolveOwnedComposer();
+                if (!preClickOwned || !preClickOwned.root.contains(button) || !isVisibleAndEnabled(button) || isStopButton(button)) {
+                    window.__submit_status = 'safe: Gemini send button ownership lost before click';
+                    return;
+                }
+                if (normalize(readText(preClickOwned.composer)) !== expectedText) {
+                    window.__submit_status = 'safe: Gemini prompt drifted right before click';
+                    return;
+                }
+                const attCheck = verifyLiveAttachmentsBeforeClick(preClickOwned.root);
+                if (!attCheck.ok) {
+                    window.__submit_status = 'safe: Gemini attachment pre-click verification failed (' + attCheck.reason + ')';
+                    return;
+                }
+
+                const providerFailureAtStart = providerFailureVisible();
+                button.click();
+                submitClicked = true;
+
+                for (let attempt = 0; attempt < 900; attempt += 1) {
+                    if (submitClicked && !providerFailureAtStart && providerFailureVisible()) {
+                        window.__submit_status = 'provider_rejected: Gemini rejected the submitted prompt';
+                        return;
+                    }
+                    const messages = Array.from(document.querySelectorAll(userSelector));
+                    if (messages.length > initialUserCount + 1) {
+                        window.__submit_status = 'unknown: unexpected Gemini user message count after submit';
+                        return;
+                    }
+                    if (messages.length === initialUserCount + 1) {
+                        const latestMessage = messages[messages.length - 1];
+                        const latestText = normalize(latestMessage ? readText(latestMessage) : '');
+                        const echo = verifyPromptEcho(prompt, latestText);
+                        if (echo.verified) {
+                            window.__submit_status = 'success:' + JSON.stringify({
+                                clicked: true,
+                                user_message_verified: true,
+                                verification: 'semantic_projection_v2',
+                                anchor_matches: echo.anchor_matches,
+                                anchor_required: echo.anchor_required
+                            });
+                            return;
+                        }
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+                window.__submit_status = 'unknown: Gemini did not render the submitted prompt in the conversation';
+            } catch (_) {
+                window.__submit_status = (submitClicked ? 'unknown: ' : 'safe: ') +
+                    'Gemini submission verification failed';
+            }
+        })();
+        return true;
+    }"#
+    .replace("__PROMPT__", &prompt_json)
+    .replace("__PROMPT_ECHO_VERIFIER__", echo_verifier.trim())
+    .replace("__USER_SELECTOR__", &user_selector_json)
+    .replace("__SEND_SELECTORS__", send_selectors_json)
+    .replace("__EXPECTED_DOCS__", &expected_docs_json)
+    .replace("__BASELINE_DOC_COUNTS__", &baseline_doc_counts_json)
+    .replace(
+        "__BASELINE_UNMATCHED_DOC_COUNT__",
+        &baseline.unmatched_doc_count.to_string(),
+    )
+    .replace("__BASELINE_IMAGE_SRCS__", &baseline_image_srcs_json)
+    .replace("__EXPECTED_IMAGE_COUNT__", &expected_image_count.to_string())
+    .replace(
+        "__STOP_SELECTORS__",
+        Provider::Gemini.stop_button_selectors_json(),
+    )
+    .replace(
+        "__COMPOSER_SELECTORS__",
+        Provider::Gemini.composer_selectors_json(),
+    )
+    .replace(
+        "__GEMINI_ATTACHMENT_PROJECTION_JS__",
+        include_str!("gemini_attachment_projection.js"),
+    ))
+}
+
+fn submit_gemini_regular_prompt(
+    config_path: &str,
+    prompt: &str,
+    baseline: &AttachmentBaseline,
+    expected_document_names: &[String],
+    expected_image_count: usize,
+    verbose: bool,
+) -> Result<String, PromptSubmissionFailure> {
+    insert_gemini_prompt_text(config_path, prompt, verbose)
+        .map_err(PromptSubmissionFailure::safe)?;
+    let submit_js = build_gemini_prompt_submission_script(
+        prompt,
+        baseline,
+        expected_document_names,
+        expected_image_count,
+    )
+    .map_err(PromptSubmissionFailure::safe)?;
+    let started = call_mcp_tool(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": submit_js }),
+    )
+    .map_err(PromptSubmissionFailure::unknown)?;
+    if !parse_script_result(&started)
+        .map_err(PromptSubmissionFailure::unknown)?
+        .as_bool()
+        .unwrap_or(false)
+    {
+        return Err(PromptSubmissionFailure::unknown(
+            "Failed to start verified Gemini prompt submission",
+        ));
+    }
+
+    wait_for_chatgpt_submit_status(config_path)
+}
+
 fn submit_prompt_to_provider(
     config_path: &str,
     provider: Provider,
     prompt: &str,
+    attachment_baseline: Option<&AttachmentBaseline>,
+    expected_document_names: &[String],
+    expected_image_count: usize,
     verbose: bool,
 ) -> Result<String, PromptSubmissionFailure> {
     if provider == Provider::ChatGpt
@@ -13151,6 +14877,17 @@ fn submit_prompt_to_provider(
     }
     if provider == Provider::ChatGpt {
         return submit_chatgpt_regular_prompt(config_path, prompt, verbose);
+    }
+    if provider == Provider::Gemini {
+        let default_baseline = AttachmentBaseline::default();
+        return submit_gemini_regular_prompt(
+            config_path,
+            prompt,
+            attachment_baseline.unwrap_or(&default_baseline),
+            expected_document_names,
+            expected_image_count,
+            verbose,
+        );
     }
 
     submit_regular_prompt(config_path, provider, prompt, verbose)
@@ -13249,11 +14986,17 @@ fn build_response_probe_script(
         .map_err(|_| "Failed to serialize assistant selector".to_string())?;
     let user_selector = serde_json::to_string(provider.user_selector())
         .map_err(|_| "Failed to serialize user selector".to_string())?;
+    let is_gemini = if provider == Provider::Gemini {
+        "true"
+    } else {
+        "false"
+    };
     Ok(r#"() => {
             const stopSelectors = __STOP_SELECTORS__;
             const assistantSelector = __ASSISTANT_SELECTOR__;
             const userSelector = __USER_SELECTOR__;
             const minimumImageDimension = __MINIMUM_IMAGE_DIMENSION__;
+            const isGemini = __IS_GEMINI__;
             const isVisibleControl = (el) => {
                 if (!el) return false;
                 const style = window.getComputedStyle(el);
@@ -13291,26 +15034,38 @@ fn build_response_probe_script(
             };
 __CANONICAL_TURN_GROUP_JS__
 __TURN_IDENTITY_JS__
-            const conversationId = (() => {
-                const match = window.location.pathname.match(/^\/c\/([^/?#]+)/);
-                return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
-            })();
+            const module = undefined;
+__GEMINI_TURN_PROJECTION_JS__
+            const conversationId = isGemini
+                ? geminiConversationId(window.location)
+                : (() => {
+                    const match = window.location.pathname.match(/^\/(?:c|app)\/([^/?#]+)/);
+                    return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
+                })();
             const assistantGroups = turnGroups(assistantSelector);
             const userGroups = turnGroups(userSelector);
             const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
             const contentNodes = latestGroup ? latestGroup.nodes : [];
             const latest = contentNodes[contentNodes.length - 1] || null;
-            const identity = turnIdentity(latestGroup);
+            const identity = isGemini ? geminiTurnIdentity(latestGroup) : turnIdentity(latestGroup);
             const turnId = identity.turnId;
             const artifactIds = identity.artifactIds;
             const loadedImages = [];
-            const seenImageSources = new Set();
-            for (const node of contentNodes) {
-                for (const img of Array.from(node.querySelectorAll('img')).filter(isLargeLoadedImage)) {
-                    const src = img.currentSrc || img.src || '';
-                    if (seenImageSources.has(src)) continue;
-                    seenImageSources.add(src);
+            let geminiImageCandidates = [];
+            if (isGemini) {
+                geminiImageCandidates = findGeminiFinalGeneratedImages(latestGroup, minimumImageDimension);
+                for (const img of geminiImageCandidates) {
                     loadedImages.push(img);
+                }
+            } else {
+                const seenImageSources = new Set();
+                for (const node of contentNodes) {
+                    for (const img of Array.from(node.querySelectorAll('img')).filter(isLargeLoadedImage)) {
+                        const src = img.currentSrc || img.src || '';
+                        if (seenImageSources.has(src)) continue;
+                        seenImageSources.add(src);
+                        loadedImages.push(img);
+                    }
                 }
             }
             const generationControl = stopSelectors
@@ -13319,10 +15074,13 @@ __TURN_IDENTITY_JS__
             // ChatGPT marks a streaming turn as in_progress until the final
             // answer is complete. The stop button can disappear before the last
             // tokens render, so the turn state is part of the same signal.
-            const turnStates = document.querySelectorAll('[data-talvt-turn-state]');
+            const turnStates = isGemini ? [] : document.querySelectorAll('[data-talvt-turn-state]');
             const latestTurnState = turnStates.length > 0
                 ? turnStates[turnStates.length - 1].getAttribute('data-talvt-turn-state')
                 : '';
+            const generationControlVisible = isGemini
+                ? isGeminiGenerating(document, latestGroup, stopSelectors, isVisibleControl)
+                : (Boolean(generationControl) || latestTurnState === 'in_progress');
             const latestText = contentNodes.map((node) => node.textContent || '').join('\n');
             const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i;
             const visibleProviderAlerts = Array.from(document.querySelectorAll('[role="alert"]'))
@@ -13349,7 +15107,7 @@ __TURN_IDENTITY_JS__
                 artifact_ids: artifactIds,
                 user_count: userGroups.length,
                 assistant_count: assistantGroups.length,
-                generation_control_visible: Boolean(generationControl) || latestTurnState === 'in_progress',
+                generation_control_visible: generationControlVisible,
                 content_present: Boolean((latestText || '').trim().length > 0 || loadedImages.length > 0),
                 content_text_length: (latestText || '').trim().length,
                 provider_failure_visible: providerFailureVisible,
@@ -13357,14 +15115,17 @@ __TURN_IDENTITY_JS__
                     ? textSignature(providerFailureText.trim())
                     : '',
                 loaded_large_image_count: loadedImages.length,
+                image_candidates: isGemini ? geminiImageCandidates : [],
                 dom_signature: domSignature(contentNodes)
             };
         }"#
     .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
     .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
     .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__IS_GEMINI__", is_gemini)
     .replace("__CANONICAL_TURN_GROUP_JS__", CANONICAL_TURN_GROUP_JS)
     .replace("__TURN_IDENTITY_JS__", TURN_IDENTITY_JS)
+    .replace("__GEMINI_TURN_PROJECTION_JS__", include_str!("gemini_turn_projection.js"))
     .replace(
         "__MINIMUM_IMAGE_DIMENSION__",
         &GENERATED_IMAGE_MIN_DIMENSION.to_string(),
@@ -13724,7 +15485,7 @@ fn ensure_isolated_provider_tab(
     call_mcp_tool_raw(
         config_path,
         "new_page",
-        isolated_new_page_args(&provider.home_url(), background_tab),
+        isolated_new_page_args(provider.home_url(), background_tab),
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -13768,15 +15529,15 @@ fn ensure_isolated_provider_tab(
         )?;
         bind_owned_page(&session_id, page_id)?;
         let receipt_path = write_session_receipt(
+            provider,
             &session_id,
             attachment_summary.count(),
             attachment_summary.total_bytes,
             expected_output_type,
         )
-        .map_err(|error| {
+        .inspect_err(|_| {
             emit_structured_diagnostic(StructuredDiagnosticCode::SessionReceiptFailed);
             clear_owned_page();
-            error
         })?;
         if verbose {
             println!(
@@ -14277,6 +16038,237 @@ fn main() {
     }
 }
 
+fn atomic_write_text_output(path: &Path, content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Err("Text output content was empty".to_string());
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to create temp output file: {}", e))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write temp output file: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to restrict temp output file permissions: {}", e))?;
+        }
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync temp output file: {}", e))?;
+        drop(file);
+        std::fs::rename(&temp_path, path)
+            .map_err(|e| format!("Failed to publish output file: {}", e))?;
+        let persisted_bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to verify output file readback: {}", e))?;
+        if persisted_bytes != content.as_bytes() {
+            return Err("Persisted output file bytes did not match written content".to_string());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn build_verified_gemini_markdown_script(
+    baseline: &ResponseBaseline,
+    identity: &VerifiedResponseIdentity,
+) -> Result<String, String> {
+    let token_json = serde_json::to_string(&baseline.ownership_token)
+        .map_err(|_| "Failed to serialize response ownership token".to_string())?;
+    let home_url_json = serde_json::to_string(Provider::Gemini.home_url())
+        .map_err(|_| "Failed to serialize Gemini URL".to_string())?;
+    let assistant_selector = serde_json::to_string(Provider::Gemini.assistant_selector())
+        .map_err(|_| "Failed to serialize Gemini assistant selector".to_string())?;
+    let user_selector = serde_json::to_string(Provider::Gemini.user_selector())
+        .map_err(|_| "Failed to serialize Gemini user selector".to_string())?;
+    let content_selector = serde_json::to_string(Provider::Gemini.response_content_selector())
+        .map_err(|_| "Failed to serialize Gemini content selector".to_string())?;
+    let expected_json = serde_json::json!({
+        "conversation_id": identity.conversation_id,
+        "turn_id": identity.turn_id,
+        "artifact_ids": identity.artifact_ids,
+        "user_count": identity.user_count,
+        "assistant_count": identity.assistant_count,
+        "dom_signature": identity.dom_signature,
+    });
+    let expected_str = serde_json::to_string(&expected_json)
+        .map_err(|_| "Failed to serialize expected Gemini identity".to_string())?;
+    Ok(r#"() => {
+        const stopSelectors = __STOP_SELECTORS__;
+        const assistantSelector = __ASSISTANT_SELECTOR__;
+        const userSelector = __USER_SELECTOR__;
+        const contentSelector = __CONTENT_SELECTOR__;
+        const expected = __EXPECTED_IDENTITY__;
+        const isVisibleControl = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const domSignature = (elements) => {
+            let length = 0;
+            let hash = 2166136261;
+            for (const element of elements || []) {
+                const source = element ? (element.innerHTML || '') : '';
+                length += source.length;
+                for (let index = 0; index < source.length; index += 1) {
+                    hash ^= source.charCodeAt(index);
+                    hash = Math.imul(hash, 16777619);
+                }
+            }
+            return `${length}:${(hash >>> 0).toString(16)}`;
+        };
+__CANONICAL_TURN_GROUP_JS__
+        const module = undefined;
+__GEMINI_TURN_PROJECTION_JS__
+        const verifySnapshot = () => {
+            let originOk = false;
+            try { originOk = window.location.origin === new URL(__PROVIDER_HOME_URL__).origin; } catch (_) { originOk = false; }
+            if (window.__ask_bridge_response_owner_v1 !== __TOKEN__ || !originOk) {
+                return { ok: false, failure: 'identity_changed', reason: 'ownership_or_origin_mismatch' };
+            }
+            const conversationId = geminiConversationId(window.location);
+            const assistantGroups = turnGroups(assistantSelector);
+            const userGroups = turnGroups(userSelector);
+            const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
+            const contentNodes = latestGroup ? latestGroup.nodes : [];
+            const id = geminiTurnIdentity(latestGroup);
+            if (isGeminiGenerating(document, latestGroup, stopSelectors, isVisibleControl)) {
+                return { ok: false, failure: 'identity_changed', reason: 'still_generating' };
+            }
+            if (userGroups.length !== expected.user_count || assistantGroups.length !== expected.assistant_count) {
+                return { ok: false, failure: 'identity_changed', reason: 'turn_counts_changed' };
+            }
+            if (!id.turnId || id.turnId !== expected.turn_id || conversationId !== expected.conversation_id) {
+                return { ok: false, failure: 'identity_changed', reason: 'turn_identity_mismatch' };
+            }
+            if (JSON.stringify(id.artifactIds) !== JSON.stringify(expected.artifact_ids || [])) {
+                return { ok: false, failure: 'identity_changed', reason: 'artifact_ids_changed' };
+            }
+            const sig = domSignature(contentNodes);
+            if (!sig || sig !== expected.dom_signature) {
+                return { ok: false, failure: 'identity_changed', reason: 'dom_signature_changed' };
+            }
+            return { ok: true, contentNodes };
+        };
+        const before = verifySnapshot();
+        if (!before.ok) return before;
+        const chunks = [];
+        for (const node of before.contentNodes) {
+            const target = contentSelector ? (node.querySelector(contentSelector) || node) : node;
+            const chunk = geminiElementToMarkdown(target);
+            if (chunk && chunk.trim()) chunks.push(chunk.trim());
+        }
+        const after = verifySnapshot();
+        if (!after.ok) return after;
+        const markdown = chunks.join('\n\n').trim();
+        if (!markdown) {
+            return { ok: false, failure: 'empty', reason: 'empty_markdown' };
+        }
+        return { ok: true, markdown };
+    }"#
+    .replace("__STOP_SELECTORS__", Provider::Gemini.stop_button_selectors_json())
+    .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+    .replace("__USER_SELECTOR__", &user_selector)
+    .replace("__CONTENT_SELECTOR__", &content_selector)
+    .replace("__EXPECTED_IDENTITY__", &expected_str)
+    .replace("__CANONICAL_TURN_GROUP_JS__", CANONICAL_TURN_GROUP_JS)
+    .replace("__GEMINI_TURN_PROJECTION_JS__", include_str!("gemini_turn_projection.js"))
+    .replace("__PROVIDER_HOME_URL__", &home_url_json)
+    .replace("__TOKEN__", &token_json))
+}
+
+fn extract_verified_gemini_markdown(
+    config_path: &str,
+    verified_response: Option<(&ResponseBaseline, &VerifiedResponseIdentity)>,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<String, ResponseFailureCode> {
+    let Some((baseline, identity)) = verified_response else {
+        return Err(ResponseFailureCode::ResponseIdentityChanged);
+    };
+    if identity.turn_id.trim().is_empty() || identity.conversation_id.trim().is_empty() {
+        return Err(ResponseFailureCode::ResponseIdentityChanged);
+    }
+    let script = build_verified_gemini_markdown_script(baseline, identity)
+        .map_err(|_| ResponseFailureCode::TextExtractionFailed)?;
+    let res = call_mcp_tool_with_deadline(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": script }),
+        deadline,
+    )
+    .map_err(|_| ResponseFailureCode::TextExtractionFailed)?;
+    let value = parse_script_result(&res).map_err(|_| ResponseFailureCode::TextExtractionFailed)?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        if value.get("failure").and_then(Value::as_str) == Some("identity_changed") {
+            return Err(ResponseFailureCode::ResponseIdentityChanged);
+        }
+        return Err(ResponseFailureCode::TextExtractionFailed);
+    }
+    let markdown = value
+        .get("markdown")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if markdown.trim().is_empty() {
+        return Err(ResponseFailureCode::TextExtractionFailed);
+    }
+    Ok(markdown)
+}
+
+fn verify_gemini_text_identity_unchanged(
+    config_path: &str,
+    probe_script: &str,
+    expected: &VerifiedResponseIdentity,
+    deadline: Option<McpOperationDeadline>,
+) -> Result<(), ResponseFailureCode> {
+    let check_res = call_mcp_tool_with_deadline(
+        config_path,
+        "evaluate_script",
+        serde_json::json!({ "function": probe_script }),
+        deadline,
+    )
+    .map_err(|_| ResponseFailureCode::ResponseProbeFailed)?;
+    let value =
+        parse_script_result(&check_res).map_err(|_| ResponseFailureCode::ResponseProbeFailed)?;
+    let probe: ResponseDomProbe =
+        serde_json::from_value(value).map_err(|_| ResponseFailureCode::ResponseProbeFailed)?;
+    if !probe.ownership_token_matches
+        || !probe.provider_url_owned
+        || probe.user_count != expected.user_count
+        || probe.assistant_count != expected.assistant_count
+        || probe.conversation_id != expected.conversation_id
+        || (!expected.turn_id.is_empty() && probe.turn_id != expected.turn_id)
+        || (!expected.artifact_ids.is_empty() && probe.artifact_ids != expected.artifact_ids)
+    {
+        return Err(ResponseFailureCode::ResponseIdentityChanged);
+    }
+    Ok(())
+}
+
 fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = Cli::parse();
     if cli.command.is_none() {
@@ -14402,19 +16394,32 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let background_tab = resolve_background_tab(cli.background_tab, is_headless, is_login);
 
     if matches!(cli.command, Some(Commands::Close)) {
-        let profile_path = match chrome_profile_path() {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("Error locating Chrome profile: {}", e);
-                std::process::exit(1);
-            }
-        };
+        match try_acquire_chrome_instance_exclusive_lock() {
+            Ok(Some(_close_lock)) => {
+                let profile_path = match chrome_profile_path() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        eprintln!("Error locating Chrome profile: {}", e);
+                        std::process::exit(1);
+                    }
+                };
 
-        match close_ask_chrome_on_debug_port(&profile_path) {
-            Ok(true) => println!("Closed ask-bridge Chrome browser instance."),
-            Ok(false) => println!("No ask-bridge Chrome browser instance is running."),
+                match close_ask_chrome_on_debug_port(&profile_path) {
+                    Ok(true) => println!("Closed ask-bridge Chrome browser instance."),
+                    Ok(false) => println!("No ask-bridge Chrome browser instance is running."),
+                    Err(e) => {
+                        eprintln!("Error closing ask-bridge Chrome browser instance: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Ok(None) => {
+                println!(
+                    "Skipped closing ask-bridge Chrome: another ask-bridge session is active."
+                );
+            }
             Err(e) => {
-                eprintln!("Error closing ask-bridge Chrome browser instance: {}", e);
+                eprintln!("Error checking active ask-bridge Chrome sessions: {}", e);
                 std::process::exit(1);
             }
         }
@@ -14433,6 +16438,15 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             emit_structured_diagnostic(StructuredDiagnosticCode::RuntimePreflightFailed);
             eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let _chrome_instance_lock = match acquire_chrome_instance_shared_lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            emit_structured_diagnostic(StructuredDiagnosticCode::LeaseUnavailable);
+            eprintln!("Error acquiring shared Chrome instance lock: {}", e);
             std::process::exit(1);
         }
     };
@@ -14854,31 +16868,62 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify login
     match check_login_status(&config_path, provider, command_verbose) {
+        Ok(LoginState::LoggedIn) => {}
         Ok(LoginState::LoggedOut) => {
-            eprintln!(
-                "\nError: You are not logged in to {}.",
-                provider.display_name()
-            );
-            eprintln!(
-                "Please run `ask-bridge --provider {} login` to log in manually first, and then run your query again.\n",
-                provider
-            );
+            if provider == Provider::Gemini && safe_session_id.is_some() {
+                if let Some(path) = receipt_path.as_deref() {
+                    let _ = record_auth_failed(path, GEMINI_AUTH_FAILURE_CODE);
+                }
+                eprintln!(
+                    "Error: {}: Gemini login state is logged_out.",
+                    GEMINI_AUTH_FAILURE_CODE
+                );
+            } else {
+                eprintln!(
+                    "\nError: You are not logged in to {}.",
+                    provider.display_name()
+                );
+                eprintln!(
+                    "Please run `ask-bridge --provider {} login` to log in manually first, and then run your query again.\n",
+                    provider
+                );
+            }
             std::process::exit(1);
         }
         Ok(LoginState::Unknown) => {
+            if provider == Provider::Gemini && safe_session_id.is_some() {
+                if let Some(path) = receipt_path.as_deref() {
+                    let _ = record_auth_failed(path, GEMINI_AUTH_FAILURE_CODE);
+                }
+                eprintln!(
+                    "Error: {}: Could not confirm positive Gemini login state in isolated mode.",
+                    GEMINI_AUTH_FAILURE_CODE
+                );
+                std::process::exit(1);
+            }
             eprintln!(
                 "Warning: Could not confirm the {} account menu. Attempting to proceed...",
                 provider.display_name()
             );
         }
-        Ok(LoginState::LoggedIn) => {}
-        Err(e) if command_verbose => {
-            eprintln!(
-                "Warning: Failed to verify login status: {}. Attempting to proceed...",
-                e
-            );
+        Err(e) => {
+            if provider == Provider::Gemini && safe_session_id.is_some() {
+                if let Some(path) = receipt_path.as_deref() {
+                    let _ = record_auth_failed(path, GEMINI_AUTH_FAILURE_CODE);
+                }
+                eprintln!(
+                    "Error: {}: Failed to verify Gemini login status: {}",
+                    GEMINI_AUTH_FAILURE_CODE, e
+                );
+                std::process::exit(1);
+            }
+            if command_verbose {
+                eprintln!(
+                    "Warning: Failed to verify login status: {}. Attempting to proceed...",
+                    e
+                );
+            }
         }
-        Err(_) => {}
     }
 
     if provider == Provider::ChatGpt {
@@ -14892,28 +16937,33 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_selection_outcome = None;
     for m in &cli.model {
         match switch_model(&config_path, provider, m, command_verbose) {
-            Ok(outcome) if provider == Provider::ChatGpt => {
+            Ok(outcome) if matches!(provider, Provider::ChatGpt | Provider::Gemini) => {
                 model_selection_outcome = Some(outcome);
             }
             Ok(_) => {}
             Err(error) => {
-                if provider == Provider::ChatGpt {
+                if matches!(provider, Provider::ChatGpt | Provider::Gemini) {
+                    let failure_code = if provider == Provider::Gemini {
+                        GEMINI_MODEL_SELECTION_FAILURE_CODE
+                    } else {
+                        MODEL_SELECTION_FAILURE_CODE
+                    };
                     if let Some(path) = receipt_path.as_deref()
-                        && let Err(receipt_error) = record_model_selection_failed(path)
+                        && let Err(receipt_error) =
+                            record_model_selection_failed_for_provider(path, provider)
                     {
                         eprintln!(
                             "Error switching model '{}': {} (receipt failed: {})",
-                            m, MODEL_SELECTION_FAILURE_CODE, receipt_error
+                            m, failure_code, receipt_error
                         );
                         std::process::exit(1);
                     }
-                    if let Ok(cleanup_json) = serde_json::to_string(m.trim()) {
+                    if provider == Provider::ChatGpt
+                        && let Ok(cleanup_json) = serde_json::to_string(m.trim())
+                    {
                         best_effort_close_reasoning_menu(&config_path, &cleanup_json);
                     }
-                    eprintln!(
-                        "Error switching model '{}': {}: {}",
-                        m, MODEL_SELECTION_FAILURE_CODE, error
-                    );
+                    eprintln!("Error switching model '{}': {}: {}", m, failure_code, error);
                 } else {
                     eprintln!("Error switching model '{}': {}", m, error);
                 }
@@ -14944,7 +16994,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             &attachment_summary,
             command_verbose,
         ) {
-            Ok(summary) => {
+            Ok((summary, _baseline)) => {
                 if let Some(ref probe) = summary {
                     if let Some(path) = receipt_path.as_deref() {
                         // Drive the receipt state machine first so the
@@ -14979,10 +17029,12 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let attachment_baseline_cell: std::cell::RefCell<Option<AttachmentBaseline>> =
+        std::cell::RefCell::new(None);
     let submission_result = execute_verified_prompt_submission(
         receipt_path.as_deref(),
         || {
-            let probe_summary = upload_attachments_to_provider(
+            let (probe_summary, captured_baseline) = upload_attachments_to_provider(
                 &config_path,
                 provider,
                 &cli.images,
@@ -14990,6 +17042,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 &attachment_summary,
                 command_verbose,
             )?;
+            *attachment_baseline_cell.borrow_mut() = Some(captured_baseline);
             // Persist the additive attachment_probe receipt fields for typed
             // mixed attachment diagnostics.  The receipt's
             // attachment_verification/prompt_submission state machine is
@@ -15006,8 +17059,17 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             if command_verbose {
                 println!("Setting prompt text and submitting...");
             }
-            submit_prompt_to_provider(&config_path, provider, &prompt, command_verbose)
-                .map_err(|error| error.with_context("Text entry or submission failed"))
+            let captured_baseline = attachment_baseline_cell.borrow();
+            submit_prompt_to_provider(
+                &config_path,
+                provider,
+                &prompt,
+                captured_baseline.as_ref(),
+                &attachment_summary.file_names,
+                cli.images.len(),
+                command_verbose,
+            )
+            .map_err(|error| error.with_context("Text entry or submission failed"))
         },
     );
     let (response_baseline, status) = match submission_result {
@@ -15030,7 +17092,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut spinner_idx = 0;
     let response_deadline = McpOperationDeadline::from_timeout(Duration::from_secs(cli.timeout))?;
     let response_probe_script = build_response_probe_script(provider, &response_baseline)?;
-    let mut response_tracker = ResponseCompletionTracker::new(
+    let mut response_tracker = ResponseCompletionTracker::new_for_provider(
+        provider,
         expected_output_type,
         response_baseline.initial_user_count,
         response_baseline.initial_assistant_count,
@@ -15095,40 +17158,40 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(backend_probe_script) = backend_probe_script.as_deref() {
             backend_probe_tick = backend_probe_tick.saturating_add(1);
-            if backend_probe_tick % BACKEND_RESPONSE_POLL_TICKS == 0 {
-                if let Ok(backend_probe) = fetch_backend_response_probe(
+            if backend_probe_tick.is_multiple_of(BACKEND_RESPONSE_POLL_TICKS)
+                && let Ok(backend_probe) = fetch_backend_response_probe(
                     &config_path,
                     backend_probe_script,
                     Some(response_deadline),
+                )
+            {
+                match assess_backend_response_probe(
+                    &backend_probe,
+                    response_baseline.initial_user_count,
                 ) {
-                    match assess_backend_response_probe(
-                        &backend_probe,
-                        response_baseline.initial_user_count,
-                    ) {
-                        BackendResponseDecision::Pending => {}
-                        BackendResponseDecision::Completed(text) => {
-                            break ResponseWaitOutcome::BackendText(text);
+                    BackendResponseDecision::Pending => {}
+                    BackendResponseDecision::Completed(text) => {
+                        break ResponseWaitOutcome::BackendText(text);
+                    }
+                    BackendResponseDecision::Unknown(code) => {
+                        if command_verbose {
+                            eprintln!(
+                                "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
+                                code,
+                                backend_probe.user_count,
+                                backend_probe.answer_count,
+                                backend_probe.answers_after_last_user,
+                                backend_probe.last_assistant_status
+                            );
                         }
-                        BackendResponseDecision::Unknown(code) => {
-                            if command_verbose {
-                                eprintln!(
-                                    "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
-                                    code,
-                                    backend_probe.user_count,
-                                    backend_probe.answer_count,
-                                    backend_probe.answers_after_last_user,
-                                    backend_probe.last_assistant_status
-                                );
-                            }
-                            break ResponseWaitOutcome::Unknown(code);
-                        }
+                        break ResponseWaitOutcome::Unknown(code);
                     }
                 }
-                // A failed backend poll is never terminal on its own: the
-                // DOM tracker stays the primary completion signal until the
-                // deadline, and a transient fetch error is retried on the
-                // next cadence tick.
             }
+            // A failed backend poll is never terminal on its own: the
+            // DOM tracker stays the primary completion signal until the
+            // deadline, and a transient fetch error is retried on the
+            // next cadence tick.
         }
 
         let remaining = response_deadline
@@ -15200,7 +17263,11 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    if let Some(path) = receipt_path.as_deref() {
+    let strict_text_completion_gate = expected_output_type == ExpectedOutputType::Text
+        && (provider == Provider::Gemini || cli.output.is_some());
+    if (expected_output_type == ExpectedOutputType::Image || !strict_text_completion_gate)
+        && let Some(path) = receipt_path.as_deref()
+    {
         record_session_response_outcome(
             path,
             ResponseCompletion::Completed,
@@ -15215,6 +17282,32 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         // for this response; the toolbar copy button is skipped entirely so
         // the result never depends on window focus or clipboard state.
         last_markdown = text;
+    } else if provider == Provider::Gemini {
+        // R6: Gemini formal/isolated queries never read/write the system clipboard;
+        // extract verified structured DOM->Markdown locked to the completed turn identity.
+        match extract_verified_gemini_markdown(
+            &config_path,
+            verified_response
+                .as_ref()
+                .map(|identity| (&response_baseline, identity)),
+            Some(response_deadline),
+        ) {
+            Ok(content) => {
+                last_markdown = content;
+            }
+            Err(code) => {
+                if let Some(path) = receipt_path.as_deref() {
+                    record_session_response_outcome(
+                        path,
+                        ResponseCompletion::Unknown,
+                        0,
+                        Some(code),
+                    )
+                    .map_err(|_| "Gemini text extraction failed, and receipt audit failed")?;
+                }
+                return Err(format!("Gemini verified text extraction failed ({code})").into());
+            }
+        }
     } else {
         if command_verbose {
             println!(
@@ -15234,31 +17327,83 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        if last_markdown.trim().is_empty() {
+        if last_markdown.trim().is_empty()
+            && let Some(backend_probe_script) = backend_probe_script.as_deref()
+            && let Ok(backend_probe) = fetch_backend_response_probe(
+                &config_path,
+                backend_probe_script,
+                Some(response_deadline),
+            )
+            && let BackendResponseDecision::Completed(text) =
+                assess_backend_response_probe(&backend_probe, response_baseline.initial_user_count)
+        {
             // The DOM completed but the toolbar copy and DOM scrape both came
             // back empty (for example a lazy renderer plus an unfocused
             // clipboard).  Ask the backend conversation API once more before
             // giving up on the text.
-            if let Some(backend_probe_script) = backend_probe_script.as_deref() {
-                if let Ok(backend_probe) = fetch_backend_response_probe(
-                    &config_path,
-                    backend_probe_script,
-                    Some(response_deadline),
-                ) {
-                    if let BackendResponseDecision::Completed(text) = assess_backend_response_probe(
-                        &backend_probe,
-                        response_baseline.initial_user_count,
-                    ) {
-                        if command_verbose {
-                            println!(
-                                "Falling back to ChatGPT backend conversation text ({} bytes).",
-                                text.len()
-                            );
-                        }
-                        last_markdown = text;
-                    }
-                }
+            if command_verbose {
+                println!(
+                    "Falling back to ChatGPT backend conversation text ({} bytes).",
+                    text.len()
+                );
             }
+            last_markdown = text;
+        }
+    }
+
+    if strict_text_completion_gate {
+        if provider == Provider::Gemini
+            && let Some(identity) = verified_response.as_ref()
+            && let Err(code) = verify_gemini_text_identity_unchanged(
+                &config_path,
+                &response_probe_script,
+                identity,
+                Some(response_deadline),
+            )
+        {
+            if let Some(path) = receipt_path.as_deref() {
+                record_session_response_outcome(path, ResponseCompletion::Unknown, 0, Some(code))
+                    .map_err(|_| "Text extraction identity drift, and receipt audit failed")?;
+            }
+            return Err(format!("Verified text response identity changed ({code})").into());
+        }
+        if last_markdown.trim().is_empty() {
+            if let Some(path) = receipt_path.as_deref() {
+                record_session_response_outcome(
+                    path,
+                    ResponseCompletion::Unknown,
+                    0,
+                    Some(ResponseFailureCode::TextExtractionFailed),
+                )
+                .map_err(|_| "Text extraction returned empty, and receipt audit failed")?;
+            }
+            return Err("Text response extraction returned empty content".into());
+        }
+        if let Some(ref output_path) = cli.output {
+            if let Err(err) = atomic_write_text_output(Path::new(output_path), &last_markdown) {
+                if let Some(path) = receipt_path.as_deref() {
+                    record_session_response_outcome(
+                        path,
+                        ResponseCompletion::Unknown,
+                        0,
+                        Some(ResponseFailureCode::TextExtractionFailed),
+                    )
+                    .map_err(|_| "Output write failed, and receipt audit failed")?;
+                }
+                return Err(format!("Failed to write verified output file: {}", err).into());
+            }
+            if command_verbose {
+                println!("Successfully wrote Markdown response to {}", output_path);
+            }
+        }
+        if let Some(path) = receipt_path.as_deref() {
+            record_session_response_outcome(
+                path,
+                ResponseCompletion::Completed,
+                downloaded_image_count,
+                None,
+            )
+            .map_err(|_| "Failed to persist final response receipt")?;
         }
     }
 
@@ -15286,7 +17431,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(ref output_path) = cli.output {
+    if !strict_text_completion_gate && let Some(ref output_path) = cli.output {
         if let Err(e) = std::fs::write(output_path, &last_markdown) {
             eprintln!("Error writing output file: {}", e);
         } else if command_verbose {
@@ -15298,10 +17443,10 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     // supporting, non-gating step: any failure is sanitised to a warning and
     // never changes the success receipt, downloaded images, output files, or
     // process exit success.
-    if let Some(path) = receipt_path.as_deref() {
-        if let Some(warning) = run_owned_tab_cleanup_warning(&config_path, Some(path)) {
-            eprintln!("{}", warning);
-        }
+    if let Some(path) = receipt_path.as_deref()
+        && let Some(warning) = run_owned_tab_cleanup_warning(&config_path, Some(path))
+    {
+        eprintln!("{}", warning);
     }
 
     Ok(())

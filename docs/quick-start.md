@@ -124,15 +124,16 @@ cat README.md | ask-bridge "摘要這份文件。"
 
 ## 附上圖片或文件
 
-`ask-bridge` 支援把本機檔案當作附件直接上傳給所選 provider，不必透過 pipe 把內容塞進 prompt。Gemini 目前支援 `--file` 文件附件；`--image` 圖片輸入目前支援 ChatGPT 與 Claude。
+`ask-bridge` 支援把本機檔案當作附件直接上傳給所選 provider，不必透過 pipe 把內容塞進 prompt。ChatGPT、Gemini 與 Claude 皆支援 `--file` 與 `--image`（含混合附件）；Gemini 實作兩階段 target-locked CDP Trusted 上傳，並於 Phase 0B 實頁驗收通過前暫不在執行期 `capabilities` 宣告 `verified_gemini_image_workflow_v1`。
 
 ### 附上圖片
 
-使用 `--image`（可重複指定）。此功能目前支援 ChatGPT 與 Claude；搭配 `--provider gemini` 使用會立即回報錯誤。
+使用 `--image`（可重複指定）。支援 ChatGPT、Gemini 與 Claude。
 
 ```sh
 ask-bridge "請描述這張圖片。" --image screenshot.png
 ask-bridge "比較這兩張圖。" --image v1.png --image v2.png
+ask-bridge --provider gemini "請對照這張風格參考圖與文件。" --image style.png --file spec.md
 ```
 
 ### 附上文件
@@ -178,7 +179,7 @@ ask-bridge --provider claude "用幾句話介紹 Rust。" --model Sonnet
 ask-bridge close
 ```
 
-`close` 只會關閉使用本專案專屬 Chrome profile 且監聽 debug port `9223` 的瀏覽器 instance；如果沒有執行中的 `ask-bridge` Chrome，會直接回報沒有 instance 正在執行。
+`close` 只會關閉使用本專案專屬 Chrome profile 且監聽 debug port `9223` 的瀏覽器 instance；如果沒有執行中的 `ask-bridge` Chrome，會直接回報沒有 instance 正在執行。若仍有其他使用 `chrome-instance.flock` 共享鎖的 `ask-bridge` 工作在執行中，`close` 會安全略過關閉 Chrome，避免中斷其他進行中的工作。
 
 ## MCP 行為
 
