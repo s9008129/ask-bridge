@@ -162,6 +162,7 @@ const ATTACHMENT_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ATTACHMENT_REQUIRED_STABLE_PROBES: usize = 2;
 const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RESPONSE_REQUIRED_STABLE_PROBES: usize = 3;
+const GEMINI_IMAGE_TEXT_ONLY_STALL_PROBES: usize = 90;
 /// Minimum text content length (in bytes of trimmed textContent) for a text
 /// response to be considered complete.  ChatGPT sometimes shows short
 /// processing-status text (e.g. "Reading Schema For JSON Deck Plan
@@ -1252,6 +1253,8 @@ struct ResponseCompletionTracker {
     stable_probes: usize,
     provider_failure_signature: Option<String>,
     provider_failure_probes: usize,
+    text_only_stall_signature: Option<String>,
+    text_only_stall_probes: usize,
     was_generating: bool,
     terminal: Option<ResponseTrackerDecision>,
 }
@@ -1304,6 +1307,8 @@ impl ResponseCompletionTracker {
             stable_probes: 0,
             provider_failure_signature: None,
             provider_failure_probes: 0,
+            text_only_stall_signature: None,
+            text_only_stall_probes: 0,
             was_generating: false,
             terminal: None,
         }
@@ -1495,6 +1500,29 @@ impl ResponseCompletionTracker {
                     .response_image_candidates
                     .as_ref()
                     .is_some_and(|items| !items.is_empty());
+            if has_turn_identity
+                && has_conversation_identity
+                && self.expected_output_type == ExpectedOutputType::Image
+                && probe.loaded_large_image_count == 0
+                && probe.image_candidates.is_empty()
+                && !probe.generation_control_visible
+                && probe.content_present
+                && probe.content_text_length > 0
+                && !probe.dom_signature.is_empty()
+            {
+                if self.text_only_stall_signature.as_deref() == Some(probe.dom_signature.as_str()) {
+                    self.text_only_stall_probes = self.text_only_stall_probes.saturating_add(1);
+                } else {
+                    self.text_only_stall_signature = Some(probe.dom_signature.clone());
+                    self.text_only_stall_probes = 1;
+                }
+                if self.text_only_stall_probes >= GEMINI_IMAGE_TEXT_ONLY_STALL_PROBES {
+                    return self.finish_unknown(ResponseFailureCode::ProviderRejected);
+                }
+                return ResponseTrackerDecision::Pending;
+            }
+            self.text_only_stall_signature = None;
+            self.text_only_stall_probes = 0;
             if !has_turn_identity || !has_conversation_identity || !has_image_candidates {
                 self.reset_stability();
                 return ResponseTrackerDecision::Pending;
@@ -1557,6 +1585,8 @@ impl ResponseCompletionTracker {
         self.stable_probes = 0;
         self.provider_failure_signature = None;
         self.provider_failure_probes = 0;
+        self.text_only_stall_signature = None;
+        self.text_only_stall_probes = 0;
     }
 }
 
@@ -5490,6 +5520,16 @@ mod tests {
         }
     }
 
+    fn gemini_image_text_probe(signature: &str) -> ResponseDomProbe {
+        let mut probe = response_probe(1, false, 0, signature);
+        probe.url = "https://gemini.google.com/app/conv-s05".to_string();
+        probe.conversation_id = "conversation:conv-s05".to_string();
+        probe.turn_id = "resp-s05".to_string();
+        probe.content_present = true;
+        probe.content_text_length = "身为一个语言模型，我没办法提供这方面的帮助。".len();
+        probe
+    }
+
     #[test]
     fn image_completion_waits_for_loaded_artifact_after_assistant_and_stop_disappear() {
         let mut tracker = ResponseCompletionTracker::new(ExpectedOutputType::Image, 0, 4);
@@ -5697,6 +5737,114 @@ mod tests {
             tracker.observe(rejected),
             ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
         );
+    }
+
+    #[test]
+    fn gemini_image_provider_rejection_fails_on_the_third_probe() {
+        let mut tracker = ResponseCompletionTracker::new_for_provider(
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        let mut rejected = gemini_image_text_probe("gemini-refusal-dom");
+        rejected.provider_failure_visible = true;
+        rejected.provider_failure_signature = "gemini-refusal-signature".to_string();
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(rejected),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn gemini_image_text_only_stall_fails_at_ninety_probes_and_resets_on_change() {
+        let mut stalled = ResponseCompletionTracker::new_for_provider(
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        let text_only = gemini_image_text_probe("gemini-text-only");
+        for probe_index in 1..GEMINI_IMAGE_TEXT_ONLY_STALL_PROBES {
+            assert_eq!(
+                stalled.observe(text_only.clone()),
+                ResponseTrackerDecision::Pending,
+                "probe {probe_index} must remain pending"
+            );
+        }
+        assert_eq!(
+            stalled.observe(text_only),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+
+        let mut resetting = ResponseCompletionTracker::new_for_provider(
+            Provider::Gemini,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                resetting.observe(gemini_image_text_probe("gemini-text-stable")),
+                ResponseTrackerDecision::Pending
+            );
+        }
+        assert_eq!(resetting.text_only_stall_probes, 5);
+        assert_eq!(
+            resetting.observe(gemini_image_text_probe("gemini-text-changed")),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(resetting.text_only_stall_probes, 1);
+        let mut generating = gemini_image_text_probe("gemini-text-changed");
+        generating.generation_control_visible = true;
+        assert_eq!(
+            resetting.observe(generating),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(resetting.text_only_stall_probes, 0);
+        assert_eq!(resetting.text_only_stall_signature, None);
+
+        let mut chatgpt = ResponseCompletionTracker::new_for_provider(
+            Provider::ChatGpt,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        for _ in 0..GEMINI_IMAGE_TEXT_ONLY_STALL_PROBES {
+            assert_eq!(
+                chatgpt.observe(gemini_image_text_probe("chatgpt-text-only")),
+                ResponseTrackerDecision::Pending
+            );
+        }
+
+        let mut gemini_text = ResponseCompletionTracker::new_for_provider(
+            Provider::Gemini,
+            ExpectedOutputType::Text,
+            0,
+            0,
+        );
+        let mut text_output = gemini_image_text_probe("gemini-text-output");
+        text_output.content_text_length = 1000;
+        assert_eq!(
+            gemini_text.observe(text_output.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            gemini_text.observe(text_output.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert!(matches!(
+            gemini_text.observe(text_output),
+            ResponseTrackerDecision::Completed(_)
+        ));
     }
 
     #[test]
@@ -6335,6 +6483,154 @@ writeStreamFlushed(process.stdout, payload)
         assert!(!script.contains("__TOKEN__"));
         assert!(!script.contains("__ASSISTANT_SELECTOR__"));
         assert!(!script.contains("__USER_SELECTOR__"));
+    }
+
+    #[test]
+    fn gemini_response_probe_detects_short_refusal_without_matching_long_or_json_outputs() {
+        let script = build_response_probe_script(
+            Provider::Gemini,
+            &ResponseBaseline {
+                initial_user_count: 0,
+                initial_assistant_count: 0,
+                ownership_token: "response-token".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(script.contains("geminiRefusalPattern"));
+        assert!(script.contains("身为一个语言模型"));
+        assert!(script.contains("身為一個語言模型"));
+        assert!(script.contains("as (?:an? )?(?:ai )?language model"));
+        assert!(script.contains("normalizedLatestBody.length <= 400"));
+        assert!(script.contains("!normalizedLatestBody.startsWith('{')"));
+
+        let s05 = "Gemini 說了\n\n身为一个语言模型，我没办法提供这方面的帮助。";
+        let long_output = format!("{s05}{}", "。".repeat(401));
+        let json_output = format!(
+            "  \n  Gemini 說了\n\n{}",
+            serde_json::json!({ "message": s05 })
+        );
+        let probe_source = serde_json::to_string(&script).unwrap();
+        let texts = serde_json::to_string(&serde_json::json!({
+            "s05": s05,
+            "long": long_output,
+            "json": json_output,
+        }))
+        .unwrap();
+        let js = r#"
+const vm = require('node:vm');
+const probeSource = __PROBE_SOURCE__;
+const texts = __TEXTS__;
+const runProbe = (text) => {
+  const turnScope = {
+    tagName: 'DIV',
+    innerHTML: text,
+    children: [],
+    childNodes: [],
+    classList: [],
+    getAttribute(name) {
+      return name === 'data-turn-key' ? 'resp-s05' : '';
+    },
+    closest(selector) {
+      return selector === '[data-turn-key]' ? turnScope : null;
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  const response = {
+    tagName: 'MODEL-RESPONSE',
+    textContent: text,
+    innerHTML: text,
+    children: [],
+    childNodes: [],
+    classList: [],
+    getAttribute(name) {
+      if (name === 'data-response-id') return 'resp-s05';
+      if (name === 'aria-busy' || name === 'data-loading') return 'false';
+      return '';
+    },
+    closest(selector) {
+      if (selector === 'model-response') return response;
+      if (selector === '[data-turn-key]') return turnScope;
+      return null;
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getBoundingClientRect: () => ({ width: 600, height: 100 }),
+  };
+  const userQuery = {
+    tagName: 'USER-QUERY',
+    textContent: 'make an image',
+    innerHTML: 'make an image',
+    closest(selector) {
+      return selector === '[data-turn-key]' ? turnScope : null;
+    },
+    querySelectorAll() { return []; },
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll(selector) {
+      if (selector === 'model-response') return [response];
+      if (selector === 'user-query') return [userQuery];
+      return [];
+    },
+  };
+  return vm.runInNewContext(probeSource, {
+    URL,
+    document,
+    window: {
+      location: {
+        origin: 'https://gemini.google.com',
+        pathname: '/app/conv-s05',
+        href: 'https://gemini.google.com/app/conv-s05',
+      },
+      document,
+      __ask_bridge_response_owner_v1: 'response-token',
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    },
+  })();
+};
+const results = {};
+for (const [name, text] of Object.entries(texts)) {
+  results[name] = runProbe(text);
+}
+console.log(JSON.stringify(results));
+"#
+        .replace("__PROBE_SOURCE__", &probe_source)
+        .replace("__TEXTS__", &texts);
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run Gemini refusal probe test");
+        assert!(
+            output.status.success(),
+            "node Gemini refusal probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse Gemini refusal probe output");
+        assert_eq!(
+            parsed["s05"]["provider_failure_visible"], true,
+            "parsed={parsed}"
+        );
+        assert!(
+            parsed["s05"]["provider_failure_signature"]
+                .as_str()
+                .is_some_and(|signature| !signature.is_empty()),
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["s05"]["generation_control_visible"], false,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["long"]["provider_failure_visible"], false,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["json"]["provider_failure_visible"], false,
+            "parsed={parsed}"
+        );
     }
 
     /// Shipped source of one top-level function, resolved by bare name and a
@@ -16085,14 +16381,28 @@ __GEMINI_TURN_PROJECTION_JS__
                 : (Boolean(generationControl) || latestTurnState === 'in_progress');
             const latestText = contentNodes.map((node) => node.textContent || '').join('\n');
             const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i;
+            const geminiRefusalPattern = /(?:身为一个语言模型|身為一個語言模型|作为一个语言模型|作為一個語言模型|(?:没|沒)办法提供这方面的(?:帮|幫)助|(?:沒|没)辦法提供這方面的(?:幫助|協助)|無法提供這方面的(?:協助|幫助)|(?:無法|不能|无法)(?:為你|为您|幫你|帮你)?(?:生成|建立|製作|制作|繪製|绘制)(?:這張|这张|此|該|该)?(?:圖|图)(?:片|像)|i(?:'m| am) (?:just )?a language model|as (?:an? )?(?:ai )?language model|i (?:can't|cannot) help with that|i (?:can't|cannot|am unable to) (?:generate|create) (?:that |this |an? )?image)/i;
             const visibleProviderAlerts = Array.from(document.querySelectorAll('[role="alert"]'))
                 .filter(isVisibleControl)
                 .map((element) => String(element.innerText || element.textContent || '').trim())
                 .filter((text, index, values) => Boolean(text) && values.indexOf(text) === index);
             const latestProviderFailure = providerFailurePattern.test(latestText) ? latestText : '';
+            const normalizedLatestBody = latestText
+                .trim()
+                .replace(/^(?:Gemini\s*(?:說了|说了|said)\s*)+/i, '')
+                .trim();
+            const latestGeminiRefusal = isGemini
+                && loadedImages.length === 0
+                && !generationControlVisible
+                && normalizedLatestBody.length > 0
+                && normalizedLatestBody.length <= 400
+                && !normalizedLatestBody.startsWith('{')
+                && geminiRefusalPattern.test(normalizedLatestBody)
+                ? normalizedLatestBody
+                : '';
             const providerFailureText = visibleProviderAlerts
                 .filter((text) => providerFailurePattern.test(text))
-                .join('\n') || latestProviderFailure;
+                .join('\n') || latestProviderFailure || latestGeminiRefusal;
             const providerFailureVisible = Boolean(providerFailureText.trim());
             let providerUrlOwned = false;
             try {

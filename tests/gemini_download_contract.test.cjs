@@ -1626,6 +1626,49 @@ test('full-size download saves a 2752x1536 PNG disguised as .jpeg as .png and re
   }
 });
 
+test('full-size download event grace is 19000ms and remains bounded by timeoutMs', async () => {
+  const timerDelays = [];
+  const helpers = loadGeminiDownloadHelpers({
+    setTimeout(fn, ms) {
+      timerDelays.push(ms);
+      return setTimeout(fn, ms);
+    },
+  });
+  assert.equal(helpers.DOWNLOAD_EVENT_GRACE_MS, 19000);
+  assert.ok(helpers.DOWNLOAD_EVENT_GRACE_MS > 12000);
+  assert.ok(helpers.DOWNLOAD_EVENT_GRACE_MS < helpers.DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS);
+
+  const candidate = makeFullSizeCandidate(1);
+  const harness = makeFullSizeHarness(candidate);
+  const timeoutMs = 80;
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => helpers.downloadFullSizeCandidateViaBrowser(
+      harness.pageWs,
+      harness.browserWs,
+      { ok: true, candidates: [candidate] },
+      candidate,
+      fullSizeIdentity(),
+      {
+        timeoutMs,
+        verifyTimeoutMs: 5,
+        eventGraceMs: helpers.DOWNLOAD_EVENT_GRACE_MS,
+      },
+    ),
+    (error) => {
+      assert.equal(error.fallbackReason, 'click_no_download_event');
+      assert.equal(error.fallbackEligible, true);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - startedAt < 750, 'event grace must not outlive timeoutMs');
+  assert.equal(timerDelays.includes(helpers.DOWNLOAD_EVENT_GRACE_MS), false);
+  assert.ok(
+    timerDelays.some((delay) => delay >= 60 && delay <= timeoutMs),
+    `expected a grace timer bounded by timeoutMs, got ${timerDelays.join(',')}`,
+  );
+});
+
 test('full-size download verifies a late OOPIF sandbox iframe with a bounded Target.getTargets and replays blob:null download events', async () => {
   const timerDelays = [];
   const helpers = loadGeminiDownloadHelpers({
