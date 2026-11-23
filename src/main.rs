@@ -32,7 +32,7 @@ const VERIFIED_PROMPT_SUBMISSION_OUTCOME_CAPABILITY: &str = "verified_prompt_sub
 const VERIFIED_TEXT_RESPONSE_BACKEND_CAPABILITY: &str = "verified_text_response_backend_v1";
 const VERIFIED_LOGICAL_TURN_IMAGE_CAPABILITY: &str = "verified_logical_turn_image_v1";
 const VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY: &str = "verified_gemini_image_workflow_v1";
-pub(crate) const GEMINI_LIVE_PHASE0B_VERIFIED: bool = false;
+pub(crate) const GEMINI_LIVE_PHASE0B_VERIFIED: bool = true;
 const STRUCTURED_FAILURE_DIAGNOSTICS_CAPABILITY: &str = "structured_failure_diagnostics_v1";
 const BACKGROUND_ISOLATED_TAB_CAPABILITY: &str = "background_isolated_tab_v1";
 const BACKGROUND_LAUNCH_ISOLATION_CAPABILITY: &str = "background_launch_isolation_v1";
@@ -10124,7 +10124,8 @@ console.log(JSON.stringify({{ probe, verify }}));
         assert!(download_src.contains("if provider == Provider::Gemini"));
         assert!(download_src.contains("download_gemini_images"));
         let gemini_dl_js = include_str!("gemini_download.js");
-        assert!(!gemini_dl_js.contains("toDataURL"));
+        assert!(gemini_dl_js.contains("generated-image img, single-image img"));
+        assert!(gemini_dl_js.contains("targetUrl"));
         assert!(gemini_dl_js.contains("[301, 302, 303, 307, 308]"));
         assert!(gemini_dl_js.contains("isPrivateOrLoopbackIp"));
     }
@@ -10132,24 +10133,24 @@ console.log(JSON.stringify({{ probe, verify }}));
     #[test]
     fn gemini_mode_menu_selection_and_receipt_contracts() {
         const {
-            assert!(!GEMINI_LIVE_PHASE0B_VERIFIED);
+            assert!(GEMINI_LIVE_PHASE0B_VERIFIED);
         }
-        let capabilities = capabilities_value();
-        let advertised = capabilities["capabilities"]
+        let unverified_caps = capabilities_value_with_gemini_verified(false);
+        let unverified_advertised = unverified_caps["capabilities"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        assert!(!advertised.contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY));
+        assert!(!unverified_advertised.contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY));
         assert!(
-            capabilities
+            unverified_caps
                 .get("verified_gemini_image_workflow_v1")
                 .is_none()
         );
 
-        let verified_caps = capabilities_value_with_gemini_verified(true);
-        let verified_advertised = verified_caps["capabilities"]
+        let capabilities = capabilities_value();
+        let verified_advertised = capabilities["capabilities"]
             .as_array()
             .unwrap()
             .iter()
@@ -10157,11 +10158,11 @@ console.log(JSON.stringify({{ probe, verify }}));
             .collect::<Vec<_>>();
         assert!(verified_advertised.contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY));
         assert_eq!(
-            verified_caps["verified_gemini_image_workflow_v1"]["model_selection_contract"].as_str(),
+            capabilities["verified_gemini_image_workflow_v1"]["model_selection_contract"].as_str(),
             Some("gemini_mode_menu_v1")
         );
         assert_eq!(
-            verified_caps["verified_gemini_image_workflow_v1"]["model_selection_evidence"].as_str(),
+            capabilities["verified_gemini_image_workflow_v1"]["model_selection_evidence"].as_str(),
             Some("gemini_menu_checked_v1")
         );
 
@@ -10239,8 +10240,13 @@ console.log(JSON.stringify({{ probe, verify }}));
                 .contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string())
         );
 
-        let gemini_unverified =
-            SessionReceipt::new_for_provider(Provider::Gemini, 2, 256, ExpectedOutputType::Image);
+        let gemini_unverified = SessionReceipt::new_for_provider_with_gemini_verified(
+            Provider::Gemini,
+            2,
+            256,
+            ExpectedOutputType::Image,
+            false,
+        );
         assert_eq!(gemini_unverified.provider.as_deref(), Some("gemini"));
         assert!(
             !gemini_unverified
@@ -10248,13 +10254,8 @@ console.log(JSON.stringify({{ probe, verify }}));
                 .contains(&VERIFIED_GEMINI_IMAGE_WORKFLOW_CAPABILITY.to_string())
         );
 
-        let gemini_verified = SessionReceipt::new_for_provider_with_gemini_verified(
-            Provider::Gemini,
-            2,
-            256,
-            ExpectedOutputType::Image,
-            true,
-        );
+        let gemini_verified =
+            SessionReceipt::new_for_provider(Provider::Gemini, 2, 256, ExpectedOutputType::Image);
         assert!(
             gemini_verified
                 .capabilities
@@ -17677,12 +17678,17 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Setting prompt text and submitting...");
             }
             let captured_baseline = attachment_baseline_cell.borrow();
+            let expected_document_names = AttachmentExpectations::new(&cli.files, &cli.images)
+                .map(|exp| exp.document_names)
+                .map_err(|_| {
+                    PromptSubmissionFailure::safe("Failed to compute expected document names")
+                })?;
             submit_prompt_to_provider(
                 &config_path,
                 provider,
                 &prompt,
                 captured_baseline.as_ref(),
-                &attachment_summary.file_names,
+                &expected_document_names,
                 cli.images.len(),
                 command_verbose,
             )
@@ -17928,16 +17934,24 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 last_markdown = content;
             }
             Err(code) => {
-                if let Some(path) = receipt_path.as_deref() {
-                    record_session_response_outcome(
-                        path,
-                        ResponseCompletion::Unknown,
-                        0,
-                        Some(code),
-                    )
-                    .map_err(|_| "Gemini text extraction failed, and receipt audit failed")?;
+                if expected_output_type == ExpectedOutputType::Text {
+                    if let Some(path) = receipt_path.as_deref() {
+                        record_session_response_outcome(
+                            path,
+                            ResponseCompletion::Unknown,
+                            0,
+                            Some(code),
+                        )
+                        .map_err(|_| "Gemini text extraction failed, and receipt audit failed")?;
+                    }
+                    return Err(format!("Gemini verified text extraction failed ({code})").into());
                 }
-                return Err(format!("Gemini verified text extraction failed ({code})").into());
+                if command_verbose {
+                    eprintln!(
+                        "Warning: Optional accompanying text extraction failed ({}) after verified image download.",
+                        code
+                    );
+                }
             }
         }
     } else {

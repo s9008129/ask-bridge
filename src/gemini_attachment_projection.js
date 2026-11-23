@@ -32,6 +32,7 @@ const GEMINI_ATTACHMENT_IMG_CONTAINER_SELECTOR = [
     'uploader-file-preview',
     'uploader-image-preview',
     'file-preview-chip',
+    'gem-media-attachment',
 ].join(',');
 
 const GEMINI_UPLOADING_DOM_SELECTOR = [
@@ -85,12 +86,16 @@ function geminiMatchesExactFilename(candidateText, expectedName) {
     const basePattern = dot > 0
         ? `${geminiEscapeRegex(expected.slice(0, dot))}(?:\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\))?${geminiEscapeRegex(expected.slice(dot))}`
         : geminiEscapeRegex(expected);
+    const stemLineRe = dot > 0
+        ? new RegExp(`^${geminiEscapeRegex(expected.slice(0, dot))}(?:\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\))?$`)
+        : null;
     const lineRe = new RegExp(`^${basePattern}$`);
     const boundedRe = new RegExp(`(?<![A-Za-z0-9._-])${basePattern}(?![A-Za-z0-9._-])`);
 
     const lines = text.split(/[\r\n]+/).map((line) => line.trim()).filter(Boolean);
     for (const line of lines) {
         if (lineRe.test(line)) return true;
+        if (stemLineRe && stemLineRe.test(line)) return true;
     }
     return boundedRe.test(text.trim());
 }
@@ -118,12 +123,44 @@ function collectGeminiCandidateTexts(el) {
 
 function collectGeminiAttachmentLeaves(root, isVisibleFn) {
     if (!root || typeof root.querySelectorAll !== 'function') return [];
-    const allTiles = Array.from(root.querySelectorAll(GEMINI_ATTACHMENT_DOC_SELECTOR)).filter(isVisibleFn);
+    const allTiles = Array.from(root.querySelectorAll(GEMINI_ATTACHMENT_DOC_SELECTOR))
+        .filter(isVisibleFn)
+        .filter((el) => {
+            if (String(el.tagName || '').toLowerCase() === 'img') return false;
+            if (typeof el.matches === 'function') {
+                try {
+                    if (el.matches('button, gem-icon-button, gem-icon, mat-icon, [class*="close-button"], [class*="remove-button"], [class*="attachment-icon"]')) {
+                        return false;
+                    }
+                    if (el.matches('[class*="attachment-content"]') && !String(el.innerText || el.textContent || '').trim()) {
+                        return false;
+                    }
+                } catch (_) {}
+            }
+            return true;
+        });
     const leaves = allTiles.filter((t) => !allTiles.some((o) => o !== t && (typeof t.contains === 'function' ? t.contains(o) : false)));
     return leaves.filter((leaf) => {
         const ariaLabel = String(typeof leaf.getAttribute === 'function' ? (leaf.getAttribute('aria-label') || '') : '').toLowerCase();
         return !ariaLabel.startsWith('移除') && !ariaLabel.startsWith('remove');
     });
+}
+
+function isDomFileTypeIcon(img, stopBoundary) {
+    let cursor = img || null;
+    while (cursor && cursor !== stopBoundary) {
+        const tag = String(cursor.tagName || '').toLowerCase();
+        if (tag === 'gem-icon' || tag === 'mat-icon') return true;
+        if (typeof cursor.matches === 'function') {
+            try {
+                if (cursor.matches('gem-icon, mat-icon, .gem-attachment-icon, .lm-icon-l')) {
+                    return true;
+                }
+            } catch (_) {}
+        }
+        cursor = cursor.parentElement || null;
+    }
+    return false;
 }
 
 function isDomAvatarElement(img, stopBoundary) {
@@ -243,6 +280,7 @@ function projectGeminiAttachments(root, expectedDocNames, baseline = {}, isVisib
             seenImg.add(img);
             const boundary = findInnermostAttachmentBoundary(img, imgContainers, imgContainerSet, root);
             if (isDomAvatarElement(img, boundary)) continue;
+            if (isDomFileTypeIcon(img, boundary)) continue;
             scopedImgs.push(img);
         }
     }

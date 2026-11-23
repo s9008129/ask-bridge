@@ -42,10 +42,20 @@ function isGeminiModeItemLockedOrDisabled(el) {
     return /\bupgrade\b|升級|解鎖|locked/i.test(fullText) && hasLockIcon;
 }
 
-function geminiModeItemLabel(el) {
-    if (!el) return '';
+function geminiModeItemLabels(el) {
+    if (!el) return [];
     const ariaLabel = typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : '';
-    return ((String(el.innerText || el.textContent || ariaLabel || '').split('\n')[0]) || '').trim();
+    const raw = String(el.innerText || el.textContent || ariaLabel || '');
+    return raw.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+function geminiModeItemLabel(el) {
+    return geminiModeItemLabels(el)[0] || '';
+}
+
+function geminiModeItemMatches(el, normalizedTarget) {
+    if (!normalizedTarget) return false;
+    return geminiModeItemLabels(el).some((label) => normalizeGeminiModeLabel(label) === normalizedTarget);
 }
 
 function findGeminiModePickerButton(doc, isVisible) {
@@ -93,7 +103,7 @@ async function selectGeminiMode(targetModelRaw, options = {}) {
         if (items.length > 0) break;
     } while (Date.now() < openDeadline);
 
-    const matches = items.filter((item) => normalizeGeminiModeLabel(geminiModeItemLabel(item)) === target);
+    const matches = items.filter((item) => geminiModeItemMatches(item, target));
     if (matches.length === 0) {
         dispatchEscape();
         return 'error: model not found in menu';
@@ -156,10 +166,10 @@ async function selectGeminiMode(targetModelRaw, options = {}) {
     );
 
     const allMatchingTargets = reopened.filter(
-        (item) => normalizeGeminiModeLabel(geminiModeItemLabel(item)) === target,
+        (item) => geminiModeItemMatches(item, target),
     );
     const conflictingChecked = reopened.filter(
-        (item) => normalizeGeminiModeLabel(geminiModeItemLabel(item)) !== target && isItemChecked(item)
+        (item) => !geminiModeItemMatches(item, target) && isItemChecked(item)
     );
 
     dispatchEscape();

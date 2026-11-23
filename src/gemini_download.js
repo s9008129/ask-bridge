@@ -676,31 +676,60 @@ async function readBlobDataUrlFromBrowser(ws, blobUrl, maxBytes = MAX_IMAGE_BYTE
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), ${effectiveTimeoutMs});
                 try {
-                    const resp = await fetch(${JSON.stringify(blobUrl)}, { redirect: 'error', signal: controller.signal });
-                    if (!resp.ok) {
-                        throw new Error('Blob fetch failed with status ' + resp.status);
-                    }
-                    const rawLen = resp.headers && resp.headers.get ? resp.headers.get('content-length') : null;
-                    if (rawLen !== null) {
-                        const declared = Number(rawLen);
-                        if (Number.isFinite(declared) && declared > ${maxBytes}) {
+                    let dataUrl = '';
+                    try {
+                        const resp = await fetch(${JSON.stringify(blobUrl)}, { redirect: 'error', signal: controller.signal });
+                        if (!resp.ok) {
+                            throw new Error('Blob fetch failed with status ' + resp.status);
+                        }
+                        const rawLen = resp.headers && resp.headers.get ? resp.headers.get('content-length') : null;
+                        if (rawLen !== null) {
+                            const declared = Number(rawLen);
+                            if (Number.isFinite(declared) && declared > ${maxBytes}) {
+                                throw new Error('Blob image exceeds maximum allowed bytes');
+                            }
+                        }
+                        const blob = await resp.blob();
+                        const mime = String(blob && blob.type || '').toLowerCase();
+                        if (!mime.startsWith('image/')) {
+                            throw new Error('Blob payload is not an image MIME type');
+                        }
+                        if (!blob || blob.size <= 0 || blob.size > ${maxBytes}) {
                             throw new Error('Blob image exceeds maximum allowed bytes');
                         }
+                        dataUrl = await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(String(reader.result || ''));
+                            reader.onerror = () => reject(new Error('FileReader blob read failed'));
+                            reader.readAsDataURL(blob);
+                        });
+                    } catch (fetchErr) {
+                        if (controller.signal.aborted) {
+                            throw fetchErr;
+                        }
+                        // Gemini revokes same-origin blob: object URLs immediately after
+                        // <generated-image> / <single-image> finishes decoding the bitmap.
+                        // Read back strictly the exact matching decoded <img> element.
+                        const targetUrl = ${JSON.stringify(blobUrl)};
+                        const imgs = Array.from(document.querySelectorAll('generated-image img, single-image img'));
+                        const matchedImg = imgs.find((img) => {
+                            const cur = String(img.currentSrc || img.src || '');
+                            return cur === targetUrl && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0;
+                        });
+                        if (!matchedImg) {
+                            throw fetchErr;
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = matchedImg.naturalWidth;
+                        canvas.height = matchedImg.naturalHeight;
+                        const ctx = canvas.getContext('2d');
+                        if (!ctx) {
+                            throw fetchErr;
+                        }
+                        ctx.drawImage(matchedImg, 0, 0);
+                        dataUrl = canvas.toDataURL('image/png');
                     }
-                    const blob = await resp.blob();
-                    const mime = String(blob && blob.type || '').toLowerCase();
-                    if (!mime.startsWith('image/')) {
-                        throw new Error('Blob payload is not an image MIME type');
-                    }
-                    if (!blob || blob.size <= 0 || blob.size > ${maxBytes}) {
-                        throw new Error('Blob image exceeds maximum allowed bytes');
-                    }
-                    return await new Promise((resolve, reject) => {
-                        const reader = new FileReader();
-                        reader.onload = () => resolve(String(reader.result || ''));
-                        reader.onerror = () => reject(new Error('FileReader blob read failed'));
-                        reader.readAsDataURL(blob);
-                    });
+                    return dataUrl;
                 } finally {
                     clearTimeout(timer);
                 }

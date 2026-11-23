@@ -237,9 +237,9 @@ function buildResolveComposerContextExpression(expectedToken) {
             throw new Error(inputs.length === 0 ? 'Gemini composer textbox unavailable' : 'Gemini composer textbox ambiguous');
         }
         const input = inputs[0];
-        const container = input.closest('rich-textarea')
-            || input.closest('input-area-v2')
+        const container = input.closest('input-area-v2')
             || input.closest('[data-testid*="composer"]')
+            || input.closest('rich-textarea')
             || input.closest('form')
             || input.parentElement;
         if (!container || container === document.body || container === document.documentElement) {
@@ -453,7 +453,7 @@ async function uploadToGeminiPage(cdp, filePath, uploadKind, options = {}) {
                         return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
                     };
                     const buttons = Array.from(this.querySelectorAll('button, [role="button"]')).filter(isVisible);
-                    const primaryMatches = buttons.filter((el) => /add\\s*files?|upload|新增檔案|上傳檔案|加入檔案|新增圖片|attach/i.test([el.getAttribute('aria-label'), el.textContent, el.getAttribute('title')].filter(Boolean).join(' ')));
+                    const primaryMatches = buttons.filter((el) => /add\\s*files?|upload|新增檔案|上傳檔案|上傳與工具|加入檔案|新增圖片|attach/i.test([el.getAttribute('aria-label'), el.textContent, el.getAttribute('title')].filter(Boolean).join(' ')));
                     const fallbackMatches = primaryMatches.length > 0
                         ? primaryMatches
                         : buttons.filter((el) => /add|plus|\\+/i.test([el.getAttribute('aria-label'), el.textContent, el.getAttribute('mattooltip')].filter(Boolean).join(' ')));
@@ -525,7 +525,8 @@ async function uploadToGeminiPage(cdp, filePath, uploadKind, options = {}) {
                         menuContainer = ariaMenus[0];
                     } else {
                         const menuSel = '[role="menu"], [role="listbox"], .mat-mdc-menu-panel, .cdk-overlay-pane';
-                        const newlyVisible = Array.from(document.querySelectorAll(menuSel)).filter((el) => isVisible(el) && !pre.has(el));
+                        const rawNewlyVisible = Array.from(document.querySelectorAll(menuSel)).filter((el) => isVisible(el) && !pre.has(el));
+                        const newlyVisible = rawNewlyVisible.filter((el) => !rawNewlyVisible.some((other) => other !== el && typeof el.contains === 'function' && el.contains(other)));
                         if (newlyVisible.length === 1) {
                             menuContainer = newlyVisible[0];
                         }

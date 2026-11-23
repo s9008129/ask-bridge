@@ -182,15 +182,34 @@ function resolveGeminiImageArtifactId(img) {
     };
     let cursor = img || null;
     let steps = 0;
+    let seenGeneratedContainer = false;
+    let attachmentIndex = '';
     while (cursor && steps < 10) {
         steps += 1;
         const tag = String(cursor.tagName || '').toLowerCase();
         if (tag === 'model-response' || tag === 'user-query' || tag === 'body' || tag === 'html') break;
-        if (cursor === img || isContainer(cursor)) {
+        const inContainer = isContainer(cursor);
+        if (inContainer) {
+            seenGeneratedContainer = true;
+            if (!attachmentIndex) {
+                attachmentIndex = readAttr(cursor, 'data-image-attachment-index');
+            }
+        }
+        if (cursor === img || inContainer) {
             const id = readIdentifyingAttr(cursor);
             if (id) return id;
         }
         cursor = cursor.parentElement || null;
+    }
+    if (seenGeneratedContainer) {
+        const src = String((img && (img.currentSrc || img.src || readAttr(img, 'src'))) || '').trim();
+        const blobPrefix = 'blob:https://gemini.google.com/';
+        if (src.startsWith(blobPrefix) && src.length > blobPrefix.length) {
+            return `blob:${src.slice(blobPrefix.length)}`;
+        }
+        if (attachmentIndex) {
+            return `generated-image-idx:${attachmentIndex}`;
+        }
     }
     return '';
 }
@@ -215,11 +234,16 @@ function geminiTurnIdentity(group) {
             || resolveAttr(turn, 'data-turn-key')
             || resolveAttr(turn, 'data-response-id')
             || (String(turn.tagName || '').toLowerCase() === 'model-response' ? resolveAttr(turn, 'id') : '');
+        if (!turnId && typeof turn.closest === 'function') {
+            const convContainer = turn.closest('.conversation-container[id]');
+            turnId = resolveAttr(convContainer, 'id');
+        }
         if (!turnId && typeof turn.querySelector === 'function') {
-            const keyed = turn.querySelector('[data-turn-id], [data-turn-key], [data-response-id]');
+            const keyed = turn.querySelector('[data-turn-id], [data-turn-key], [data-response-id], message-content[id], [id^="message-content-id-"], [id^="model-response-message-content"]');
             turnId = resolveAttr(keyed, 'data-turn-id')
                 || resolveAttr(keyed, 'data-turn-key')
-                || resolveAttr(keyed, 'data-response-id');
+                || resolveAttr(keyed, 'data-response-id')
+                || resolveAttr(keyed, 'id');
         }
     }
     if (!turnId && fallback) {

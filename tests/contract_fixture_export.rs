@@ -34,8 +34,8 @@ fn export_fixture(dir: &Path, name: &str, value: &Value) {
 fn build_fixtures() -> Vec<(&'static str, Value)> {
     let scratch = make_temp_dir("receipts");
 
-    let capabilities_unverified = capabilities_value();
-    let capabilities_verified = capabilities_value_with_gemini_verified(true);
+    let capabilities_unverified = capabilities_value_with_gemini_verified(false);
+    let capabilities_verified = capabilities_value();
 
     // 1. Legacy ChatGPT receipt (without `provider`, simulating existing receipts).
     let chatgpt_legacy_path = scratch.join("chatgpt_legacy.json");
@@ -95,10 +95,15 @@ fn build_fixtures() -> Vec<(&'static str, Value)> {
     let chatgpt_current_val: Value =
         serde_json::from_slice(&std::fs::read(&chatgpt_current_path).unwrap()).unwrap();
 
-    // 2b. Candidate unverified Gemini runtime receipt (produced by `new_for_provider`, omits `verified_gemini_image_workflow_v1`).
+    // 2b. Candidate unverified Gemini runtime receipt (explicitly `gemini_verified = false`, omits `verified_gemini_image_workflow_v1`).
     let gemini_candidate_unverified_path = scratch.join("gemini_candidate_unverified.json");
-    let gemini_candidate_unverified =
-        SessionReceipt::new_for_provider(Provider::Gemini, 1, 1024, ExpectedOutputType::Text);
+    let gemini_candidate_unverified = SessionReceipt::new_for_provider_with_gemini_verified(
+        Provider::Gemini,
+        1,
+        1024,
+        ExpectedOutputType::Text,
+        false,
+    );
     write_private_json(
         &gemini_candidate_unverified_path,
         &gemini_candidate_unverified,
