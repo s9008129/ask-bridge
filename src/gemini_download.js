@@ -25,7 +25,8 @@ const REQUEST_TIMEOUT_MS = 30000;
 const CDP_CALL_TIMEOUT_MS = 10000;
 const CDP_OPEN_TIMEOUT_MS = 5000;
 const DEFAULT_FULL_SIZE_DOWNLOAD_TIMEOUT_MS = 20000;
-const DOWNLOAD_EVENT_GRACE_MS = 8000;
+const DOWNLOAD_EVENT_GRACE_MS = 12000;
+const GEMINI_SANDBOXED_BLOB_EVENT_RE = /^blob:null\/[A-Za-z0-9-]+$/;
 const BROWSER_CDP_VERSION_URL = 'http://127.0.0.1:9223/json/version';
 const FULL_SIZE_FALLBACK_REASONS = new Set([
     'button_not_found',
@@ -107,10 +108,11 @@ function isAllowedGeminiBlobUrl(blobUrl) {
     }
 }
 
-function isAllowedGeminiDownloadEventUrl(urlString) {
+function isAllowedGeminiDownloadEventUrl(urlString, options = {}) {
     const raw = String(urlString || '').trim();
     if (!raw) return false;
     if (/^data:image\/[a-z0-9.+-]+(?:;[^,]*)?,/i.test(raw)) return true;
+    if (options.allowOwnedSandboxedBlob === true && GEMINI_SANDBOXED_BLOB_EVENT_RE.test(raw)) return true;
     if (isAllowedGeminiBlobUrl(raw)) return true;
     return isAllowedGeminiImageUrl(raw).ok;
 }
@@ -510,7 +512,7 @@ function validateImageHeaderAndTrailer(buffer, minDimension = MINIMUM_IMAGE_DIME
             if (offset >= buffer.length) break;
             const marker = buffer[offset];
             offset += 1;
-            if (marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+            if (marker === 0x00 || marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
             if (marker === 0xD9 || marker === 0xDA) break;
             if (offset + 1 >= buffer.length) return imageValidationFailure('invalid_jpeg_segment');
             const segmentLength = buffer.readUInt16BE(offset);
@@ -895,6 +897,52 @@ function collectOwnedFrameIds(frameTree) {
     return ids;
 }
 
+function collectOwnedIframeTargets(targetInfos, rootIds, ownedBrowserContextId) {
+    const roots = new Set(Array.from(rootIds || []).map((id) => String(id || '')).filter(Boolean));
+    const infos = (Array.isArray(targetInfos) ? targetInfos : []).filter(
+        (info) => info && typeof info === 'object' && info.type === 'iframe',
+    );
+    const byTargetId = new Map();
+    for (const info of infos) {
+        const targetId = String(info.targetId || '');
+        if (targetId) byTargetId.set(targetId, info);
+    }
+
+    const expectedContext = String(ownedBrowserContextId || '');
+    const isContextOwned = (info) => (
+        !expectedContext || String(info.browserContextId || '') === expectedContext
+    );
+    const isOwnedByRoot = (targetId, seen = new Set()) => {
+        if (!targetId || seen.has(targetId)) return false;
+        seen.add(targetId);
+        if (roots.has(targetId)) return true;
+        const info = byTargetId.get(targetId);
+        if (!info) return false;
+        for (const parentRef of [info.parentId, info.parentFrameId]) {
+            const parentId = String(parentRef || '');
+            if (!parentId) continue;
+            if (roots.has(parentId) || isOwnedByRoot(parentId, seen)) return true;
+        }
+        return false;
+    };
+    const isSandboxedIframeUrl = (urlString) => {
+        const url = String(urlString || '').trim().toLowerCase();
+        return url === 'about:srcdoc'
+            || url === 'about:blank'
+            || url.startsWith('data:text/html');
+    };
+
+    const ownedTargetIds = [];
+    const sandboxedIframeIds = [];
+    for (const info of infos) {
+        const targetId = String(info.targetId || '');
+        if (!targetId || !isContextOwned(info) || !isOwnedByRoot(targetId)) continue;
+        ownedTargetIds.push(targetId);
+        if (isSandboxedIframeUrl(info.url)) sandboxedIframeIds.push(targetId);
+    }
+    return { ownedTargetIds, sandboxedIframeIds };
+}
+
 function buildFullSizeClickExpression(expectedIdentity, candidate) {
     const normalized = normalizeCandidate(candidate);
     if (!normalized) return '(() => ({ ok: false, reason: "invalid_candidate", identityChanged: true }))()';
@@ -1063,13 +1111,232 @@ async function downloadFullSizeCandidateViaBrowser(pageWs, browserWs, before, ca
                 'Page.getFrameTree is unavailable for full-size download',
             );
         }
-        const ownedFrameIds = new Set(collectOwnedFrameIds(frameTreeResult && frameTreeResult.frameTree));
-        if (ownedFrameIds.size === 0) {
+        const rootFrameIds = new Set(collectOwnedFrameIds(frameTreeResult && frameTreeResult.frameTree));
+        if (rootFrameIds.size === 0) {
             throw geminiFallbackError(
                 'cdp_download_behavior_unsupported',
                 'Page.getFrameTree did not identify an owned frame',
             );
         }
+
+        let ownedFrameIds = new Set(rootFrameIds);
+        const sandboxedIframeIds = new Set();
+        const targetInfosById = new Map();
+        const pendingDownloadsByGuid = new Map();
+        const unknownFrameVerifications = new Map();
+        const unknownFrameVerificationResults = new Map();
+        let ownedBrowserContextId = '';
+        let targetDiscoverySupported = false;
+
+        const addTargetInfos = (targetInfos) => {
+            if (!Array.isArray(targetInfos)) return;
+            for (const info of targetInfos) {
+                if (!info || typeof info !== 'object') continue;
+                const targetId = String(info.targetId || '');
+                if (targetId) targetInfosById.set(targetId, info);
+            }
+            if (!ownedBrowserContextId) {
+                const rootInfo = Array.from(targetInfosById.values()).find(
+                    (info) => rootFrameIds.has(String(info.targetId || ''))
+                        && String(info.browserContextId || ''),
+                );
+                if (rootInfo) ownedBrowserContextId = String(rootInfo.browserContextId || '');
+            }
+            const owned = collectOwnedIframeTargets(
+                Array.from(targetInfosById.values()),
+                rootFrameIds,
+                ownedBrowserContextId,
+            );
+            ownedFrameIds = new Set(rootFrameIds);
+            sandboxedIframeIds.clear();
+            for (const targetId of owned.ownedTargetIds) ownedFrameIds.add(targetId);
+            for (const targetId of owned.sandboxedIframeIds) sandboxedIframeIds.add(targetId);
+        };
+
+        const handleVerifiedDownloadWillBegin = (params) => {
+            firstDownloadEvent();
+            const guid = String(params.guid || '');
+            if (guid) observedGuids.add(guid);
+            if (!isSafeDownloadGuid(guid)) {
+                finishFailure(geminiFailClosedError('Gemini full-size download returned an unsafe guid'));
+                return;
+            }
+            const frameId = String(params.frameId || '');
+            if (!isAllowedGeminiDownloadEventUrl(String(params.url || ''), {
+                allowOwnedSandboxedBlob: sandboxedIframeIds.has(frameId),
+            })) {
+                finishFailure(geminiFailClosedError('Gemini full-size download URL is not allowlisted'));
+                return;
+            }
+            if (currentGuid !== null && guid !== currentGuid) {
+                finishFailure(geminiFailClosedError('Gemini full-size click triggered multiple owned downloads'));
+                return;
+            }
+            currentGuid = guid;
+        };
+
+        const handleDownloadProgress = (params) => {
+            if (!params || currentGuid === null || String(params.guid || '') !== currentGuid) return;
+            const received = Number(params.receivedBytes || 0);
+            const total = Number(params.totalBytes || 0);
+            if (received > MAX_IMAGE_BYTES || total > MAX_IMAGE_BYTES) {
+                finishFailure(geminiFailClosedError('Gemini full-size download exceeded maximum allowed bytes'));
+                return;
+            }
+            if (params.state === 'canceled' || params.state === 'interrupted') {
+                finishFailure(geminiFallbackError('download_canceled', 'Gemini full-size download was canceled'));
+                return;
+            }
+            if (params.state === 'completed') {
+                completed = true;
+                if (!settled) {
+                    settled = true;
+                    clearEventTimers();
+                    resolveDownload();
+                }
+            }
+        };
+
+        const replayPendingGuid = (guid) => {
+            if (settled) return;
+            const pending = pendingDownloadsByGuid.get(guid);
+            if (!pending) return;
+            pendingDownloadsByGuid.delete(guid);
+            handleVerifiedDownloadWillBegin(pending.willBegin);
+            if (settled) return;
+            for (const progress of pending.progresses) {
+                handleDownloadProgress(progress);
+                if (settled) break;
+            }
+        };
+
+        const dropPendingForFrame = (frameId) => {
+            for (const [guid, pending] of [...pendingDownloadsByGuid.entries()]) {
+                if (pending.frameId === frameId) pendingDownloadsByGuid.delete(guid);
+            }
+        };
+
+        const verifyUnknownFrame = (frameId) => {
+            if (unknownFrameVerifications.has(frameId)) return unknownFrameVerifications.get(frameId);
+            const verification = (async () => {
+                let owned = false;
+                try {
+                    const targetResult = await callCdp(
+                        browserWs,
+                        'Target.getTargets',
+                        {},
+                        Math.min(verifyTimeoutMs, remainingMs(), 2000),
+                    );
+                    addTargetInfos(targetResult && targetResult.targetInfos);
+                    owned = ownedFrameIds.has(frameId);
+                } catch (_) {
+                    owned = false;
+                }
+                unknownFrameVerificationResults.set(frameId, owned);
+                if (owned) {
+                    const guids = [...pendingDownloadsByGuid.entries()]
+                        .filter(([, pending]) => pending.frameId === frameId)
+                        .map(([guid]) => guid);
+                    for (const guid of guids) replayPendingGuid(guid);
+                } else {
+                    dropPendingForFrame(frameId);
+                }
+            })();
+            unknownFrameVerifications.set(frameId, verification);
+            verification.finally(() => {
+                if (unknownFrameVerifications.get(frameId) === verification) {
+                    unknownFrameVerifications.delete(frameId);
+                }
+            }).catch(() => {});
+            return verification;
+        };
+
+        const onBrowserMessage = (event) => {
+            let message;
+            try {
+                message = JSON.parse(event.data);
+            } catch (_) {
+                return;
+            }
+            const params = message && message.params;
+            if (message.method === 'Target.targetCreated' || message.method === 'Target.targetInfoChanged') {
+                const targetInfo = params && params.targetInfo;
+                if (targetInfo && typeof targetInfo === 'object') {
+                    addTargetInfos([targetInfo]);
+                    const frameId = String(targetInfo.targetId || '');
+                    if (ownedFrameIds.has(frameId)) {
+                        const guids = [...pendingDownloadsByGuid.entries()]
+                            .filter(([, pending]) => pending.frameId === frameId)
+                            .map(([guid]) => guid);
+                        for (const guid of guids) replayPendingGuid(guid);
+                    }
+                }
+                return;
+            }
+            if (message.method === 'Browser.downloadWillBegin') {
+                if (!params || typeof params !== 'object') return;
+                const frameId = String(params.frameId || '');
+                if (!ownedFrameIds.has(frameId)) {
+                    if (!targetDiscoverySupported) return;
+                    const guid = String(params.guid || '');
+                    if (!guid) return;
+                    if (!pendingDownloadsByGuid.has(guid)) {
+                        pendingDownloadsByGuid.set(guid, { willBegin: params, progresses: [], frameId });
+                    }
+                    if (unknownFrameVerificationResults.get(frameId) === true) {
+                        replayPendingGuid(guid);
+                    } else if (unknownFrameVerificationResults.get(frameId) !== false) {
+                        verifyUnknownFrame(frameId);
+                    } else {
+                        pendingDownloadsByGuid.delete(guid);
+                    }
+                    return;
+                }
+                handleVerifiedDownloadWillBegin(params);
+                return;
+            }
+            if (message.method === 'Browser.downloadProgress') {
+                if (!params || typeof params !== 'object') return;
+                const guid = String(params.guid || '');
+                if (currentGuid === null) {
+                    const pending = pendingDownloadsByGuid.get(guid);
+                    if (pending) pending.progresses.push(params);
+                    return;
+                }
+                handleDownloadProgress(params);
+            }
+        };
+        if (typeof browserWs.addEventListener !== 'function' || typeof browserWs.removeEventListener !== 'function') {
+            throw geminiFallbackError(
+                'cdp_download_behavior_unsupported',
+                'Browser CDP WebSocket does not support download events',
+            );
+        }
+        browserWs.addEventListener('message', onBrowserMessage);
+        removeEventListeners = () => {
+            try { browserWs.removeEventListener('message', onBrowserMessage); } catch (_) {}
+        };
+
+        try {
+            await callCdp(
+                browserWs,
+                'Target.setDiscoverTargets',
+                { discover: true },
+                Math.min(verifyTimeoutMs, remainingMs(), 2000),
+            );
+            targetDiscoverySupported = true;
+        } catch (_) {
+            targetDiscoverySupported = false;
+        }
+        try {
+            const targetResult = await callCdp(
+                browserWs,
+                'Target.getTargets',
+                {},
+                Math.min(verifyTimeoutMs, remainingMs(), 2000),
+            );
+            addTargetInfos(targetResult && targetResult.targetInfos);
+        } catch (_) {}
 
         try {
             await callCdp(browserWs, 'Browser.setDownloadBehavior', {
@@ -1084,67 +1351,6 @@ async function downloadFullSizeCandidateViaBrowser(pageWs, browserWs, before, ca
             );
         }
 
-        const onBrowserMessage = (event) => {
-            let message;
-            try {
-                message = JSON.parse(event.data);
-            } catch (_) {
-                return;
-            }
-            const params = message && message.params;
-            if (message.method === 'Browser.downloadWillBegin') {
-                if (!params || typeof params !== 'object') return;
-                if (!ownedFrameIds.has(String(params.frameId || ''))) return;
-                firstDownloadEvent();
-                const guid = String(params.guid || '');
-                if (guid) observedGuids.add(guid);
-                if (!isSafeDownloadGuid(guid)) {
-                    finishFailure(geminiFailClosedError('Gemini full-size download returned an unsafe guid'));
-                    return;
-                }
-                if (!isAllowedGeminiDownloadEventUrl(String(params.url || ''))) {
-                    finishFailure(geminiFailClosedError('Gemini full-size download URL is not allowlisted'));
-                    return;
-                }
-                if (currentGuid !== null && guid !== currentGuid) {
-                    finishFailure(geminiFailClosedError('Gemini full-size click triggered multiple owned downloads'));
-                    return;
-                }
-                currentGuid = guid;
-                return;
-            }
-            if (message.method === 'Browser.downloadProgress') {
-                if (!params || currentGuid === null || String(params.guid || '') !== currentGuid) return;
-                const received = Number(params.receivedBytes || 0);
-                const total = Number(params.totalBytes || 0);
-                if (received > MAX_IMAGE_BYTES || total > MAX_IMAGE_BYTES) {
-                    finishFailure(geminiFailClosedError('Gemini full-size download exceeded maximum allowed bytes'));
-                    return;
-                }
-                if (params.state === 'canceled' || params.state === 'interrupted') {
-                    finishFailure(geminiFallbackError('download_canceled', 'Gemini full-size download was canceled'));
-                    return;
-                }
-                if (params.state === 'completed') {
-                    completed = true;
-                    if (!settled) {
-                        settled = true;
-                        clearEventTimers();
-                        resolveDownload();
-                    }
-                }
-            }
-        };
-        if (typeof browserWs.addEventListener !== 'function' || typeof browserWs.removeEventListener !== 'function') {
-            throw geminiFallbackError(
-                'cdp_download_behavior_unsupported',
-                'Browser CDP WebSocket does not support download events',
-            );
-        }
-        browserWs.addEventListener('message', onBrowserMessage);
-        removeEventListeners = () => {
-            try { browserWs.removeEventListener('message', onBrowserMessage); } catch (_) {}
-        };
         timeoutTimer = setTimeout(() => {
             if (currentGuid === null) {
                 finishFailure(geminiFallbackError(
@@ -1979,6 +2185,7 @@ module.exports = {
     isAllowedGeminiImageUrl,
     isAllowedGeminiBlobUrl,
     isAllowedGeminiDownloadEventUrl,
+    collectOwnedIframeTargets,
     assertAllowedGeminiImageHost,
     isPrivateOrLoopbackIp,
     decodeDataImageUrl,

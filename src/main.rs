@@ -1623,6 +1623,43 @@ fn parse_gemini_rollback_recovery_summary(stdout: &[u8]) -> Option<String> {
     Some(summary)
 }
 
+const GEMINI_FULL_SIZE_FALLBACK_REASONS: [&str; 6] = [
+    "button_not_found",
+    "click_no_download_event",
+    "download_timeout",
+    "download_canceled",
+    "cdp_download_behavior_unsupported",
+    "full_size_integrity_failed",
+];
+
+fn extract_gemini_full_size_fallback_diagnostics(stdout: &[u8]) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_slice::<Value>(stdout) else {
+        return Vec::new();
+    };
+    if parsed.get("download_source").and_then(Value::as_str) != Some("preview_fallback") {
+        return Vec::new();
+    }
+    let Some(reasons) = parsed.get("fallback_reasons").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for value in reasons {
+        let Some(reason) = value.as_str() else {
+            continue;
+        };
+        if GEMINI_FULL_SIZE_FALLBACK_REASONS.contains(&reason) {
+            let line = format!(
+                "ASK_BRIDGE_DIAGNOSTIC v1 code=gemini_full_size_{} stage=image_download",
+                reason
+            );
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+    }
+    lines
+}
+
 fn interpret_gemini_download_output(
     output: &std::process::Output,
     verbose: bool,
@@ -10667,6 +10704,26 @@ console.log(JSON.stringify({{ probe, verify }}));
     }
 
     #[test]
+    fn extract_gemini_full_size_fallback_diagnostics_filters_closed_allowlist() {
+        let fallback_stdout = br#"{"ok":true,"files":["/tmp/a.png"],"download_source":"preview_fallback","fallback_reasons":["button_not_found","unknown_secret","button_not_found","click_no_download_event",123]}"#;
+        assert_eq!(
+            extract_gemini_full_size_fallback_diagnostics(fallback_stdout),
+            vec![
+                "ASK_BRIDGE_DIAGNOSTIC v1 code=gemini_full_size_button_not_found stage=image_download"
+                    .to_string(),
+                "ASK_BRIDGE_DIAGNOSTIC v1 code=gemini_full_size_click_no_download_event stage=image_download"
+                    .to_string(),
+            ]
+        );
+
+        let full_size_stdout = br#"{"ok":true,"files":["/tmp/a.png"],"download_source":"full_size_download","fallback_reasons":["button_not_found"]}"#;
+        assert!(extract_gemini_full_size_fallback_diagnostics(full_size_stdout).is_empty());
+
+        let legacy_stdout = br#"{"ok":true,"files":["/tmp/a.png"]}"#;
+        assert!(extract_gemini_full_size_fallback_diagnostics(legacy_stdout).is_empty());
+    }
+
+    #[test]
     fn gemini_image_download_source_is_persisted_only_for_successful_nonempty_image_turns() {
         fn persist_outcome(
             label: &str,
@@ -11322,6 +11379,9 @@ fn download_gemini_images(
     })?;
 
     let (files, image_download_source) = interpret_gemini_download_output(&output, verbose)?;
+    for line in extract_gemini_full_size_fallback_diagnostics(&output.stdout) {
+        eprintln!("{}", line);
+    }
     for path in &files {
         println!("Downloaded and saved generated image to: {}", path);
     }

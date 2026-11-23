@@ -70,13 +70,14 @@ function makeSyntheticPng(width = 2752, height = 1536, options = {}) {
 }
 
 function makeSyntheticJpeg(width = 2752, height = 1536, options = {}) {
-  const header = Buffer.from([
-    0xff, 0xd8,
+  const fill = options.zeroFillBeforeSof ? Buffer.from([0xff, 0x00]) : Buffer.alloc(0);
+  const sof = Buffer.from([
     0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x00, 0x00, 0x00,
     0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
   ]);
-  header.writeUInt16BE(height, 7);
-  header.writeUInt16BE(width, 9);
+  const header = Buffer.concat([Buffer.from([0xff, 0xd8]), fill, sof]);
+  header.writeUInt16BE(height, 2 + fill.length + 5);
+  header.writeUInt16BE(width, 2 + fill.length + 7);
   return options.missingEoi
     ? header
     : Buffer.concat([header, Buffer.from([0xff, 0xd9])]);
@@ -191,10 +192,24 @@ function makeFullSizeHarness(candidate, options = {}) {
     cancels: [],
     downloadPath: null,
     targetMethods: [],
+    targetGetCalls: 0,
+    targetSetDiscoverCalls: 0,
     clickCount: 0,
   };
   const browserWs = makeCdpSocket((message) => {
     state.targetMethods.push(message.method);
+    if (message.method === 'Target.setDiscoverTargets') {
+      state.targetSetDiscoverCalls += 1;
+      if (options.targetDiscoveryUnsupported) throw new Error('Target.setDiscoverTargets unsupported');
+      return {};
+    }
+    if (message.method === 'Target.getTargets') {
+      state.targetGetCalls += 1;
+      if (typeof options.onGetTargets === 'function') {
+        return options.onGetTargets({ call: state.targetGetCalls, state });
+      }
+      return { targetInfos: options.targetInfos || [] };
+    }
     if (message.method === 'Browser.setDownloadBehavior') {
       state.behaviors.push(message.params.behavior);
       if (message.params.behavior === 'allowAndName') {
@@ -1265,6 +1280,8 @@ test('full-size download allowlist accepts only single-label usercontent.google.
   assert.equal(helpers.isAllowedGeminiDownloadEventUrl('https://abc.usercontent.google.com/download'), true);
   assert.equal(helpers.isAllowedGeminiDownloadEventUrl('https://lh3.googleusercontent.com/download'), true);
   assert.equal(helpers.isAllowedGeminiDownloadEventUrl('blob:https://gemini.google.com/1234'), true);
+  assert.equal(helpers.isAllowedGeminiDownloadEventUrl('blob:null/1234-5678'), false);
+  assert.equal(helpers.isAllowedGeminiDownloadEventUrl('blob:null/1234-5678', { allowOwnedSandboxedBlob: true }), true);
   assert.equal(helpers.isAllowedGeminiDownloadEventUrl('data:image/png;base64,AAAA'), true);
 
   for (const blocked of [
@@ -1274,13 +1291,42 @@ test('full-size download allowlist accepts only single-label usercontent.google.
     'https://user:secret@abc.usercontent.google.com/download',
     'javascript:alert(1)',
     'blob:https://evil.example.com/1234',
+    'blob:null/',
+    'blob:null/1234/extra',
+    'blob:null/1234?download=1',
+    'blob:null/1234#fragment',
+    'blob:null/../escape',
+    'blob:null/1234_5678',
   ]) {
     assert.equal(helpers.isAllowedGeminiDownloadEventUrl(blocked), false, `must reject ${blocked}`);
+    assert.equal(
+      helpers.isAllowedGeminiDownloadEventUrl(blocked, { allowOwnedSandboxedBlob: true }),
+      false,
+      `sandbox override must still reject ${blocked}`,
+    );
   }
 
   const source = readFileSync(join(repoRoot, 'src', 'gemini_download.js'), 'utf8');
   assert.equal(source.includes('node:zlib'), false);
   assert.equal(source.includes('inflateSync'), false);
+});
+
+test('collectOwnedIframeTargets follows same-context iframe parent chains and marks only sandboxed child targets', () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const result = helpers.collectOwnedIframeTargets([
+    { targetId: 'main-frame', type: 'page', url: 'https://gemini.google.com/app', browserContextId: 'ctx-owned' },
+    { targetId: 'owned-srcdoc', type: 'iframe', parentFrameId: 'main-frame', url: 'about:srcdoc', browserContextId: 'ctx-owned' },
+    { targetId: 'owned-blank', type: 'iframe', parentId: 'owned-srcdoc', url: 'about:blank', browserContextId: 'ctx-owned' },
+    { targetId: 'owned-data', type: 'iframe', parentFrameId: 'main-frame', url: 'data:text/html;charset=utf-8,<p>x</p>', browserContextId: 'ctx-owned' },
+    { targetId: 'owned-https', type: 'iframe', parentFrameId: 'main-frame', url: 'https://example.com/frame', browserContextId: 'ctx-owned' },
+    { targetId: 'foreign-frame', type: 'iframe', parentFrameId: 'foreign-page', url: 'about:srcdoc', browserContextId: 'ctx-owned' },
+    { targetId: 'other-context', type: 'iframe', parentFrameId: 'main-frame', url: 'about:srcdoc', browserContextId: 'ctx-other' },
+    { targetId: 'loop-a', type: 'iframe', parentId: 'loop-b', url: 'about:blank', browserContextId: 'ctx-owned' },
+    { targetId: 'loop-b', type: 'iframe', parentId: 'loop-a', url: 'about:blank', browserContextId: 'ctx-owned' },
+  ], ['main-frame'], 'ctx-owned');
+
+  assert.deepEqual(Array.from(result.ownedTargetIds).sort(), ['owned-blank', 'owned-data', 'owned-https', 'owned-srcdoc']);
+  assert.deepEqual(Array.from(result.sandboxedIframeIds).sort(), ['owned-blank', 'owned-data', 'owned-srcdoc']);
 });
 
 test('validateImageHeaderAndTrailer checks PNG IHDR+IEND, JPEG SOF+EOI, WebP RIFF dimensions, and size bounds without decoding pixels', () => {
@@ -1308,6 +1354,13 @@ test('validateImageHeaderAndTrailer checks PNG IHDR+IEND, JPEG SOF+EOI, WebP RIF
   assert.equal(jpegResult.ext, 'jpg');
   assert.equal(jpegResult.width, 2752);
   assert.equal(jpegResult.height, 1536);
+  const zeroFilledJpeg = helpers.validateImageHeaderAndTrailer(
+    makeSyntheticJpeg(2752, 1536, { zeroFillBeforeSof: true }),
+    256,
+  );
+  assert.equal(zeroFilledJpeg.ok, true);
+  assert.equal(zeroFilledJpeg.width, 2752);
+  assert.equal(zeroFilledJpeg.height, 1536);
   assert.equal(
     helpers.validateImageHeaderAndTrailer(makeSyntheticJpeg(2752, 1536, { missingEoi: true }), 256).reason,
     'invalid_jpeg_trailer',
@@ -1570,6 +1623,107 @@ test('full-size download saves a 2752x1536 PNG disguised as .jpeg as .png and re
     assert.deepEqual(harness.state.cancels, []);
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('full-size download verifies a late OOPIF sandbox iframe with a bounded Target.getTargets and replays blob:null download events', async () => {
+  const timerDelays = [];
+  const helpers = loadGeminiDownloadHelpers({
+    setTimeout(fn, ms) {
+      timerDelays.push(ms);
+      return setTimeout(fn, ms);
+    },
+  });
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-full-oopif-'));
+  try {
+    const candidate = makeFullSizeCandidate(1);
+    const expectedBytes = makeSyntheticJpeg(2752, 1536, { zeroFillBeforeSof: true });
+    const ownedTargets = [
+      { targetId: 'main-frame', type: 'page', url: 'https://gemini.google.com/app', browserContextId: 'ctx-owned' },
+      { targetId: 'oopif-frame', type: 'iframe', parentFrameId: 'main-frame', url: 'about:srcdoc', browserContextId: 'ctx-owned' },
+    ];
+    const harness = makeFullSizeHarness(candidate, {
+      onGetTargets({ call }) {
+        return { targetInfos: call === 1 ? [] : ownedTargets };
+      },
+      onClick({ browserWs, state }) {
+        writeFileSync(join(state.downloadPath, 'guid-oopif'), expectedBytes);
+        beginOwnedDownload(browserWs, 'guid-oopif', 'oopif-frame', 'blob:null/7c7d3dc2-2fa0-41bc-95da-8157cf998131');
+        completeOwnedDownload(browserWs, 'guid-oopif');
+      },
+    });
+    const output = join(tmpRoot, 'oopif.jpeg');
+    const result = await helpers.downloadAndPublishBatchWithMeta(
+      harness.pageWs,
+      { ok: true, candidates: [candidate] },
+      'verify()',
+      output,
+      fullSizeIdentity(),
+      {
+        timeoutMs: 3000,
+        fullSizeTimeoutMs: 2000,
+        verifyTimeoutMs: 10000,
+        eventGraceMs: 1000,
+        browserWs: harness.browserWs,
+      },
+    );
+    assert.equal(result.downloadSource, 'full_size_download');
+    assert.deepEqual(Array.from(result.files), [join(tmpRoot, 'oopif.jpg')]);
+    assert.deepEqual(readFileSync(join(tmpRoot, 'oopif.jpg')), expectedBytes);
+    assert.equal(harness.state.targetSetDiscoverCalls, 1);
+    assert.ok(harness.state.targetGetCalls >= 2, 'initial discovery plus one unknown-frame verification');
+    assert.ok(timerDelays.includes(2000), 'Target.getTargets checks must be capped at 2000ms');
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('full-size download drops unverified OOPIF download events after Target.getTargets timeout or no ownership', async () => {
+  const candidate = makeFullSizeCandidate(1);
+  const ownedPage = { targetId: 'main-frame', type: 'page', url: 'https://gemini.google.com/app', browserContextId: 'ctx-owned' };
+
+  for (const mode of ['timeout', 'no-ownership']) {
+    const tmpRoot = mkdtempSync(join(tmpdir(), `gemini-full-oopif-${mode}-`));
+    try {
+      const helpers = loadGeminiDownloadHelpers();
+      const foreignTargets = [
+        ownedPage,
+        { targetId: 'foreign-frame', type: 'iframe', parentFrameId: 'foreign-page', url: 'about:srcdoc', browserContextId: 'ctx-owned' },
+      ];
+      const harness = makeFullSizeHarness(candidate, {
+        onGetTargets({ call }) {
+          if (call === 1) return { targetInfos: [] };
+          if (mode === 'timeout') return new Promise(() => {});
+          return { targetInfos: foreignTargets };
+        },
+        onClick({ browserWs, state }) {
+          writeFileSync(join(state.downloadPath, 'guid-unverified'), makeSyntheticJpeg(2752, 1536));
+          beginOwnedDownload(browserWs, 'guid-unverified', 'foreign-frame', 'blob:null/11111111-2222-3333-4444-555555555555');
+          completeOwnedDownload(browserWs, 'guid-unverified');
+        },
+      });
+      const result = await helpers.downloadAndPublishBatchWithMeta(
+        harness.pageWs,
+        { ok: true, candidates: [candidate] },
+        'verify()',
+        join(tmpRoot, 'drop.jpeg'),
+        fullSizeIdentity(),
+        {
+          timeoutMs: 600,
+          fullSizeTimeoutMs: 400,
+          verifyTimeoutMs: mode === 'timeout' ? 60 : 2000,
+          eventGraceMs: 120,
+          browserWs: harness.browserWs,
+        },
+      );
+      assert.equal(result.downloadSource, 'preview_fallback');
+      assert.deepEqual(Array.from(result.fallbackReasons), ['click_no_download_event']);
+      assert.deepEqual(Array.from(result.files), [join(tmpRoot, 'drop.png')]);
+      assert.equal(existsSync(join(tmpRoot, 'drop.jpg')), false);
+      assert.ok(harness.state.targetGetCalls >= 2);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
   }
 });
 

@@ -790,6 +790,422 @@ test('V2-R6: selectGeminiMode rejects reopened menu when duplicate mode names ap
     assert.equal(status, 'error: Gemini model selection readback mismatch');
 });
 
+test('Gemini 4 nested thinking-level submenu supports hover/click open, check icons, bilingual aliases, and fail-closed readback', async () => {
+    const makeGemini4Doc = ({ openOn = 'hover', useCheckIcon = false, failUpdate = false, conflictSubmenu = false, lockHigh = false } = {}) => {
+        let topOpen = false;
+        let subOpen = false;
+        let selectedModel = 'auto';
+        let selectedThinking = 'medium';
+
+        const makeItem = (key, text, { role = 'menuitemradio', haspopup = '', locked = false, onClick, onHover } = {}) => {
+            const isChecked = () => {
+                if (['auto', 'hydrogen', 'neon', 'carbon'].includes(key)) {
+                    return selectedModel === key;
+                }
+                if (['low', 'medium', 'high'].includes(key)) {
+                    if (conflictSubmenu && key === 'low') return true;
+                    return selectedThinking === key;
+                }
+                return false;
+            };
+            const item = {
+                tagName: 'BUTTON',
+                innerText: text,
+                textContent: text,
+                disabled: locked,
+                className: haspopup ? 'mat-mdc-menu-item mat-mdc-menu-item-submenu-trigger' : 'mat-mdc-menu-item',
+                hasAttribute: (k) => (k === 'disabled' ? locked : false),
+                getAttribute: (k) => {
+                    if (k === 'role') return role;
+                    if (k === 'aria-haspopup') return haspopup;
+                    if (k === 'aria-disabled') return locked ? 'true' : 'false';
+                    if (k === 'aria-checked') {
+                        if (useCheckIcon) return '';
+                        return isChecked() ? 'true' : 'false';
+                    }
+                    if (k === 'aria-selected') return '';
+                    return '';
+                },
+                querySelector: () => (locked ? { tagName: 'MAT-ICON', textContent: 'lock' } : null),
+                querySelectorAll: (sel) => {
+                    if (useCheckIcon && sel.includes('mat-icon') && isChecked()) {
+                        return [{ tagName: 'MAT-ICON', textContent: 'check', getAttribute: () => 'check' }];
+                    }
+                    return [];
+                },
+                dispatchEvent(ev) {
+                    if (onHover && ['pointerenter', 'mouseenter', 'mouseover'].includes(ev && ev.type)) {
+                        onHover();
+                    }
+                    return true;
+                },
+                click() {
+                    if (onClick) onClick();
+                },
+            };
+            return item;
+        };
+
+        const topItems = [
+            makeItem('auto', '自動\n根據需求調整回覆', {
+                onClick: () => { selectedModel = 'auto'; topOpen = false; subOpen = false; },
+            }),
+            makeItem('hydrogen', '全天候貼心協助\n4 Hydrogen', {
+                onClick: () => { selectedModel = 'hydrogen'; topOpen = false; subOpen = false; },
+            }),
+            makeItem('neon', '深入分析\n4 Neon\n新模型', {
+                onClick: () => { selectedModel = 'neon'; topOpen = false; subOpen = false; },
+            }),
+            makeItem('carbon', '程式編寫與複雜任務\n4 Carbon\n升級', {
+                locked: true,
+            }),
+            makeItem('thinking-trigger', '思考程度', {
+                role: 'menuitem',
+                haspopup: 'menu',
+                onHover: () => { if (openOn === 'hover') subOpen = true; },
+                onClick: () => { if (openOn === 'click') subOpen = true; },
+            }),
+        ];
+        const subItems = [
+            makeItem('low', '低\n快速高效', {
+                onClick: () => { if (!failUpdate) selectedThinking = 'low'; subOpen = false; topOpen = false; },
+            }),
+            makeItem('medium', '中等\n適中', {
+                onClick: () => { if (!failUpdate) selectedThinking = 'medium'; subOpen = false; topOpen = false; },
+            }),
+            makeItem('high', '高\n詳盡', {
+                locked: lockHigh,
+                onClick: () => { if (!failUpdate) selectedThinking = 'high'; subOpen = false; topOpen = false; },
+            }),
+        ];
+
+        const doc = {
+            querySelectorAll(sel) {
+                if (sel === 'button') {
+                    return [{
+                        tagName: 'BUTTON',
+                        innerText: selectedModel === 'hydrogen' ? '全天候貼心協助' : '自動',
+                        textContent: selectedModel === 'hydrogen' ? '全天候貼心協助' : '自動',
+                        getAttribute: (k) => (k === 'aria-label' ? '模式挑選器' : ''),
+                        click() { topOpen = !topOpen; subOpen = false; },
+                    }];
+                }
+                if (sel.includes('menuitem')) {
+                    if (!topOpen) return [];
+                    return subOpen ? [...topItems, ...subItems] : [...topItems];
+                }
+                return [];
+            },
+        };
+        const dispatchEscape = () => {
+            if (subOpen) {
+                subOpen = false;
+            } else {
+                topOpen = false;
+            }
+        };
+        return { doc, dispatchEscape, state: () => ({ selectedModel, selectedThinking, topOpen, subOpen }) };
+    };
+
+    // 1. Sequential "4 Hydrogen" then "高" via hover-opened submenu with aria-checked
+    const hoverCtx = makeGemini4Doc({ openOn: 'hover' });
+    assert.equal(
+        await selectGeminiMode('4 Hydrogen', { doc: hoverCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: hoverCtx.dispatchEscape }),
+        'success:gemini_mode_menu_v1',
+    );
+    assert.equal(
+        await selectGeminiMode('高', { doc: hoverCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: hoverCtx.dispatchEscape }),
+        'success:gemini_mode_menu_v1',
+    );
+    assert.deepEqual(hoverCtx.state(), { selectedModel: 'hydrogen', selectedThinking: 'high', topOpen: false, subOpen: false });
+
+    // 2. Click-opened submenu + mat-icon checkmark + bilingual English alias "High" -> matches "高"
+    const clickCtx = makeGemini4Doc({ openOn: 'click', useCheckIcon: true });
+    assert.equal(
+        await selectGeminiMode('4 Hydrogen', { doc: clickCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: clickCtx.dispatchEscape }),
+        'success:gemini_mode_menu_v1',
+    );
+    assert.equal(
+        await selectGeminiMode('High', { doc: clickCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: clickCtx.dispatchEscape }),
+        'success:gemini_mode_menu_v1',
+    );
+    assert.deepEqual(clickCtx.state(), { selectedModel: 'hydrogen', selectedThinking: 'high', topOpen: false, subOpen: false });
+
+    // 3. Fail-closed negative cases: readback mismatch, conflicting submenu check, locked item, unknown label
+    const mismatchCtx = makeGemini4Doc({ failUpdate: true });
+    assert.equal(
+        await selectGeminiMode('高', { doc: mismatchCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: mismatchCtx.dispatchEscape }),
+        'error: Gemini model selection readback mismatch',
+    );
+
+    const conflictCtx = makeGemini4Doc({ conflictSubmenu: true });
+    assert.equal(
+        await selectGeminiMode('高', { doc: conflictCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: conflictCtx.dispatchEscape }),
+        'error: Gemini model selection readback mismatch',
+    );
+
+    const lockedCtx = makeGemini4Doc({ lockHigh: true });
+    assert.equal(
+        await selectGeminiMode('高', { doc: lockedCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: lockedCtx.dispatchEscape }),
+        'error: matched model is locked or disabled',
+    );
+
+    const missingCtx = makeGemini4Doc();
+    assert.equal(
+        await selectGeminiMode('超高推理', { doc: missingCtx.doc, sleep: async () => {}, isVisible: () => true, dispatchEscape: missingCtx.dispatchEscape }),
+        'error: model not found in menu',
+    );
+});
+
+test('V2-R7: dismissGeminiMenus closes Gemini shield when Escape is ineffective and sequential Gemini 4 selections stay stable', async () => {
+    let selectedModel = 'auto';
+    let selectedThinking = 'medium';
+    let topOpen = false;
+    let subOpen = false;
+    let shieldClicks = 0;
+
+    const makeItem = (key, text, { role = 'menuitemradio', haspopup = '', onClick, onHover } = {}) => ({
+        tagName: 'BUTTON',
+        innerText: text,
+        textContent: text,
+        disabled: false,
+        className: haspopup ? 'mat-mdc-menu-item-submenu-trigger' : 'mat-mdc-menu-item',
+        hasAttribute: () => false,
+        getAttribute(name) {
+            if (name === 'role') return role;
+            if (name === 'aria-haspopup') return haspopup;
+            if (name === 'aria-checked') {
+                if (['hydrogen', 'neon', 'carbon', 'auto'].includes(key)) return selectedModel === key ? 'true' : 'false';
+                return selectedThinking === key ? 'true' : 'false';
+            }
+            return '';
+        },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        dispatchEvent(ev) {
+            if (onHover && ['pointerenter', 'mouseenter', 'mouseover'].includes(ev && ev.type)) onHover();
+            return true;
+        },
+        click() { if (onClick) onClick(); },
+    });
+
+    const topItems = [
+        makeItem('hydrogen', '全天候貼心協助\n4 Hydrogen', {
+            onClick: () => { selectedModel = 'hydrogen'; topOpen = false; subOpen = false; },
+        }),
+        makeItem('thinking-trigger', '思考程度', {
+            role: 'menuitem',
+            haspopup: 'menu',
+            onHover: () => { subOpen = true; },
+        }),
+    ];
+    const subItems = [
+        makeItem('medium', '中等\n適中', {
+            onClick: () => { selectedThinking = 'medium'; topOpen = false; subOpen = false; },
+        }),
+        makeItem('high', '高\n詳盡', {
+            onClick: () => { selectedThinking = 'high'; topOpen = false; subOpen = false; },
+        }),
+    ];
+    const picker = {
+        tagName: 'BUTTON',
+        innerText: selectedModel === 'hydrogen' ? '全天候貼心協助' : '自動',
+        textContent: selectedModel === 'hydrogen' ? '全天候貼心協助' : '自動',
+        getAttribute: (name) => (name === 'aria-label' ? '模式挑選器' : ''),
+        click() { topOpen = !topOpen; subOpen = false; },
+    };
+    const shield = {
+        click() {
+            shieldClicks += 1;
+            topOpen = false;
+            subOpen = false;
+        },
+    };
+    const doc = {
+        querySelectorAll(selector) {
+            if (selector === 'button') return [picker];
+            if (selector.includes('menuitem')) {
+                if (!topOpen) return [];
+                return subOpen ? [...topItems, ...subItems] : [...topItems];
+            }
+            if (selector.includes('.popover-click-shield')) return (topOpen || subOpen) ? [shield] : [];
+            return [];
+        },
+    };
+    const dispatchEscape = () => {};
+
+    assert.equal(
+        await selectGeminiMode('4 Hydrogen', { doc, sleep: async () => {}, isVisible: () => true, dispatchEscape }),
+        'success:gemini_mode_menu_v1',
+    );
+    assert.equal(
+        await selectGeminiMode('高', { doc, sleep: async () => {}, isVisible: () => true, dispatchEscape }),
+        'success:gemini_mode_menu_v1',
+    );
+    assert.deepEqual({ selectedModel, selectedThinking, topOpen, subOpen }, {
+        selectedModel: 'hydrogen',
+        selectedThinking: 'high',
+        topOpen: false,
+        subOpen: false,
+    });
+    assert.ok(shieldClicks >= 2, 'both selections must close the Gemini shield without Escape');
+});
+
+test('V2-R7: delayed picker mount still gets at least three polls after one sleep jumps past pickerWaitMs', async () => {
+    const originalNow = Date.now;
+    let clock = 0;
+    let sleepCalls = 0;
+    let buttonQueries = 0;
+    let menuOpen = false;
+    let selected = false;
+    Date.now = () => clock;
+    try {
+        const picker = {
+            tagName: 'BUTTON',
+            innerText: 'Gemini Mode',
+            textContent: 'Gemini Mode',
+            getAttribute: (name) => (name === 'aria-label' ? '模式挑選器' : ''),
+            click() { menuOpen = true; },
+        };
+        const item = {
+            tagName: 'BUTTON',
+            innerText: '3.1 Pro',
+            textContent: '3.1 Pro',
+            disabled: false,
+            hasAttribute: () => false,
+            getAttribute: (name) => {
+                if (name === 'role') return 'menuitemradio';
+                if (name === 'aria-checked') return selected ? 'true' : 'false';
+                return '';
+            },
+            querySelector: () => null,
+            click() { selected = true; menuOpen = false; },
+        };
+        const doc = {
+            querySelectorAll(selector) {
+                if (selector === 'button') {
+                    buttonQueries += 1;
+                    return buttonQueries <= 2 ? [] : [picker];
+                }
+                if (selector.includes('menuitem')) return menuOpen ? [item] : [];
+                return [];
+            },
+        };
+        const status = await selectGeminiMode('3.1 Pro', {
+            doc,
+            isVisible: () => true,
+            pickerWaitMs: 5000,
+            sleep: async () => { sleepCalls += 1; clock += 5000; },
+            dispatchEscape: () => { menuOpen = false; },
+        });
+        assert.equal(status, 'success:gemini_mode_menu_v1');
+        assert.ok(buttonQueries >= 3, 'picker polling must query the DOM at least three times');
+        assert.ok(sleepCalls >= 3, 'picker polling must not stop after the first throttled sleep');
+    } finally {
+        Date.now = originalNow;
+    }
+});
+
+test('V2-R7: selection waits for the shield to unload before readback, and retries a zero-item reopen once', async () => {
+    let menuOpen = false;
+    let selected = false;
+    let shieldSleepsRemaining = 0;
+    let earlyReopen = false;
+    let readbackOpens = 0;
+    const item = {
+        tagName: 'BUTTON',
+        innerText: '3.1 Pro',
+        textContent: '3.1 Pro',
+        disabled: false,
+        hasAttribute: () => false,
+        getAttribute: (name) => {
+            if (name === 'role') return 'menuitemradio';
+            if (name === 'aria-checked') return selected ? 'true' : 'false';
+            return '';
+        },
+        querySelector: () => null,
+        click() { selected = true; menuOpen = false; shieldSleepsRemaining = 3; },
+    };
+    const picker = {
+        tagName: 'BUTTON',
+        innerText: 'Gemini Mode',
+        textContent: 'Gemini Mode',
+        getAttribute: (name) => (name === 'aria-label' ? '模式挑選器' : ''),
+        click() {
+            if (selected && shieldSleepsRemaining > 0) earlyReopen = true;
+            menuOpen = true;
+        },
+    };
+    const shield = { click() {} };
+    const doc = {
+        querySelectorAll(selector) {
+            if (selector === 'button') return [picker];
+            if (selector.includes('menuitem')) return menuOpen ? [item] : [];
+            if (selector.includes('.popover-click-shield')) return shieldSleepsRemaining > 0 ? [shield] : [];
+            return [];
+        },
+    };
+    const status = await selectGeminiMode('3.1 Pro', {
+        doc,
+        sleep: async () => { if (shieldSleepsRemaining > 0) shieldSleepsRemaining -= 1; },
+        isVisible: () => true,
+        dispatchEscape: () => { menuOpen = false; },
+    });
+    assert.equal(status, 'success:gemini_mode_menu_v1');
+    assert.equal(earlyReopen, false, 'readback must wait until the overlay shield is gone');
+
+    let retryMenuOpen = false;
+    let retrySelected = false;
+    let suppressReadback = false;
+    const retryItem = {
+        tagName: 'BUTTON',
+        innerText: '3.1 Pro',
+        textContent: '3.1 Pro',
+        disabled: false,
+        hasAttribute: () => false,
+        getAttribute: (name) => {
+            if (name === 'role') return 'menuitemradio';
+            if (name === 'aria-checked') return retrySelected ? 'true' : 'false';
+            return '';
+        },
+        querySelector: () => null,
+        click() { retrySelected = true; retryMenuOpen = false; },
+    };
+    const retryPicker = {
+        tagName: 'BUTTON',
+        innerText: 'Gemini Mode',
+        textContent: 'Gemini Mode',
+        getAttribute: (name) => (name === 'aria-label' ? '模式挑選器' : ''),
+        click() {
+            retryMenuOpen = true;
+            if (retrySelected) {
+                readbackOpens += 1;
+                suppressReadback = readbackOpens === 1;
+            }
+        },
+    };
+    const retryDoc = {
+        querySelectorAll(selector) {
+            if (selector === 'button') return [retryPicker];
+            if (selector.includes('menuitem')) {
+                if (!retryMenuOpen || suppressReadback) return [];
+                return [retryItem];
+            }
+            return [];
+        },
+    };
+    const retryStatus = await selectGeminiMode('3.1 Pro', {
+        doc: retryDoc,
+        sleep: async () => {},
+        isVisible: () => true,
+        openWaitMs: 20,
+        pollIntervalMs: 10,
+        dispatchEscape: () => { retryMenuOpen = false; },
+    });
+    assert.equal(retryStatus, 'success:gemini_mode_menu_v1');
+    assert.equal(readbackOpens, 2, 'zero-item reopen must be retried exactly once');
+});
+
 // --- Gemini full-size download button scoping contract ---
 function makeFullSizeControl(options = {}) {
     const attrs = options.attrs || {};
