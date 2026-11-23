@@ -126,6 +126,48 @@ function collectGeminiAttachmentLeaves(root, isVisibleFn) {
     });
 }
 
+function isDomAvatarElement(img, stopBoundary) {
+    let cursor = img || null;
+    while (cursor && cursor !== stopBoundary) {
+        if (typeof cursor.matches === 'function') {
+            try {
+                if (cursor.matches('[data-testid*="avatar" i], [data-test-id*="avatar" i], [class*="user-avatar" i], [class*="account-avatar" i], [class*="profile-pic" i], [aria-label*="Google Account" i], [aria-label*="Google 帳戶" i]')) {
+                    return true;
+                }
+            } catch (_) {}
+        }
+        cursor = cursor.parentElement || null;
+    }
+    return false;
+}
+
+function findInnermostAttachmentBoundary(img, imgContainers, imgContainerSet, root) {
+    let cursor = (img && img.parentElement) || null;
+    while (cursor) {
+        if (imgContainerSet.has(cursor)) return cursor;
+        if (cursor === root) break;
+        cursor = cursor.parentElement || null;
+    }
+
+    let boundary = null;
+    for (const container of imgContainers) {
+        if (!container || container === img || typeof container.contains !== 'function' || !container.contains(img)) continue;
+        const containsDeeperContainer = imgContainers.some((other) => (
+            other !== container
+            && other !== img
+            && typeof container.contains === 'function'
+            && typeof other.contains === 'function'
+            && container.contains(other)
+            && other.contains(img)
+        ));
+        if (!containsDeeperContainer) {
+            boundary = container;
+            break;
+        }
+    }
+    return boundary;
+}
+
 function projectGeminiAttachments(root, expectedDocNames, baseline = {}, isVisibleFn = () => true) {
     const docNames = Array.isArray(expectedDocNames) ? expectedDocNames : [];
     const baseDocCounts = (baseline && baseline.document_counts) || {};
@@ -191,14 +233,16 @@ function projectGeminiAttachments(root, expectedDocNames, baseline = {}, isVisib
         unexpectedDocuments += Math.max(0, observed - expected);
     }
 
-    const scopedImgs = [];
+    const imgContainers = Array.from(root.querySelectorAll(GEMINI_ATTACHMENT_IMG_CONTAINER_SELECTOR)).filter(isVisibleFn);
+    const imgContainerSet = new Set(imgContainers);
     const seenImg = new Set();
-    for (const container of Array.from(root.querySelectorAll(GEMINI_ATTACHMENT_IMG_CONTAINER_SELECTOR)).filter(isVisibleFn)) {
+    const scopedImgs = [];
+    for (const container of imgContainers) {
         for (const img of Array.from(container.querySelectorAll('img')).filter(isVisibleFn)) {
             if (seenImg.has(img)) continue;
             seenImg.add(img);
-            const src = String(img.currentSrc || img.src || '');
-            if (/avatar|profile/i.test(src)) continue;
+            const boundary = findInnermostAttachmentBoundary(img, imgContainers, imgContainerSet, root);
+            if (isDomAvatarElement(img, boundary)) continue;
             scopedImgs.push(img);
         }
     }

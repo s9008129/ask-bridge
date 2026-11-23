@@ -21,6 +21,8 @@ const GEMINI_ORIGIN = 'https://gemini.google.com';
 const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const REQUEST_TIMEOUT_MS = 30000;
+const CDP_CALL_TIMEOUT_MS = 10000;
+const CDP_OPEN_TIMEOUT_MS = 5000;
 const DEFAULT_MINIMUM_IMAGE_DIMENSION = 256;
 const MINIMUM_IMAGE_DIMENSION = (
     typeof __GEMINI_MIN_IMAGE_DIMENSION__ === 'number'
@@ -508,18 +510,54 @@ function resolveOutputFilePaths(imageOutput, extList) {
     return extList.map((ext, idx) => path.join(raw, `generated_${epoch}_${idx + 1}.${ext}`));
 }
 
-async function callCdp(ws, method, params = {}) {
+async function callCdp(ws, method, params = {}, timeoutMs = CDP_CALL_TIMEOUT_MS) {
     const id = Math.floor(Math.random() * 1e9);
+    const effectiveTimeoutMs = Math.max(1, Number.isFinite(timeoutMs) ? timeoutMs : CDP_CALL_TIMEOUT_MS);
     return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = null;
+        const cleanup = () => {
+            if (ws && typeof ws.removeEventListener === 'function') {
+                ws.removeEventListener('message', onMessage);
+                ws.removeEventListener('close', onClose);
+                ws.removeEventListener('error', onError);
+            }
+            if (timer !== null) clearTimeout(timer);
+        };
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn(value);
+        };
         const onMessage = (event) => {
             const msg = JSON.parse(event.data);
             if (msg.id !== id) return;
-            ws.removeEventListener('message', onMessage);
-            if (msg.error) reject(new Error(msg.error.message || 'CDP error'));
-            else resolve(msg.result);
+            if (msg.error) finish(reject, new Error(msg.error.message || 'CDP error'));
+            else finish(resolve, msg.result);
         };
+        const onClose = () => finish(reject, new Error('CDP connection closed before response'));
+        const onError = () => finish(reject, new Error('CDP connection failed'));
+        if (!ws || typeof ws.addEventListener !== 'function' || typeof ws.send !== 'function') {
+            finish(reject, new Error('Invalid CDP WebSocket'));
+            return;
+        }
+        if (Number.isFinite(ws.readyState) && ws.readyState >= 2) {
+            finish(reject, new Error('CDP connection is not open'));
+            return;
+        }
         ws.addEventListener('message', onMessage);
-        ws.send(JSON.stringify({ id, method, params }));
+        ws.addEventListener('close', onClose);
+        ws.addEventListener('error', onError);
+        timer = setTimeout(
+            () => finish(reject, new Error(`CDP call timed out: ${method}`)),
+            effectiveTimeoutMs,
+        );
+        try {
+            ws.send(JSON.stringify({ id, method, params }));
+        } catch (err) {
+            finish(reject, err);
+        }
     });
 }
 
@@ -575,28 +613,8 @@ function buildVerifyProjectionExpression(expectedIdentity) {
             return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
         };
         const stopSelectors = ['button[aria-label*="Stop" i]', 'button[aria-label*="停止"]'];
-        const assistantNodes = Array.from(document.querySelectorAll('model-response, .model-response-text'));
-        const userNodes = Array.from(document.querySelectorAll('user-query, .user-query'));
-        const turnKey = (el) => {
-            const root = el.closest('[data-turn-id], [data-turn-key], [data-response-id], model-response') || el;
-            return root.getAttribute('data-turn-id') || root.getAttribute('data-turn-key') || root.getAttribute('data-response-id') || root.getAttribute('id') || '';
-        };
-        const groupNodes = (els) => {
-            const groups = [];
-            for (const el of els) {
-                const scope = el.closest('model-response') || el;
-                const key = turnKey(el);
-                const prev = groups[groups.length - 1];
-                if (prev && ((key && prev.key === key) || prev.scope === scope)) {
-                    prev.nodes.push(el);
-                } else {
-                    groups.push({ key, scope, nodes: [el] });
-                }
-            }
-            return groups;
-        };
-        const assistantGroups = groupNodes(assistantNodes);
-        const userGroups = groupNodes(userNodes);
+        const assistantGroups = geminiTurnGroups(document, GEMINI_ASSISTANT_SELECTOR);
+        const userGroups = geminiTurnGroups(document, GEMINI_USER_SELECTOR);
         const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
         if (isGeminiGenerating(document, latestGroup, stopSelectors, isVisible)) {
             return { ok: false, reason: 'still_generating' };
@@ -689,7 +707,7 @@ async function readBlobDataUrlFromBrowser(ws, blobUrl, maxBytes = MAX_IMAGE_BYTE
             })()`,
             awaitPromise: true,
             returnByValue: true,
-        }),
+        }, effectiveTimeoutMs),
         new Promise((_, reject) => {
             timer = setTimeout(() => reject(new Error('Gemini blob image read timed out')), effectiveTimeoutMs);
         }),
@@ -703,10 +721,6 @@ async function readBlobDataUrlFromBrowser(ws, blobUrl, maxBytes = MAX_IMAGE_BYTE
 
 // Supports both `(cdpOrWs, frameId, url, maxBytes, timeoutMs)` and `(ws, url, maxBytes, timeoutMs)`
 async function tryReadCachedResourceViaCdp(cdpOrWs, frameIdOrUrl, maybeUrlOrMaxBytes, maybeMaxBytes, maybeTimeoutMs) {
-    const cdpCall = typeof cdpOrWs.call === 'function'
-        ? (method, params) => cdpOrWs.call(method, params)
-        : (method, params) => callCdp(cdpOrWs, method, params);
-
     let frameId;
     let url;
     let maxBytes = MAX_IMAGE_BYTES;
@@ -724,6 +738,10 @@ async function tryReadCachedResourceViaCdp(cdpOrWs, frameIdOrUrl, maybeUrlOrMaxB
     }
 
     const deadlineAt = Date.now() + Math.max(1, timeoutMs);
+    const remainingMs = () => Math.max(1, deadlineAt - Date.now());
+    const cdpCall = typeof cdpOrWs.call === 'function'
+        ? (method, params) => cdpOrWs.call(method, params)
+        : (method, params) => callCdp(cdpOrWs, method, params, remainingMs());
     const raceWithRemaining = (promise, msg) => {
         const remaining = deadlineAt - Date.now();
         if (remaining <= 0) {
@@ -784,8 +802,10 @@ async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, d
     const readBlobFn = deps.readBlobDataUrlFromBrowser || readBlobDataUrlFromBrowser;
     const readCachedFn = deps.tryReadCachedResourceViaCdp || tryReadCachedResourceViaCdp;
     const fetchFn = deps.fetchWithValidatedRedirects || fetchWithValidatedRedirects;
+    const fsOps = deps.fsOps || fs;
 
     const perImageTimeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS;
+    const verifyTimeoutMs = Number.isFinite(deps.verifyTimeoutMs) ? deps.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
     const fetched = [];
     for (let i = 0; i < before.candidates.length; i += 1) {
         const candidate = before.candidates[i];
@@ -845,7 +865,7 @@ async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, d
         const afterRes = await callCdp(ws, 'Runtime.evaluate', {
             expression: verifyExpr,
             returnByValue: true,
-        });
+        }, verifyTimeoutMs);
         const after = afterRes && afterRes.result && afterRes.result.value;
         if (!after || !after.ok || !candidatesEqual(before.candidates, after.candidates)) {
             const err = new Error(`Response identity changed during Gemini download: ${(after && after.reason) || 'candidates_mismatch'}`);
@@ -860,7 +880,7 @@ async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, d
         for (const item of tempFiles) {
             let st = null;
             try {
-                st = fs.lstatSync(item.targetPath);
+                st = fsOps.lstatSync(item.targetPath);
             } catch (statErr) {
                 if (!statErr || statErr.code !== 'ENOENT') {
                     throw statErr;
@@ -884,11 +904,11 @@ async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, d
                     path.dirname(targetPath),
                     `.${path.basename(targetPath)}.bak-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
                 );
-                fs.renameSync(targetPath, backupPath);
+                fsOps.renameSync(targetPath, backupPath);
                 backups.push({ targetPath, backupPath });
             }
             for (const item of tempFiles) {
-                fs.renameSync(item.tmpPath, item.targetPath);
+                fsOps.renameSync(item.tmpPath, item.targetPath);
                 item.published = true;
                 if (!existingSet.has(item.targetPath)) {
                     createdNewTargets.push(item.targetPath);
@@ -896,23 +916,54 @@ async function downloadAndPublishBatch(ws, before, verifyExpr, outputArgValue, d
                 published.push(item.targetPath);
             }
         } catch (publishErr) {
+            const rollbackFailures = [];
+            const remainingBackups = [];
+            const uncleanedNewTargets = [];
             for (const newTarget of createdNewTargets) {
-                try { fs.unlinkSync(newTarget); } catch (_) {}
+                try {
+                    fsOps.unlinkSync(newTarget);
+                } catch (error) {
+                    rollbackFailures.push({ action: 'unlink_new_target', targetPath: newTarget, error });
+                    uncleanedNewTargets.push(newTarget);
+                }
             }
             for (let i = backups.length - 1; i >= 0; i -= 1) {
                 const b = backups[i];
-                try { fs.renameSync(b.backupPath, b.targetPath); } catch (_) {}
+                try {
+                    fsOps.renameSync(b.backupPath, b.targetPath);
+                } catch (error) {
+                    const failure = {
+                        action: 'restore_backup',
+                        targetPath: b.targetPath,
+                        backupPath: b.backupPath,
+                        error,
+                    };
+                    rollbackFailures.push(failure);
+                    remainingBackups.push(failure);
+                }
+            }
+            if (rollbackFailures.length > 0) {
+                const retainedBackups = remainingBackups.map((item) => `${item.backupPath} -> ${item.targetPath}`).join(', ') || 'none';
+                const uncleanedTargets = uncleanedNewTargets.join(', ') || 'none';
+                const err = new Error(
+                    `Gemini image publish failed and rollback was incomplete; remaining backups: ${retainedBackups}; uncleaned targets: ${uncleanedTargets}; original error: ${publishErr && publishErr.message ? publishErr.message : String(publishErr)}`,
+                );
+                err.publishError = publishErr;
+                err.rollbackFailures = rollbackFailures;
+                err.remainingBackups = remainingBackups;
+                err.uncleanedNewTargets = uncleanedNewTargets;
+                throw err;
             }
             throw publishErr;
         }
         for (const b of backups) {
-            try { fs.unlinkSync(b.backupPath); } catch (_) {}
+            try { fsOps.unlinkSync(b.backupPath); } catch (_) {}
         }
         return published;
     } catch (err) {
         for (const item of tempFiles) {
             if (!item.published) {
-                try { fs.unlinkSync(item.tmpPath); } catch (_) {}
+                try { fsOps.unlinkSync(item.tmpPath); } catch (_) {}
             }
         }
         throw err;
@@ -930,72 +981,141 @@ async function readExpectedIdentityPayload(rawArg) {
     return Buffer.concat(chunks).toString('utf8');
 }
 
-async function runCli() {
-    let deadline = setTimeout(() => process.exit(1), 45000);
-    if (!tokenArg || !outputArg || !expectedIdentityJsonArg) {
-        throw new Error('Invalid Gemini download arguments');
+function waitForWebSocketOpen(ws, timeoutMs = CDP_OPEN_TIMEOUT_MS) {
+    if (!ws || typeof ws.addEventListener !== 'function') {
+        return Promise.reject(new Error('Invalid CDP WebSocket'));
     }
-
-    const expectedIdentityRaw = await readExpectedIdentityPayload(expectedIdentityJsonArg);
-    let expectedIdentity;
-    try {
-        expectedIdentity = JSON.parse(expectedIdentityRaw);
-    } catch (_) {
-        throw new Error('Invalid expected identity payload');
-    }
-    if (
-        !expectedIdentity
-        || typeof expectedIdentity !== 'object'
-        || typeof expectedIdentity.turn_id !== 'string'
-        || !expectedIdentity.turn_id.trim()
-        || typeof expectedIdentity.conversation_id !== 'string'
-        || !expectedIdentity.conversation_id.trim()
-    ) {
-        throw new Error('Gemini image download requires non-empty verified turn_id and conversation_id');
-    }
-
-    const pages = await (await fetch('http://127.0.0.1:9223/json/list')).json();
-    const matched = [];
-    for (const page of (Array.isArray(pages) ? pages : []).filter((p) => {
-        if (!p || p.type !== 'page' || typeof p.url !== 'string') return false;
-        try { return new URL(p.url).origin === GEMINI_ORIGIN; } catch (_) { return false; }
-    })) {
-        const ws = new WebSocket(page.webSocketDebuggerUrl);
-        try {
-            await new Promise((resolve, reject) => {
-                ws.addEventListener('open', resolve, { once: true });
-                ws.addEventListener('error', reject, { once: true });
-            });
-            const marker = await callCdp(ws, 'Runtime.evaluate', {
-                expression: 'window.__ask_bridge_download_token || window.__ask_bridge_gemini_download_token',
-                returnByValue: true,
-            });
-            if (marker && marker.result && marker.result.value === tokenArg) {
-                matched.push({ page, ws });
-            } else {
-                ws.close();
+    if (ws.readyState === 1) return Promise.resolve();
+    const effectiveTimeoutMs = Math.max(1, Number.isFinite(timeoutMs) ? timeoutMs : CDP_OPEN_TIMEOUT_MS);
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = null;
+        const cleanup = () => {
+            if (typeof ws.removeEventListener === 'function') {
+                ws.removeEventListener('open', onOpen);
+                ws.removeEventListener('error', onError);
+                ws.removeEventListener('close', onClose);
             }
-        } catch (_) {
-            try { ws.close(); } catch (_) {}
-        }
-    }
+            if (timer !== null) clearTimeout(timer);
+        };
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn(value);
+        };
+        const onOpen = () => finish(resolve);
+        const onError = () => finish(reject, new Error('CDP connection failed'));
+        const onClose = () => finish(reject, new Error('CDP connection closed before open'));
+        ws.addEventListener('open', onOpen);
+        ws.addEventListener('error', onError);
+        ws.addEventListener('close', onClose);
+        timer = setTimeout(() => finish(reject, new Error('CDP connection open timed out')), effectiveTimeoutMs);
+    });
+}
 
-    if (matched.length !== 1) {
-        for (const item of matched) {
-            try { item.ws.close(); } catch (_) {}
+function writeStreamFlushed(stream, value) {
+    return new Promise((resolve, reject) => {
+        if (!stream || typeof stream.write !== 'function') {
+            resolve();
+            return;
         }
-        throw new Error('Owned Gemini download target was not unique');
-    }
+        let settled = false;
+        const finish = (err) => {
+            if (settled) return;
+            settled = true;
+            if (err) reject(err);
+            else resolve();
+        };
+        try {
+            stream.write(value, (err) => finish(err));
+        } catch (err) {
+            finish(err);
+        }
+    });
+}
 
-    const { ws } = matched[0];
+async function runCli(deps = {}) {
+    const token = deps.tokenArg ?? tokenArg;
+    const output = deps.outputArg ?? outputArg;
+    const identityArg = deps.expectedIdentityJsonArg ?? expectedIdentityJsonArg;
+    const fetchImpl = deps.fetch || fetch;
+    const WebSocketCtor = deps.WebSocketCtor || WebSocket;
+    const perImageTimeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : REQUEST_TIMEOUT_MS;
+    const verifyTimeoutMs = Number.isFinite(deps.verifyTimeoutMs) ? deps.verifyTimeoutMs : CDP_CALL_TIMEOUT_MS;
+    const cleanupTimeoutMs = Number.isFinite(deps.cleanupTimeoutMs) ? deps.cleanupTimeoutMs : 2000;
+    const configuredOverallLimitMs = Number.isFinite(deps.overallLimitMs) && deps.overallLimitMs > 0
+        ? deps.overallLimitMs
+        : null;
+    const onWatchdogExit = typeof deps.onWatchdogExit === 'function'
+        ? deps.onWatchdogExit
+        : () => process.exit(1);
+    const writeStdout = typeof deps.writeStdout === 'function'
+        ? deps.writeStdout
+        : (value) => writeStreamFlushed(process.stdout, value);
+    let deadline = setTimeout(onWatchdogExit, configuredOverallLimitMs || 45000);
+    let ws = null;
     try {
-        await callCdp(ws, 'Page.enable');
+        if (!token || !output || !identityArg) {
+            throw new Error('Invalid Gemini download arguments');
+        }
+
+        const expectedIdentityRaw = await readExpectedIdentityPayload(identityArg);
+        let expectedIdentity;
+        try {
+            expectedIdentity = JSON.parse(expectedIdentityRaw);
+        } catch (_) {
+            throw new Error('Invalid expected identity payload');
+        }
+        if (
+            !expectedIdentity
+            || typeof expectedIdentity !== 'object'
+            || typeof expectedIdentity.turn_id !== 'string'
+            || !expectedIdentity.turn_id.trim()
+            || typeof expectedIdentity.conversation_id !== 'string'
+            || !expectedIdentity.conversation_id.trim()
+        ) {
+            throw new Error('Gemini image download requires non-empty verified turn_id and conversation_id');
+        }
+
+        const pages = await (await fetchImpl('http://127.0.0.1:9223/json/list')).json();
+        const matched = [];
+        for (const page of (Array.isArray(pages) ? pages : []).filter((p) => {
+            if (!p || p.type !== 'page' || typeof p.url !== 'string') return false;
+            try { return new URL(p.url).origin === GEMINI_ORIGIN; } catch (_) { return false; }
+        })) {
+            const candidateWs = new WebSocketCtor(page.webSocketDebuggerUrl);
+            try {
+                await waitForWebSocketOpen(candidateWs, CDP_OPEN_TIMEOUT_MS);
+                const marker = await callCdp(candidateWs, 'Runtime.evaluate', {
+                    expression: 'window.__ask_bridge_download_token || window.__ask_bridge_gemini_download_token',
+                    returnByValue: true,
+                }, CDP_CALL_TIMEOUT_MS);
+                if (marker && marker.result && marker.result.value === token) {
+                    matched.push({ page, ws: candidateWs });
+                } else {
+                    candidateWs.close();
+                }
+            } catch (_) {
+                try { candidateWs.close(); } catch (_) {}
+            }
+        }
+
+        if (matched.length !== 1) {
+            for (const item of matched) {
+                try { item.ws.close(); } catch (_) {}
+            }
+            throw new Error('Owned Gemini download target was not unique');
+        }
+
+        ws = matched[0].ws;
+        await callCdp(ws, 'Page.enable', {}, CDP_CALL_TIMEOUT_MS);
 
         const verifyExpr = buildVerifyProjectionExpression(expectedIdentity);
         const beforeRes = await callCdp(ws, 'Runtime.evaluate', {
             expression: verifyExpr,
             returnByValue: true,
-        });
+        }, CDP_CALL_TIMEOUT_MS);
         const before = beforeRes && beforeRes.result && beforeRes.result.value;
         if (!before || !before.ok) {
             const err = new Error(`Response identity mismatch before Gemini download: ${(before && before.reason) || 'unknown'}`);
@@ -1003,15 +1123,43 @@ async function runCli() {
             throw err;
         }
 
-        clearTimeout(deadline);
-        const overallLimitMs = Math.max(35000, before.candidates.length * REQUEST_TIMEOUT_MS + 15000);
-        deadline = setTimeout(() => process.exit(1), overallLimitMs);
+        if (configuredOverallLimitMs === null) {
+            clearTimeout(deadline);
+            deadline = setTimeout(onWatchdogExit, Math.max(35000, before.candidates.length * perImageTimeoutMs + 15000));
+        }
 
-        const savedFiles = await downloadAndPublishBatch(ws, before, verifyExpr, outputArg);
-        process.stdout.write(JSON.stringify({ ok: true, count: savedFiles.length, files: savedFiles }));
+        const savedFiles = await downloadAndPublishBatch(ws, before, verifyExpr, output, {
+            timeoutMs: perImageTimeoutMs,
+            verifyTimeoutMs,
+            fsOps: deps.fsOps,
+        });
+        await writeStdout(JSON.stringify({ ok: true, count: savedFiles.length, files: savedFiles }));
+    } catch (error) {
+        const hasRemainingBackups = Array.isArray(error && error.remainingBackups)
+            && error.remainingBackups.length > 0;
+        const hasUncleanedTargets = Array.isArray(error && error.uncleanedNewTargets)
+            && error.uncleanedNewTargets.length > 0;
+        if (hasRemainingBackups || hasUncleanedTargets) {
+            await writeStdout(JSON.stringify({
+                ok: false,
+                error: 'publish_rollback_incomplete',
+                remaining_backups: (error.remainingBackups || []).map((item) => ({
+                    target_path: String((item && item.targetPath) || ''),
+                    backup_path: String((item && item.backupPath) || ''),
+                })),
+                uncleaned_targets: (error.uncleanedNewTargets || []).map((value) => String(value || '')),
+            }));
+        }
+        throw error;
     } finally {
-        try { await callCdp(ws, 'Runtime.evaluate', { expression: 'delete window.__ask_bridge_download_token; delete window.__ask_bridge_gemini_download_token' }); } catch (_) {}
-        try { ws.close(); } catch (_) {}
+        if (ws) {
+            try {
+                await callCdp(ws, 'Runtime.evaluate', {
+                    expression: 'delete window.__ask_bridge_download_token; delete window.__ask_bridge_gemini_download_token',
+                }, cleanupTimeoutMs);
+            } catch (_) {}
+            try { ws.close(); } catch (_) {}
+        }
         clearTimeout(deadline);
     }
 }
@@ -1021,6 +1169,8 @@ module.exports = {
     MAX_IMAGE_BYTES,
     MAX_REDIRECTS,
     REQUEST_TIMEOUT_MS,
+    CDP_CALL_TIMEOUT_MS,
+    CDP_OPEN_TIMEOUT_MS,
     DEFAULT_MINIMUM_IMAGE_DIMENSION,
     MINIMUM_IMAGE_DIMENSION,
     GEMINI_TURN_PROJECTION_EMBED,
@@ -1043,11 +1193,28 @@ module.exports = {
     sniffImageExt,
     candidatesEqual,
     buildVerifyProjectionExpression,
+    callCdp,
+    writeStreamFlushed,
+    runCli,
 };
 
 if (process.env.ASK_BRIDGE_DOWNLOAD_NO_AUTORUN !== '1') {
-    runCli().catch((error) => {
-        console.error(error && error.message ? error.message : 'Gemini CDP download failed');
-        process.exit(error && Number.isInteger(error.exitCode) ? error.exitCode : 1);
-    });
+    runCli()
+        .then(() => {
+            process.exitCode = 0;
+        })
+        .catch(async (error) => {
+            const code = error && Number.isInteger(error.exitCode) ? error.exitCode : 1;
+            process.exitCode = code;
+            try {
+                await writeStreamFlushed(
+                    process.stderr,
+                    `${error && error.message ? error.message : 'Gemini CDP download failed'}\n`,
+                );
+            } catch (_) {}
+            const forceExit = setTimeout(() => process.exit(code), 1000);
+            if (typeof forceExit.unref === 'function') {
+                forceExit.unref();
+            }
+        });
 }

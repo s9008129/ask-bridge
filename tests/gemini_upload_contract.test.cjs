@@ -56,6 +56,164 @@ const makeFakeCdp = (handlers) => {
   };
 };
 
+const makeAriaStepHarness = ({ ariaControls, ariaOwns }) => {
+  const calls = [];
+  const listeners = new Map();
+  let cdp;
+  const menuIds = Array.from(new Set(
+    [ariaControls, ariaOwns]
+      .filter(Boolean)
+      .flatMap((raw) => String(raw).trim().split(/\s+/).filter(Boolean)),
+  ));
+  const document = {
+    body: { tagName: 'BODY' },
+    documentElement: { tagName: 'HTML' },
+    querySelectorAll: (selector) => (
+      selector === '[role="menu"], [role="listbox"], .mat-mdc-menu-panel, .cdk-overlay-pane'
+        ? menus
+        : []
+    ),
+    getElementById: (id) => menus.find((menu) => menu.id === id) || null,
+  };
+  const window = {
+    location: { origin: 'https://gemini.google.com' },
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  };
+  function HTMLInputElement() {}
+  HTMLInputElement.prototype.click = () => {};
+  const input = Object.create(HTMLInputElement.prototype);
+  Object.assign(input, {
+    ownerDocument: document,
+    tagName: 'INPUT',
+    type: 'file',
+  });
+  const uploadItem = {
+    textContent: 'Upload files',
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ width: 160, height: 40 }),
+    click: () => input.click(),
+  };
+  const menus = menuIds.map((id) => ({
+    id,
+    ownerDocument: document,
+    matches: () => true,
+    querySelector: () => null,
+    querySelectorAll: () => [uploadItem],
+    getBoundingClientRect: () => ({ width: 200, height: 120 }),
+    contains: (node) => node === input,
+  }));
+  input.parentNode = menus[0];
+  const uploadBtn = {
+    tagName: 'BUTTON',
+    textContent: 'Add files',
+    getAttribute(name) {
+      if (name === 'aria-controls') return ariaControls;
+      if (name === 'aria-owns') return ariaOwns;
+      if (name === 'aria-label') return 'Add files';
+      return null;
+    },
+    getBoundingClientRect: () => ({ width: 40, height: 40 }),
+    click: () => {},
+  };
+  const composer = {
+    querySelectorAll: () => [uploadBtn],
+    contains: (node) => node === input,
+  };
+  const context = {
+    window,
+    document,
+    composer,
+    input,
+    HTMLInputElement,
+  };
+  cdp = {
+    calls,
+    emit(eventName, params) {
+      const fn = listeners.get(eventName);
+      if (fn) {
+        listeners.delete(eventName);
+        fn(params);
+      }
+    },
+    call: async (method, params = {}) => {
+      calls.push({ method, params });
+      if (method === 'Page.enable' || method === 'DOM.enable') return {};
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame-1' } } };
+      if (method === 'Runtime.evaluate' && params.returnByValue === false) {
+        return { result: { objectId: 'composer-obj-1' } };
+      }
+      if (
+        method === 'Runtime.evaluate'
+        && String(params.expression).includes('delete window.__ask_bridge_upload_token')
+      ) {
+        vm.runInNewContext(params.expression, context);
+        return {};
+      }
+      if (
+        method === 'Runtime.evaluate'
+        && String(params.expression).includes('__ask_bridge_pre_menus_v1')
+      ) {
+        const value = vm.runInNewContext(params.expression, context);
+        if (value && value.clicked === true) {
+          cdp.emit('Page.fileChooserOpened', {
+            frameId: 'main-frame-1',
+            backendNodeId: 777,
+          });
+        }
+        return { result: { value } };
+      }
+      if (method === 'Runtime.evaluate') return { result: { value: true } };
+      if (method === 'DOM.describeNode' && params.objectId === 'composer-obj-1') {
+        return { node: { nodeType: 1, nodeName: 'RICH-TEXTAREA', children: [] } };
+      }
+      if (method === 'DOM.describeNode' && params.backendNodeId === 777) {
+        return {
+          node: {
+            nodeType: 1,
+            nodeName: 'INPUT',
+            attributes: ['type', 'file', 'accept', 'image/*'],
+          },
+        };
+      }
+      if (method === 'DOM.resolveNode' && params.backendNodeId === 777) {
+        return { object: { objectId: 'input-obj-777' } };
+      }
+      if (
+        method === 'Runtime.callFunctionOn'
+        && String(params.functionDeclaration).includes('__ask_bridge_pre_menus_v1')
+      ) {
+        const value = vm.runInNewContext(
+          `(${params.functionDeclaration}).call(composer)`,
+          context,
+        );
+        return { result: { value } };
+      }
+      if (
+        method === 'Runtime.callFunctionOn'
+        && String(params.functionDeclaration).includes('isShadowWithin')
+      ) {
+        const value = vm.runInNewContext(
+          `(${params.functionDeclaration}).call(composer, input)`,
+          context,
+        );
+        return { result: { value } };
+      }
+      if (method === 'Page.setInterceptFileChooserDialog') return {};
+      if (method === 'DOM.setFileInputFiles') return {};
+      throw new Error(`unexpected CDP call ${method}`);
+    },
+    onceEvent: (eventName) => new Promise((resolve) => {
+      listeners.set(eventName, resolve);
+    }),
+  };
+  return {
+    context,
+    cdp,
+    uploadBtn,
+  };
+};
+
 test('isGeminiPageTarget strictly requires type=page and https://gemini.google.com origin', () => {
   const helpers = loadGeminiUploadHelpers();
   assert.equal(helpers.isGeminiPageTarget({ type: 'page', url: 'https://gemini.google.com/app' }), true);
@@ -363,52 +521,43 @@ test('V3-R1: inputAcceptsKind handles .png/extensions accurately, composer locks
   });
   assert.equal(resolvedContainer, innerTextarea);
 
-  // 3. Multiple ARIA menu targets -> Step 2 fails closed with 0 DOM.setFileInputFiles.
-  const multiAriaCdp = makeFakeCdp((method, params) => {
-    if (method === 'Page.enable' || method === 'DOM.enable') return {};
-    if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame-1' } } };
-    if (method === 'Runtime.evaluate' && params.returnByValue === false) return { result: { objectId: 'composer-obj-1' } };
-    if (method === 'DOM.describeNode' && params.objectId === 'composer-obj-1') {
-      return { node: { nodeType: 1, nodeName: 'RICH-TEXTAREA', children: [] } };
-    }
-    if (method === 'Page.setInterceptFileChooserDialog') return {};
-    if (method === 'Runtime.callFunctionOn') return { result: { value: { clicked: true } } };
-    if (method === 'Runtime.evaluate') {
-      if (String(params.expression).includes('delete window.__ask_bridge_upload_token')) return {};
-      if (String(params.expression).includes('ambiguous_aria_menu_targets')) {
-        const makeMenu = (id) => ({
-          id,
-          matches: () => true,
-          querySelector: () => null,
-          getBoundingClientRect: () => ({ width: 200, height: 120 }),
-        });
-        const menus = { m1: makeMenu('m1'), m2: makeMenu('m2') };
-        return {
-          result: {
-            value: vm.runInNewContext(params.expression, {
-              window: {
-                __ask_bridge_pre_menus_v1: new Set(),
-                __ask_bridge_trigger_aria_refs_v1: ['m1', 'm2'],
-                getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
-              },
-              document: {
-                getElementById: (id) => menus[id] || null,
-                querySelectorAll: () => [],
-              },
-              HTMLInputElement: function HTMLInputElement() {},
-            }),
-          },
-        };
-      }
-      return { result: { value: true } };
-    }
-    throw new Error(`unexpected ${method}`);
+  // 3. Real Step 1 -> Step 2: two distinct ARIA targets fail closed.
+  const ambiguous = makeAriaStepHarness({
+    ariaControls: 'menu-a',
+    ariaOwns: 'menu-b',
   });
   await assert.rejects(
-    helpers.uploadToGeminiPage(multiAriaCdp, '/tmp/report.md', 'document', {
+    helpers.uploadToGeminiPage(ambiguous.cdp, '/tmp/s01.png', 'image', {
       setTimeoutFn: (fn) => setTimeout(fn, 1),
     }),
     /ambiguous_aria_menu_targets/,
   );
-  assert.equal(multiAriaCdp.calls.some((c) => c.method === 'DOM.setFileInputFiles'), false);
+  assert.equal(
+    ambiguous.cdp.calls.filter((c) => c.method === 'Runtime.callFunctionOn'
+      && String(c.params.functionDeclaration).includes('__ask_bridge_pre_menus_v1')).length,
+    1,
+  );
+  assert.equal(
+    ambiguous.cdp.calls.some((c) => c.method === 'DOM.setFileInputFiles'),
+    false,
+  );
+
+  // 4. The same ARIA target reached through both attributes is deduplicated as one menu.
+  const unique = makeAriaStepHarness({
+    ariaControls: 'menu-a',
+    ariaOwns: 'menu-a',
+  });
+  const result = await helpers.uploadToGeminiPage(unique.cdp, '/tmp/s01.png', 'image', {
+    setTimeoutFn: (fn) => setTimeout(fn, 1),
+  });
+  assert.equal(result.mechanism, 'dynamic_file_chooser');
+  assert.equal(
+    unique.cdp.calls.filter((c) => c.method === 'Runtime.callFunctionOn'
+      && String(c.params.functionDeclaration).includes('__ask_bridge_pre_menus_v1')).length,
+    1,
+  );
+  assert.equal(
+    unique.cdp.calls.filter((c) => c.method === 'DOM.setFileInputFiles').length,
+    1,
+  );
 });

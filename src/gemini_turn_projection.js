@@ -12,6 +12,30 @@ const GEMINI_PLACEHOLDER_PATTERNS = [
     /preview-loading/i,
 ];
 
+const GEMINI_ASSISTANT_SELECTOR = 'model-response';
+const GEMINI_USER_SELECTOR = 'user-query';
+
+function geminiTurnGroups(doc, selector) {
+    if (!doc || typeof doc.querySelectorAll !== 'function') return [];
+    const groups = new Map();
+    const ordered = [];
+    for (const node of Array.from(doc.querySelectorAll(selector))) {
+        const scope = (typeof node.closest === 'function'
+            && (node.closest('[data-turn-key]')
+                || node.closest('[data-content-search-turn-key]')
+                || node.closest('[data-turn-id]')))
+            || node;
+        let group = groups.get(scope);
+        if (!group) {
+            group = { scope, nodes: [] };
+            groups.set(scope, group);
+            ordered.push(group);
+        }
+        group.nodes.push(node);
+    }
+    return ordered;
+}
+
 function geminiConversationId(urlOrLocation) {
     let pathname = '';
     let origin = '';
@@ -388,7 +412,10 @@ function geminiElementToMarkdown(element) {
 if (typeof module !== 'undefined' && module && module.exports) {
     module.exports = {
         GEMINI_PLACEHOLDER_PATTERNS,
+        GEMINI_ASSISTANT_SELECTOR,
+        GEMINI_USER_SELECTOR,
         geminiConversationId,
+        geminiTurnGroups,
         isGeminiPlaceholderElement,
         isGeminiGenerating,
         geminiTurnIdentity,

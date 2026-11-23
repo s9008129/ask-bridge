@@ -528,3 +528,521 @@ test('V3-R3/R4/R5: batch rollback preserves existing target on 2nd EISDIR failur
     /timed out/,
   );
 });
+
+test('V4-R4: publish rollback restores both targets and reports retained backups when rollback itself fails', async () => {
+  const fs = require('node:fs');
+  const { chmodSync, mkdirSync, readdirSync, writeFileSync } = fs;
+  const { basename } = require('node:path');
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-v4-r4-'));
+  const outDir = join(tmpRoot, 'out');
+  mkdirSync(outDir, { recursive: true });
+
+  try {
+    const origNow = Date.now;
+    Date.now = () => 1700000000123;
+    let targets;
+    try {
+      targets = helpers.resolveOutputFilePaths(`${outDir}/`, ['png', 'png']);
+    } finally {
+      Date.now = origNow;
+    }
+    const originals = [Buffer.from('ORIGINAL_ONE'), Buffer.from('ORIGINAL_TWO')];
+    writeFileSync(targets[0], originals[0]);
+    writeFileSync(targets[1], originals[1]);
+    chmodSync(targets[0], 0o640);
+    chmodSync(targets[1], 0o600);
+
+    const candidates = [
+      { artifactId: 'a1', src: `data:image/png;base64,${VALID_PNG.toString('base64')}`, naturalWidth: 1024, naturalHeight: 1024 },
+      { artifactId: 'a2', src: `data:image/png;base64,${VALID_PNG.toString('base64')}`, naturalWidth: 1024, naturalHeight: 1024 },
+    ];
+    const makeWs = () => ({
+      listeners: new Set(),
+      addEventListener(_type, fn) { this.listeners.add(fn); },
+      removeEventListener(_type, fn) { this.listeners.delete(fn); },
+      send(raw) {
+        const msg = JSON.parse(raw);
+        const result = msg.method === 'Runtime.evaluate'
+          ? { result: { value: { ok: true, candidates } } }
+          : {};
+        queueMicrotask(() => {
+          for (const fn of [...this.listeners]) fn({ data: JSON.stringify({ id: msg.id, result }) });
+        });
+      },
+    });
+
+    let promotions = 0;
+    const successfulRollbackFs = {
+      ...fs,
+      renameSync(source, target) {
+        if (basename(source).includes('.tmp-')) {
+          promotions += 1;
+          if (promotions === 2) {
+            const err = new Error('EACCES: simulated second publish rename failure');
+            err.code = 'EACCES';
+            throw err;
+          }
+        }
+        return fs.renameSync(source, target);
+      },
+    };
+    await assert.rejects(
+      () => helpers.downloadAndPublishBatch(
+        makeWs(),
+        { ok: true, candidates },
+        'verify()',
+        `${outDir}/`,
+        { fsOps: successfulRollbackFs },
+      ),
+      /EACCES/,
+    );
+    assert.deepEqual(readFileSync(targets[0]), originals[0]);
+    assert.deepEqual(readFileSync(targets[1]), originals[1]);
+    assert.equal(statSync(targets[0]).mode & 0o777, 0o640);
+    assert.equal(statSync(targets[1]).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(outDir).sort(), targets.map((target) => basename(target)).sort());
+
+    promotions = 0;
+    const rollbackFailureFs = {
+      ...fs,
+      renameSync(source, target) {
+        const sourceName = basename(source);
+        if (sourceName.includes('.tmp-')) {
+          promotions += 1;
+          if (promotions === 2) {
+            const err = new Error('EACCES: simulated second publish rename failure');
+            err.code = 'EACCES';
+            throw err;
+          }
+        }
+        if (sourceName.includes('.bak-') && target === targets[0]) {
+          const err = new Error('EACCES: simulated backup restore failure');
+          err.code = 'EACCES';
+          throw err;
+        }
+        return fs.renameSync(source, target);
+      },
+    };
+    let failure = null;
+    try {
+      await helpers.downloadAndPublishBatch(
+        makeWs(),
+        { ok: true, candidates },
+        'verify()',
+        `${outDir}/`,
+        { fsOps: rollbackFailureFs },
+      );
+    } catch (err) {
+      failure = err;
+    }
+    assert.ok(failure, 'publish must reject');
+    assert.match(failure.message, /rollback was incomplete/);
+    assert.equal(failure.publishError.code, 'EACCES');
+    assert.equal(failure.rollbackFailures.length, 1);
+    assert.equal(failure.rollbackFailures[0].action, 'restore_backup');
+    assert.equal(failure.rollbackFailures[0].targetPath, targets[0]);
+    assert.equal(failure.remainingBackups.length, 1);
+    assert.equal(failure.uncleanedNewTargets.length, 0);
+    const retained = failure.remainingBackups[0];
+    assert.equal(retained.targetPath, targets[0]);
+    assert.ok(fs.existsSync(retained.backupPath));
+    assert.deepEqual(readFileSync(retained.backupPath), originals[0]);
+    assert.match(failure.message, new RegExp(retained.backupPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.deepEqual(readFileSync(targets[1]), originals[1]);
+    assert.deepEqual(
+      readdirSync(outDir).sort(),
+      [basename(targets[0]), basename(targets[1]), basename(retained.backupPath)].sort(),
+    );
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('V5-R3: runCli emits narrow rollback recovery JSON when publish and rollback both fail', async () => {
+  const fs = require('node:fs');
+  const { basename } = require('node:path');
+  const helpers = loadGeminiDownloadHelpers();
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'gemini-v5-r3-'));
+  const target = join(tmpRoot, 'diagram.png');
+  const original = Buffer.from('ORIGINAL_TARGET');
+  fs.writeFileSync(target, original);
+  const expectedIdentity = {
+    turn_id: 'turn-rollback',
+    conversation_id: 'conversation:rollback',
+    assistant_count: 1,
+    user_count: 1,
+  };
+  const candidates = [{
+    artifactId: 'png-1',
+    src: `data:image/png;base64,${VALID_PNG.toString('base64')}`,
+    naturalWidth: 1024,
+    naturalHeight: 1024,
+  }];
+  const listeners = new Map();
+  const ws = {
+    readyState: 1,
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (listeners.has(type)) listeners.get(type).delete(fn);
+    },
+    emit(type, event = {}) {
+      for (const fn of [...(listeners.get(type) || [])]) fn(event);
+    },
+    close() {
+      this.readyState = 3;
+      this.emit('close');
+    },
+    send(raw) {
+      const msg = JSON.parse(raw);
+      const expression = String((msg.params && msg.params.expression) || '');
+      let result = {};
+      if (expression.includes('__ask_bridge_download_token ||')) {
+        result = { result: { value: 'token-1' } };
+      } else if (expression.includes('const expected =')) {
+        result = { result: { value: { ok: true, candidates } } };
+      }
+      queueMicrotask(() => this.emit('message', {
+        data: JSON.stringify({ id: msg.id, result }),
+      }));
+    },
+  };
+  const rollbackFailureFs = {
+    ...fs,
+    renameSync(source, destination) {
+      if (basename(source).includes('.tmp-')) {
+        const error = new Error('EACCES: simulated publish failure');
+        error.code = 'EACCES';
+        throw error;
+      }
+      if (basename(source).includes('.bak-') && destination === target) {
+        const error = new Error('EACCES: simulated rollback failure');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return fs.renameSync(source, destination);
+    },
+  };
+  const stdout = [];
+  let stdoutFlushed = false;
+  const stdoutStream = {
+    write(value, callback) {
+      stdout.push(value);
+      setTimeout(() => {
+        stdoutFlushed = true;
+        callback(null);
+      }, 15);
+      return false;
+    },
+  };
+  try {
+    let failure = null;
+    try {
+      await helpers.runCli({
+        tokenArg: 'token-1',
+        outputArg: target,
+        expectedIdentityJsonArg: JSON.stringify(expectedIdentity),
+        fetch: async () => ({
+          json: async () => [{ type: 'page', url: `${helpers.GEMINI_ORIGIN}/app/rollback`, webSocketDebuggerUrl: 'ws://test' }],
+        }),
+        WebSocketCtor: function FakeWebSocket() { return ws; },
+        cleanupTimeoutMs: 40,
+        overallLimitMs: 1500,
+        onWatchdogExit: () => {},
+        writeStdout: (value) => helpers.writeStreamFlushed(stdoutStream, value),
+        fsOps: rollbackFailureFs,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure, 'runCli must reject when publish rollback is incomplete');
+    assert.equal(stdoutFlushed, true);
+    assert.equal(stdout.length, 1);
+    const structured = JSON.parse(stdout[0]);
+    assert.equal(structured.ok, false);
+    assert.equal(structured.error, 'publish_rollback_incomplete');
+    assert.equal(structured.remaining_backups.length, 1);
+    assert.equal(structured.remaining_backups[0].target_path, target);
+    assert.match(structured.remaining_backups[0].backup_path, /\.diagram\.png\.bak-/);
+    assert.deepEqual(structured.uncleaned_targets, []);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('V6-R2: writeStreamFlushed waits for the backpressure write callback', async () => {
+  const helpers = loadGeminiDownloadHelpers();
+  let flushed = false;
+  let writes = 0;
+  const stream = {
+    write(_value, callback) {
+      writes += 1;
+      setTimeout(() => {
+        flushed = true;
+        callback(null);
+      }, 25);
+      return false;
+    },
+  };
+
+  const pending = helpers.writeStreamFlushed(stream, 'payload').then(() => {
+    flushed = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(writes, 1);
+  assert.equal(flushed, false);
+  await pending;
+  assert.equal(flushed, true);
+});
+
+test('V4-R7: runCli bounds blob and post-publish verification CDP waits, cleans temps, closes socket, and never awaits watchdog', async () => {
+  const fs = require('node:fs');
+  const { existsSync, mkdirSync, readdirSync } = fs;
+  const helpers = loadGeminiDownloadHelpers();
+  const expectedIdentity = {
+    turn_id: 'turn-shared',
+    conversation_id: 'conversation:conv-1',
+    assistant_count: 1,
+    user_count: 1,
+  };
+
+  const makeTransport = (candidates) => {
+    const ws = {
+      readyState: 1,
+      listeners: new Map(),
+      calls: [],
+      closed: false,
+      addEventListener(type, fn) {
+        if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+        this.listeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        if (this.listeners.has(type)) this.listeners.get(type).delete(fn);
+      },
+      emit(type, event = {}) {
+        for (const fn of [...(this.listeners.get(type) || [])]) fn(event);
+      },
+      close() {
+        this.closed = true;
+        this.readyState = 3;
+        this.emit('close');
+      },
+      send(raw) {
+        const msg = JSON.parse(raw);
+        this.calls.push(msg);
+        if (msg.method === 'Page.enable') {
+          queueMicrotask(() => this.emit('message', { data: JSON.stringify({ id: msg.id, result: {} }) }));
+          return;
+        }
+        const expression = String((msg.params && msg.params.expression) || '');
+        if (expression.includes('__ask_bridge_download_token ||')) {
+          queueMicrotask(() => this.emit('message', {
+            data: JSON.stringify({ id: msg.id, result: { result: { value: 'token-1' } } }),
+          }));
+          return;
+        }
+        if (expression.includes('delete window.__ask_bridge_download_token')) return;
+        if (expression.includes('const expected =')) {
+          const verifies = this.calls.filter((call) => String((call.params && call.params.expression) || '').includes('const expected =')).length;
+          if (verifies === 1) {
+            queueMicrotask(() => this.emit('message', {
+              data: JSON.stringify({ id: msg.id, result: { result: { value: { ok: true, candidates } } } }),
+            }));
+          }
+          return;
+        }
+        if (expression.includes('fetch(blob:')) return;
+      },
+      listenerCount() {
+        return [...this.listeners.values()].reduce((sum, set) => sum + set.size, 0);
+      },
+    };
+    return ws;
+  };
+
+  const tmpA = mkdtempSync(join(tmpdir(), 'gemini-v4-r7-a-'));
+  try {
+    const candidates = Array.from({ length: 5 }, (_, index) => ({
+      artifactId: `blob-${index}`,
+      src: `blob:https://gemini.google.com/hanging-${index}`,
+      naturalWidth: 1024,
+      naturalHeight: 1024,
+    }));
+    const ws = makeTransport(candidates);
+    let watchdogFired = false;
+    const stdout = [];
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => helpers.runCli({
+        tokenArg: 'token-1',
+        outputArg: `${tmpA}/out/`,
+        expectedIdentityJsonArg: JSON.stringify(expectedIdentity),
+        fetch: async () => ({ json: async () => [{ type: 'page', url: `${helpers.GEMINI_ORIGIN}/app/conv-1`, webSocketDebuggerUrl: 'ws://test' }] }),
+        WebSocketCtor: function FakeWebSocket() { return ws; },
+        timeoutMs: 80,
+        cleanupTimeoutMs: 40,
+        overallLimitMs: 1500,
+        onWatchdogExit: () => { watchdogFired = true; },
+        writeStdout: (value) => stdout.push(value),
+      }),
+      /timed out/,
+    );
+    assert.ok(Date.now() - startedAt < 1000, 'runCli must finish well below the watchdog');
+    assert.equal(watchdogFired, false);
+    assert.equal(ws.closed, true);
+    assert.equal(ws.listenerCount(), 0);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(existsSync(`${tmpA}/out/`) ? readdirSync(`${tmpA}/out/`) : [], []);
+  } finally {
+    rmSync(tmpA, { recursive: true, force: true });
+  }
+
+  const tmpB = mkdtempSync(join(tmpdir(), 'gemini-v4-r7-b-'));
+  try {
+    const outputDir = join(tmpB, 'out');
+    mkdirSync(outputDir, { recursive: true });
+    const candidates = [{
+      artifactId: 'png-1',
+      src: `data:image/png;base64,${VALID_PNG.toString('base64')}`,
+      naturalWidth: 1024,
+      naturalHeight: 1024,
+    }];
+    const ws = makeTransport(candidates);
+    let watchdogFired = false;
+    const stdout = [];
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => helpers.runCli({
+        tokenArg: 'token-1',
+        outputArg: join(outputDir, 'diagram.png'),
+        expectedIdentityJsonArg: JSON.stringify(expectedIdentity),
+        fetch: async () => ({ json: async () => [{ type: 'page', url: `${helpers.GEMINI_ORIGIN}/app/conv-1`, webSocketDebuggerUrl: 'ws://test' }] }),
+        WebSocketCtor: function FakeWebSocket() { return ws; },
+        timeoutMs: 100,
+        verifyTimeoutMs: 60,
+        cleanupTimeoutMs: 40,
+        overallLimitMs: 1500,
+        onWatchdogExit: () => { watchdogFired = true; },
+        writeStdout: (value) => stdout.push(value),
+      }),
+      /timed out/,
+    );
+    assert.ok(Date.now() - startedAt < 1000, 'runCli must finish well below the watchdog');
+    assert.equal(watchdogFired, false);
+    assert.equal(ws.closed, true);
+    assert.equal(ws.listenerCount(), 0);
+    assert.deepEqual(stdout, []);
+    assert.deepEqual(readdirSync(outputDir), []);
+    assert.equal(fs.existsSync(join(outputDir, 'diagram.png')), false);
+  } finally {
+    rmSync(tmpB, { recursive: true, force: true });
+  }
+});
+
+test('V4-R5: shared turn grouping keeps two model-response fragments in one data-turn-key for download verification', () => {
+  const helpers = loadGeminiDownloadHelpers();
+  const projection = require('../src/gemini_turn_projection.js');
+
+  const turnScope = {
+    tagName: 'DIV',
+    getAttribute(name) { return name === 'data-turn-key' ? 'turn-shared' : ''; },
+    closest(selector) { return selector === '[data-turn-key]' ? this : null; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  const makeResponse = (id, text) => ({
+    tagName: 'MODEL-RESPONSE',
+    textContent: text,
+    innerHTML: text,
+    children: [],
+    childNodes: [],
+    classList: [],
+    getAttribute(name) { return name === 'data-response-id' ? id : ''; },
+    closest(selector) {
+      if (selector === 'model-response') return this;
+      if (selector === '[data-turn-key]') return turnScope;
+      return null;
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getBoundingClientRect: () => ({ width: 600, height: 100 }),
+  });
+  const responseOne = makeResponse('resp-1', 'first fragment');
+  const responseTwo = makeResponse('resp-2', 'second fragment');
+  const userQuery = {
+    tagName: 'USER-QUERY',
+    textContent: 'draw it',
+    closest(selector) { return selector === '[data-turn-key]' ? turnScope : null; },
+    querySelectorAll() { return []; },
+  };
+  const generatedContainer = {
+    tagName: 'GENERATED-IMAGE',
+    parentElement: responseTwo,
+    getAttribute(name) { return name === 'data-artifact-id' ? 'art-1' : ''; },
+    matches: () => false,
+    closest: () => null,
+    querySelectorAll() { return []; },
+  };
+  const generatedImage = {
+    tagName: 'IMG',
+    complete: true,
+    naturalWidth: 512,
+    naturalHeight: 512,
+    currentSrc: 'https://lh3.googleusercontent.com/generated-1.png',
+    src: 'https://lh3.googleusercontent.com/generated-1.png',
+    parentElement: generatedContainer,
+    getAttribute(name) { return name === 'src' ? this.src : ''; },
+    getBoundingClientRect: () => ({ width: 512, height: 512 }),
+    closest: () => null,
+  };
+  responseTwo.querySelectorAll = (selector) => (String(selector).includes('generated-image') ? [generatedImage] : []);
+  turnScope.querySelectorAll = (selector) => {
+    if (String(selector).includes('[data-response-id]') || String(selector).includes('[data-artifact-id]')) {
+      return [responseOne, responseTwo, generatedContainer];
+    }
+    return [];
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll(selector) {
+      if (selector === 'model-response') return [responseOne, responseTwo];
+      if (selector === 'user-query') return [userQuery];
+      return [];
+    },
+  };
+
+  const groups = projection.geminiTurnGroups(document, projection.GEMINI_ASSISTANT_SELECTOR);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].nodes.length, 2);
+
+  const expression = helpers.buildVerifyProjectionExpression({
+    turn_id: 'turn-shared',
+    conversation_id: 'conversation:conv-1',
+    user_count: 1,
+    assistant_count: 1,
+    artifact_ids: ['art-1', 'resp-1', 'resp-2'],
+    image_candidates: [{
+      artifact_id: 'art-1',
+      src: 'https://lh3.googleusercontent.com/generated-1.png',
+      natural_width: 512,
+      natural_height: 512,
+    }],
+  });
+  const result = vm.runInNewContext(expression, {
+    URL,
+    window: {
+      location: { origin: helpers.GEMINI_ORIGIN, pathname: '/app/conv-1', href: `${helpers.GEMINI_ORIGIN}/app/conv-1` },
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    },
+    document,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.turnId, 'turn-shared');
+  assert.deepEqual(Array.from(result.artifactIds), ['art-1', 'resp-1', 'resp-2']);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].artifactId, 'art-1');
+  assert.equal(result.candidates[0].src, 'https://lh3.googleusercontent.com/generated-1.png');
+});

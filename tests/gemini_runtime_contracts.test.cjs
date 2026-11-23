@@ -576,6 +576,31 @@ test('V2-R3: shared Gemini attachment projection enforces exact filename, zero-i
     assert.equal(zeroImageExtraCheck.ok, false);
     assert.equal(zeroImageExtraCheck.reason, 'unexpected_image_before_click');
 
+    const profileThumb = {
+        currentSrc: 'https://lh3.googleusercontent.com/profile.png',
+        src: 'https://lh3.googleusercontent.com/profile.png',
+        complete: true,
+        naturalWidth: 512,
+        naturalHeight: 512,
+        parentElement: null,
+    };
+    const profileProj = projectGeminiAttachments(makeComposerRoot([reportChip], [profileThumb]), ['report.md'], {}, () => true);
+    assert.equal(profileProj.newImageCount, 1);
+    const profileCheck = geminiPreClickVerify(makeComposerRoot([reportChip], [profileThumb]), ['report.md'], 0, {}, () => true);
+    assert.equal(profileCheck.ok, false);
+    assert.equal(profileCheck.reason, 'unexpected_image_before_click');
+
+    const domAvatar = {
+        currentSrc: 'https://lh3.googleusercontent.com/neutral-name.png',
+        src: 'https://lh3.googleusercontent.com/neutral-name.png',
+        complete: true,
+        naturalWidth: 512,
+        naturalHeight: 512,
+        parentElement: { matches: () => true },
+    };
+    const avatarProj = projectGeminiAttachments(makeComposerRoot([reportChip], [domAvatar]), ['report.md'], {}, () => true);
+    assert.equal(avatarProj.newImageCount, 0);
+
     const uploadingChip = {
         innerText: 'report.md\n上傳中',
         textContent: 'report.md 上傳中',
@@ -586,6 +611,110 @@ test('V2-R3: shared Gemini attachment projection enforces exact filename, zero-i
     const projUploading = projectGeminiAttachments(makeComposerRoot([uploadingChip]), ['report.md'], {}, () => true);
     assert.equal(projUploading.uploading, true);
     assert.equal(geminiPreClickVerify(makeComposerRoot([uploadingChip]), ['report.md'], 0, {}, () => true).ok, false);
+});
+
+test('V5-R2: nested attachment previews use their innermost boundary while real avatars stay excluded', () => {
+    const makeImage = (src, testid = '') => ({
+        currentSrc: src,
+        src,
+        complete: true,
+        naturalWidth: 512,
+        naturalHeight: 512,
+        matches: (selector) => Boolean(testid)
+            && selector.includes('[data-testid*="avatar"')
+            && testid.toLowerCase().includes('avatar'),
+        getAttribute: (name) => (name === 'data-testid' ? testid : ''),
+        getBoundingClientRect: () => ({ width: 50, height: 50 }),
+        querySelectorAll: () => [],
+        parentElement: null,
+    });
+    const makeNode = (attrs = {}) => {
+        const node = {
+            textContent: '',
+            innerText: '',
+            imgs: [],
+            children: [],
+            parentElement: null,
+            getAttribute: (name) => attrs[name] || '',
+            getBoundingClientRect: () => ({ width: 50, height: 24 }),
+            matches: (selector) => {
+                const testid = String(attrs['data-testid'] || '').toLowerCase();
+                return Boolean(testid)
+                    && selector.includes('[data-testid*="avatar"')
+                    && testid.includes('avatar');
+            },
+            querySelector: (selector) => (selector === 'img' ? node.imgs[0] || null : null),
+            querySelectorAll: (selector) => (selector === 'img' ? node.imgs : []),
+            contains: (other) => (
+                other === node
+                || node.imgs.includes(other)
+                || node.children.some((child) => child === other || (typeof child.contains === 'function' && child.contains(other)))
+            ),
+        };
+        return node;
+    };
+    const reportChip = {
+        innerText: 'report.md',
+        textContent: 'report.md',
+        getAttribute: () => '',
+        querySelectorAll: () => [],
+        querySelector: () => null,
+        getBoundingClientRect: () => ({ width: 50, height: 24 }),
+    };
+    const makeRoot = (outer, inner, extraContainers = []) => {
+        const root = {
+            querySelectorAll(selector) {
+                if (selector.includes('file-chip')) return [reportChip, outer, ...(inner ? [inner] : [])];
+                if (selector.includes('[data-testid*="image"]')) {
+                    return [outer, ...(inner ? [inner] : []), ...extraContainers];
+                }
+                if (selector.includes('attachment')) return [outer, ...(inner ? [inner] : [])];
+                if (selector.includes('uploader-image-preview')) return inner ? [inner] : [];
+                return [];
+            },
+        };
+        outer.parentElement = root;
+        if (inner) inner.parentElement = outer;
+        return root;
+    };
+
+    const nestedOuter = makeNode({ class: 'attachment-list' });
+    const nestedInner = makeNode({ 'data-testid': 'avatar-attachment-preview' });
+    const nestedImg = makeImage('blob:https://gemini.google.com/thumb-1');
+    nestedImg.parentElement = nestedInner;
+    nestedInner.imgs = [nestedImg];
+    nestedOuter.children = [nestedInner];
+    nestedOuter.imgs = [nestedImg];
+    const nestedRoot = makeRoot(nestedOuter, nestedInner);
+    const nestedProj = projectGeminiAttachments(nestedRoot, ['report.md'], {}, () => true);
+    assert.equal(nestedProj.newImageCount, 1);
+    const nestedCheck = geminiPreClickVerify(nestedRoot, ['report.md'], 0, {}, () => true);
+    assert.equal(nestedCheck.ok, false);
+    assert.equal(nestedCheck.reason, 'unexpected_image_before_click');
+
+    const avatarOuter = makeNode({ class: 'attachment-list' });
+    const avatarNode = makeNode({ 'data-testid': 'user-avatar' });
+    const avatarImg = makeImage('https://lh3.googleusercontent.com/u/0/photo.jpg');
+    avatarImg.parentElement = avatarNode;
+    avatarNode.imgs = [avatarImg];
+    avatarOuter.children = [avatarNode];
+    avatarOuter.imgs = [avatarImg];
+    const avatarRoot = makeRoot(avatarOuter, null);
+    const avatarProj = projectGeminiAttachments(avatarRoot, ['report.md'], {}, () => true);
+    assert.equal(avatarProj.newImageCount, 0);
+    assert.equal(geminiPreClickVerify(avatarRoot, ['report.md'], 0, {}, () => true).ok, true);
+
+    const sameImgOuter = makeNode({ class: 'attachment-list' });
+    const sameImg = makeImage('https://lh3.googleusercontent.com/u/0/photo.jpg', 'user-avatar-image');
+    sameImg.parentElement = sameImgOuter;
+    sameImgOuter.imgs = [sameImg];
+    const sameImgRoot = makeRoot(sameImgOuter, null, [sameImg]);
+    const sameImgProj = projectGeminiAttachments(sameImgRoot, ['report.md'], {}, () => true);
+    assert.equal(sameImgProj.newImageCount, 0);
+    assert.equal(geminiPreClickVerify(sameImgRoot, ['report.md'], 0, {}, () => true).ok, true);
+    const missingReference = geminiPreClickVerify(sameImgRoot, ['report.md'], 1, {}, () => true);
+    assert.equal(missingReference.ok, false);
+    assert.equal(missingReference.reason, 'image_mismatch_or_not_loaded_before_click');
 });
 
 test('V2-R4: login probe catches visible [role="button"] Sign in even with account and composer present', async () => {

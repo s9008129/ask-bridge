@@ -463,9 +463,14 @@ async function uploadToGeminiPage(cdp, filePath, uploadKind, options = {}) {
                     const uploadBtn = fallbackMatches[0];
                     const menuSel = '[role="menu"], [role="listbox"], .mat-mdc-menu-panel, .cdk-overlay-pane';
                     const preVisible = new Set(Array.from(document.querySelectorAll(menuSel)).filter(isVisible));
-                    const ariaRefs = String(uploadBtn.getAttribute('aria-controls') || uploadBtn.getAttribute('aria-owns') || '').trim().split(/\\s+/).filter(Boolean);
+                    const readAriaRefs = (el) => Array.from(new Set(
+                        [el && el.getAttribute('aria-controls'), el && el.getAttribute('aria-owns')]
+                            .filter(Boolean)
+                            .flatMap((raw) => String(raw).trim().split(/\\s+/).filter(Boolean))
+                    ));
                     window.__ask_bridge_pre_menus_v1 = preVisible;
-                    window.__ask_bridge_trigger_aria_refs_v1 = ariaRefs;
+                    window.__ask_bridge_upload_btn_v1 = uploadBtn;
+                    window.__ask_bridge_trigger_aria_refs_v1 = readAriaRefs(uploadBtn);
                     window.__ask_bridge_opened_menu_v1 = null;
                     window.__ask_bridge_triggered_file_input = null;
                     uploadBtn.click();
@@ -492,7 +497,13 @@ async function uploadToGeminiPage(cdp, filePath, uploadKind, options = {}) {
                         return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
                     };
                     const pre = window.__ask_bridge_pre_menus_v1 instanceof Set ? window.__ask_bridge_pre_menus_v1 : new Set();
-                    const ariaRefs = Array.isArray(window.__ask_bridge_trigger_aria_refs_v1) ? window.__ask_bridge_trigger_aria_refs_v1 : [];
+                    const readAriaRefs = (el) => Array.from(new Set(
+                        [el && el.getAttribute('aria-controls'), el && el.getAttribute('aria-owns')]
+                            .filter(Boolean)
+                            .flatMap((raw) => String(raw).trim().split(/\\s+/).filter(Boolean))
+                    ));
+                    const storedAriaRefs = Array.isArray(window.__ask_bridge_trigger_aria_refs_v1) ? window.__ask_bridge_trigger_aria_refs_v1 : [];
+                    const ariaRefs = Array.from(new Set([...storedAriaRefs, ...readAriaRefs(window.__ask_bridge_upload_btn_v1)]));
                     const isMenuLike = (el) => Boolean(el) && (
                         el.matches('[role="menu"], [role="listbox"], .mat-mdc-menu-panel, .cdk-overlay-pane')
                         || Boolean(el.querySelector('[role="menuitem"], [role="option"]'))
@@ -570,7 +581,7 @@ async function uploadToGeminiPage(cdp, filePath, uploadKind, options = {}) {
         try { await cdp.call('Page.setInterceptFileChooserDialog', { enabled: false }); } catch (_) {}
         try {
             await cdp.call('Runtime.evaluate', {
-                expression: 'delete window.__ask_bridge_upload_token; delete window.__ask_bridge_pre_menus_v1; delete window.__ask_bridge_trigger_aria_refs_v1; delete window.__ask_bridge_opened_menu_v1; delete window.__ask_bridge_triggered_file_input',
+                expression: 'delete window.__ask_bridge_upload_token; delete window.__ask_bridge_pre_menus_v1; delete window.__ask_bridge_upload_btn_v1; delete window.__ask_bridge_trigger_aria_refs_v1; delete window.__ask_bridge_opened_menu_v1; delete window.__ask_bridge_triggered_file_input',
             });
         } catch (_) {}
     }

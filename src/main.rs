@@ -1057,6 +1057,7 @@ impl fmt::Display for ResponseFailureCode {
 enum ImageDownloadError {
     ResponseIdentityChanged,
     DownloadFailed(String),
+    PublishRollbackIncomplete(String),
 }
 
 impl fmt::Display for ImageDownloadError {
@@ -1066,6 +1067,7 @@ impl fmt::Display for ImageDownloadError {
                 formatter.write_str("verified response identity changed before image download")
             }
             ImageDownloadError::DownloadFailed(message) => formatter.write_str(message),
+            ImageDownloadError::PublishRollbackIncomplete(message) => formatter.write_str(message),
         }
     }
 }
@@ -1557,11 +1559,132 @@ fn enforce_download_contract(
         Err(ImageDownloadError::ResponseIdentityChanged) => {
             Err(ResponseFailureCode::ResponseIdentityChanged)
         }
-        Err(ImageDownloadError::DownloadFailed(_)) => Err(ResponseFailureCode::ImageDownloadFailed),
+        Err(
+            ImageDownloadError::DownloadFailed(_)
+            | ImageDownloadError::PublishRollbackIncomplete(_),
+        ) => Err(ResponseFailureCode::ImageDownloadFailed),
         Ok(0) if expected_output_type == ExpectedOutputType::Image => {
             Err(ResponseFailureCode::ImageDownloadEmpty)
         }
         Ok(downloaded) => Ok(downloaded),
+    }
+}
+
+fn parse_gemini_rollback_recovery_summary(stdout: &[u8]) -> Option<String> {
+    let parsed: Value = serde_json::from_slice(stdout).ok()?;
+    if parsed.get("ok").and_then(Value::as_bool) != Some(false)
+        || parsed.get("error").and_then(Value::as_str) != Some("publish_rollback_incomplete")
+    {
+        return None;
+    }
+
+    let backups = parsed.get("remaining_backups")?.as_array()?;
+    let uncleaned_targets = parsed.get("uncleaned_targets")?.as_array()?;
+    let mut remaining = Vec::new();
+    for item in backups {
+        let item = item.as_object()?;
+        let target_path = item.get("target_path")?.as_str()?;
+        let backup_path = item.get("backup_path")?.as_str()?;
+        if target_path.trim().is_empty() || backup_path.trim().is_empty() {
+            continue;
+        }
+        remaining.push(format!("{backup_path} -> {target_path}"));
+    }
+
+    let mut uncleaned = Vec::new();
+    for item in uncleaned_targets {
+        let path = item.as_str()?;
+        if !path.trim().is_empty() {
+            uncleaned.push(path.to_string());
+        }
+    }
+    if remaining.is_empty() && uncleaned.is_empty() {
+        return None;
+    }
+
+    let mut summary = String::from("publish_rollback_incomplete");
+    if !remaining.is_empty() {
+        summary.push_str("; remaining backups: ");
+        summary.push_str(&remaining.join(", "));
+    }
+    if !uncleaned.is_empty() {
+        summary.push_str("; uncleaned targets: ");
+        summary.push_str(&uncleaned.join(", "));
+    }
+    Some(summary)
+}
+
+fn interpret_gemini_download_output(
+    output: &std::process::Output,
+    verbose: bool,
+) -> Result<Vec<String>, ImageDownloadError> {
+    if output.status.code() == Some(2) {
+        return Err(ImageDownloadError::ResponseIdentityChanged);
+    }
+    if !output.status.success() {
+        if let Some(summary) = parse_gemini_rollback_recovery_summary(&output.stdout) {
+            return Err(ImageDownloadError::PublishRollbackIncomplete(summary));
+        }
+        if verbose {
+            eprintln!(
+                "Gemini image download diagnostic: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Err(ImageDownloadError::DownloadFailed(
+            "Gemini safe image download failed".to_string(),
+        ));
+    }
+
+    let parsed: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        ImageDownloadError::DownloadFailed(
+            "Gemini image downloader returned invalid JSON".to_string(),
+        )
+    })?;
+    if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
+        if parsed.get("error").and_then(Value::as_str) == Some("response_identity_changed") {
+            return Err(ImageDownloadError::ResponseIdentityChanged);
+        }
+        return Err(ImageDownloadError::DownloadFailed(
+            "Gemini safe image download failed".to_string(),
+        ));
+    }
+    let files = parsed
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ImageDownloadError::DownloadFailed(
+                "Gemini image downloader missing files array".to_string(),
+            )
+        })?;
+    Ok(files
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+fn format_verified_image_download_failure(
+    code: ResponseFailureCode,
+    recovery_detail: Option<&str>,
+) -> String {
+    match recovery_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        Some(detail) => {
+            format!("Verified image response download failed ({code}): {detail}")
+        }
+        None => format!("Verified image response download failed ({code})"),
+    }
+}
+
+fn format_image_download_receipt_audit_failure(recovery_detail: Option<&str>) -> String {
+    match recovery_detail {
+        Some(detail) if !detail.trim().is_empty() => {
+            format!("Image download failed, and receipt audit also failed: {detail}")
+        }
+        _ => "Image download failed, and receipt audit also failed".to_string(),
     }
 }
 
@@ -5787,6 +5910,164 @@ mod tests {
     }
 
     #[test]
+    fn gemini_rollback_failure_is_narrowed_to_actionable_default_cli_detail() {
+        let rollback_output = Command::new("node")
+            .arg("-e")
+            .arg(
+                r#"const payload = {
+  ok: false,
+  error: 'publish_rollback_incomplete',
+  remaining_backups: [{ target_path: '/tmp/target.png', backup_path: '/tmp/.target.png.bak' }],
+  uncleaned_targets: ['/tmp/new.png']
+};
+process.stdout.write(JSON.stringify(payload));
+process.stderr.write('UNRELATED STDERR NOISE\n');
+process.exitCode = 1;"#,
+            )
+            .output()
+            .expect("run rollback failure node stub");
+        let rollback_error = interpret_gemini_download_output(&rollback_output, false)
+            .expect_err("rollback stdout must be recognized");
+        let detail = match rollback_error {
+            ImageDownloadError::PublishRollbackIncomplete(detail) => detail,
+            other => panic!("unexpected rollback error: {other:?}"),
+        };
+        assert!(detail.contains("/tmp/.target.png.bak -> /tmp/target.png"));
+        assert!(detail.contains("uncleaned targets: /tmp/new.png"));
+        assert!(!detail.contains("UNRELATED STDERR NOISE"));
+
+        let code = enforce_download_contract(
+            ExpectedOutputType::Image,
+            Err(ImageDownloadError::PublishRollbackIncomplete(
+                detail.clone(),
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(code, ResponseFailureCode::ImageDownloadFailed);
+        let message = format_verified_image_download_failure(code, Some(&detail));
+        assert!(message.contains("(image_download_failed): publish_rollback_incomplete"));
+        assert!(message.contains("/tmp/.target.png.bak -> /tmp/target.png"));
+        assert!(message.contains("uncleaned targets: /tmp/new.png"));
+        assert!(!message.contains("UNRELATED STDERR NOISE"));
+
+        let generic_output = Command::new("node")
+            .arg("-e")
+            .arg("process.stderr.write('GENERIC STDERR NOISE\\n'); process.exitCode = 1;")
+            .output()
+            .expect("run generic failure node stub");
+        let generic_error = interpret_gemini_download_output(&generic_output, false)
+            .expect_err("generic failure must remain an error");
+        assert_eq!(
+            generic_error,
+            ImageDownloadError::DownloadFailed("Gemini safe image download failed".to_string())
+        );
+        let generic_message =
+            format_verified_image_download_failure(ResponseFailureCode::ImageDownloadFailed, None);
+        assert_eq!(
+            generic_message,
+            "Verified image response download failed (image_download_failed)"
+        );
+        assert!(!generic_message.contains("GENERIC STDERR NOISE"));
+
+        assert!(parse_gemini_rollback_recovery_summary(b"not-json").is_none());
+        assert!(
+            parse_gemini_rollback_recovery_summary(
+                br#"{"ok":false,"error":"publish_rollback_incomplete","remaining_backups":[],"uncleaned_targets":[]}"#
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn gemini_rollback_failure_survives_receipt_audit_failure_and_pipe_backpressure() {
+        let detail = "publish_rollback_incomplete; remaining backups: \
+/tmp/.pipe-target-0000.png.bak -> /tmp/pipe-target-0000.png, \
+/tmp/.pipe-target-1999.png.bak -> /tmp/pipe-target-1999.png; \
+uncleaned targets: /tmp/pipe-uncleaned.png";
+        let receipt_failure = format_image_download_receipt_audit_failure(Some(detail));
+        assert!(receipt_failure.contains("Image download failed, and receipt audit also failed"));
+        assert!(
+            receipt_failure.contains("/tmp/.pipe-target-0000.png.bak -> /tmp/pipe-target-0000.png")
+        );
+        assert!(
+            receipt_failure.contains("/tmp/.pipe-target-1999.png.bak -> /tmp/pipe-target-1999.png")
+        );
+        assert!(receipt_failure.contains("uncleaned targets: /tmp/pipe-uncleaned.png"));
+        assert_eq!(
+            format_image_download_receipt_audit_failure(None),
+            "Image download failed, and receipt audit also failed"
+        );
+
+        let download_module = serde_json::to_string(&format!(
+            "{}/src/gemini_download.js",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let js = r#"
+const { writeStreamFlushed } = require(__DOWNLOAD_MODULE__);
+const backups = Array.from({ length: 2000 }, (_, index) => {
+  const suffix = String(index).padStart(4, '0');
+  return {
+    target_path: `/tmp/pipe-target-${suffix}.png`,
+    backup_path: `/tmp/.pipe-target-${suffix}.png.bak`,
+  };
+});
+const payload = JSON.stringify({
+  ok: false,
+  error: 'publish_rollback_incomplete',
+  remaining_backups: backups,
+  uncleaned_targets: ['/tmp/pipe-uncleaned.png'],
+});
+process.stderr.write('UNRELATED STDERR NOISE\n');
+writeStreamFlushed(process.stdout, payload)
+  .then(() => { process.exitCode = 1; })
+  .catch(() => { process.exitCode = 1; });
+"#
+        .replace("__DOWNLOAD_MODULE__", &download_module);
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .env("ASK_BRIDGE_DOWNLOAD_NO_AUTORUN", "1")
+            .output()
+            .expect("run pipe backpressure node stub");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.len() > 128 * 1024);
+
+        let rollback_error = interpret_gemini_download_output(&output, false)
+            .expect_err("large rollback stdout must be recognized");
+        let detail = match rollback_error {
+            ImageDownloadError::PublishRollbackIncomplete(detail) => detail,
+            other => panic!("unexpected pipe rollback error: {other:?}"),
+        };
+        assert!(detail.contains("/tmp/.pipe-target-0000.png.bak -> /tmp/pipe-target-0000.png"));
+        assert!(detail.contains("/tmp/.pipe-target-1999.png.bak -> /tmp/pipe-target-1999.png"));
+        assert!(!detail.contains("UNRELATED STDERR NOISE"));
+
+        let code = enforce_download_contract(
+            ExpectedOutputType::Image,
+            Err(ImageDownloadError::PublishRollbackIncomplete(
+                detail.clone(),
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(code, ResponseFailureCode::ImageDownloadFailed);
+        let message = format_verified_image_download_failure(code, Some(&detail));
+        assert!(message.contains("(image_download_failed): publish_rollback_incomplete"));
+        assert!(message.contains("/tmp/.pipe-target-0000.png.bak -> /tmp/pipe-target-0000.png"));
+        assert!(message.contains("/tmp/.pipe-target-1999.png.bak -> /tmp/pipe-target-1999.png"));
+        assert!(!message.contains("UNRELATED STDERR NOISE"));
+        let receipt_failure = format_image_download_receipt_audit_failure(Some(&detail));
+        assert!(receipt_failure.contains("receipt audit also failed"));
+        assert!(
+            receipt_failure.contains("/tmp/.pipe-target-0000.png.bak -> /tmp/pipe-target-0000.png")
+        );
+        assert!(
+            receipt_failure.contains("/tmp/.pipe-target-1999.png.bak -> /tmp/pipe-target-1999.png")
+        );
+        assert!(!receipt_failure.contains("UNRELATED STDERR NOISE"));
+    }
+
+    #[test]
     fn response_receipt_fields_are_additive_and_low_sensitivity() {
         let root = make_test_dir("response_receipt_privacy");
         let path = root.join("receipt.json");
@@ -7749,7 +8030,8 @@ const runProbe = (imgSrcs) => {{
 }};
 const okRes = runProbe(['https://example.invalid/baseline.png']);
 const badRes = runProbe(['https://example.invalid/baseline.png', 'https://example.invalid/unexpected.png']);
-console.log(JSON.stringify({{ okRes, badRes }}));
+const profileRes = runProbe(['https://example.invalid/baseline.png', 'https://lh3.googleusercontent.com/profile.png']);
+console.log(JSON.stringify({{ okRes, badRes, profileRes }}));
 "#,
         );
         let output = std::process::Command::new("node")
@@ -7768,6 +8050,374 @@ console.log(JSON.stringify({{ okRes, badRes }}));
         assert_eq!(parsed["okRes"]["unexpected_count"], 0);
         assert_eq!(parsed["badRes"]["complete"], false);
         assert!(parsed["badRes"]["unexpected_count"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(parsed["profileRes"]["complete"], false);
+        assert!(
+            parsed["profileRes"]["unexpected_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+    }
+
+    #[test]
+    fn gemini_document_only_probe_uses_innermost_nested_attachment_boundary() {
+        let baseline = AttachmentBaseline::default();
+        let script = build_attachment_probe_script_with_baseline(
+            Provider::Gemini,
+            &["report.md".to_string()],
+            &baseline,
+        )
+        .unwrap();
+        let typed_script = build_typed_attachment_probe_script_with_baseline(
+            Provider::Gemini,
+            &["report.md".to_string()],
+            &baseline,
+        )
+        .unwrap();
+        let projection_module = serde_json::to_string(&format!(
+            "{}/src/gemini_attachment_projection.js",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let js = r#"
+const projection = require(__PROJECTION_MODULE__);
+const makeImage = (src, testid = '') => ({
+  currentSrc: src,
+  src,
+  complete: true,
+  naturalWidth: 512,
+  naturalHeight: 512,
+  matches: (selector) => Boolean(testid)
+    && selector.includes('[data-testid*="avatar"')
+    && testid.toLowerCase().includes('avatar'),
+  getAttribute: (name) => (name === 'data-testid' ? testid : ''),
+  getBoundingClientRect: () => ({ width: 50, height: 50 }),
+  querySelectorAll: () => [],
+  parentElement: null,
+});
+const makeNode = (attrs = {}) => {
+  const node = {
+    textContent: '',
+    innerText: '',
+    imgs: [],
+    children: [],
+    parentElement: null,
+    getAttribute: (name) => attrs[name] || '',
+    getBoundingClientRect: () => ({ width: 50, height: 24 }),
+    matches: (selector) => {
+      const testid = String(attrs['data-testid'] || '').toLowerCase();
+      return Boolean(testid)
+        && selector.includes('[data-testid*="avatar"')
+        && testid.includes('avatar');
+    },
+    querySelector: (selector) => (selector === 'img' ? node.imgs[0] || null : null),
+    querySelectorAll: (selector) => (selector === 'img' ? node.imgs : []),
+    contains: (other) => other === node
+      || node.imgs.includes(other)
+      || node.children.some((child) => child === other || (typeof child.contains === 'function' && child.contains(other))),
+  };
+  return node;
+};
+const makeRoot = (kind) => {
+  const reportChip = {
+    innerText: 'report.md',
+    textContent: 'report.md',
+    getAttribute: () => '',
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getBoundingClientRect: () => ({ width: 50, height: 24 }),
+  };
+  const outer = makeNode({ class: 'attachment-list' });
+  let inner = null;
+  let avatar = null;
+  let img = null;
+  let extraContainers = [];
+  if (kind === 'nested') {
+    inner = makeNode({ 'data-testid': 'avatar-attachment-preview' });
+    img = makeImage('blob:https://gemini.google.com/thumb-1');
+    img.parentElement = inner;
+    inner.imgs = [img];
+    outer.children = [inner];
+  } else if (kind === 'sameImg') {
+    img = makeImage('https://lh3.googleusercontent.com/u/0/photo.jpg', 'user-avatar-image');
+    img.parentElement = outer;
+    outer.imgs = [img];
+    extraContainers = [img];
+  } else {
+    avatar = makeNode({ 'data-testid': 'user-avatar' });
+    img = makeImage('https://lh3.googleusercontent.com/u/0/photo.jpg');
+    img.parentElement = avatar;
+    avatar.imgs = [img];
+    outer.children = [avatar];
+  }
+  outer.imgs = [img];
+  const root = {
+    querySelectorAll(selector) {
+      if (selector.includes('file-chip')) return [reportChip, outer, ...(inner ? [inner] : [])];
+      if (selector.includes('[data-testid*="image"]')) {
+        return [outer, ...(inner ? [inner] : []), ...extraContainers];
+      }
+      if (selector.includes('attachment')) return [outer, ...(inner ? [inner] : [])];
+      if (selector.includes('uploader-image-preview')) return inner ? [inner] : [];
+      return [];
+    },
+  };
+  outer.parentElement = root;
+  if (inner) inner.parentElement = outer;
+  if (avatar) avatar.parentElement = outer;
+  const composer = {
+    getBoundingClientRect: () => ({ width: 300, height: 80 }),
+    closest: () => null,
+    parentElement: root,
+  };
+  global.window = {
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+  };
+  global.document = {
+    body: {},
+    documentElement: {},
+    querySelector: (selector) => (selector.includes('rich-textarea') ? composer : null),
+  };
+  return {
+    probe: (__PROBE__)(),
+    typedProbe: (__TYPED_PROBE__)(),
+    preclick: projection.geminiPreClickVerify(root, ['report.md'], 0, {}, () => true),
+    preclickMixed: projection.geminiPreClickVerify(root, ['report.md'], 1, {}, () => true),
+  };
+};
+console.log(JSON.stringify({
+  nested: makeRoot('nested'),
+  avatar: makeRoot('avatar'),
+  sameImg: makeRoot('sameImg'),
+}));
+"#
+        .replace("__PROJECTION_MODULE__", &projection_module)
+        .replace("__PROBE__", &script)
+        .replace("__TYPED_PROBE__", &typed_script);
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run nested node probe test");
+        assert!(
+            output.status.success(),
+            "nested node probe test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse nested probe output json");
+        assert_eq!(
+            parsed["nested"]["probe"]["complete"], false,
+            "parsed={parsed}"
+        );
+        assert!(
+            parsed["nested"]["probe"]["unexpected_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert_eq!(parsed["nested"]["preclick"]["ok"], false);
+        assert_eq!(
+            parsed["nested"]["preclick"]["reason"],
+            "unexpected_image_before_click"
+        );
+        assert_eq!(
+            parsed["avatar"]["probe"]["complete"], true,
+            "parsed={parsed}"
+        );
+        assert_eq!(parsed["avatar"]["probe"]["unexpected_count"], 0);
+        assert_eq!(parsed["avatar"]["preclick"]["ok"], true);
+        assert_eq!(
+            parsed["sameImg"]["probe"]["complete"], true,
+            "parsed={parsed}"
+        );
+        assert_eq!(parsed["sameImg"]["probe"]["unexpected_count"], 0);
+        assert_eq!(parsed["sameImg"]["typedProbe"]["image_count"], 0);
+        assert_eq!(parsed["sameImg"]["typedProbe"]["image_loaded"], false);
+        assert_eq!(parsed["sameImg"]["preclick"]["ok"], true);
+        assert_eq!(parsed["sameImg"]["preclickMixed"]["ok"], false);
+        assert_eq!(
+            parsed["sameImg"]["preclickMixed"]["reason"],
+            "image_mismatch_or_not_loaded_before_click"
+        );
+
+        let mixed_expectations = AttachmentExpectations::new(
+            &["report.md".to_string()],
+            &["missing-reference.png".to_string()],
+        )
+        .unwrap();
+        let typed_probe: TypedAttachmentProbe =
+            serde_json::from_value(parsed["sameImg"]["typedProbe"].clone()).unwrap();
+        let mut tracker = TypedAttachmentTracker::new(&mixed_expectations);
+        assert!(!tracker.observe(&typed_probe, &mixed_expectations).unwrap());
+    }
+
+    #[test]
+    fn gemini_completion_probe_and_download_verify_share_turn_grouping() {
+        let probe_script = build_response_probe_script(
+            Provider::Gemini,
+            &ResponseBaseline {
+                initial_user_count: 0,
+                initial_assistant_count: 0,
+                ownership_token: "response-token".to_string(),
+            },
+        )
+        .unwrap();
+        let probe_json = serde_json::to_string(&probe_script).unwrap();
+        let download_module = serde_json::to_string(&format!(
+            "{}/src/gemini_download.js",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let js = format!(
+            r#"
+const vm = require('node:vm');
+const helpers = require({download_module});
+const turnScope = {{
+  tagName: 'DIV',
+  innerHTML: 'turn-shared',
+  getAttribute(name) {{ return name === 'data-turn-key' ? 'turn-shared' : ''; }},
+  closest(selector) {{ return selector === '[data-turn-key]' ? this : null; }},
+  querySelector() {{ return null; }},
+  querySelectorAll() {{ return []; }},
+}};
+const makeResponse = (id, text) => ({{
+  tagName: 'MODEL-RESPONSE',
+  textContent: text,
+  innerHTML: text,
+  children: [],
+  childNodes: [],
+  classList: [],
+  getAttribute(name) {{
+    if (name === 'data-response-id') return id;
+    if (name === 'aria-busy' || name === 'data-loading') return 'false';
+    return '';
+  }},
+  closest(selector) {{
+    if (selector === 'model-response') return this;
+    if (selector === '[data-turn-key]') return turnScope;
+    return null;
+  }},
+  querySelector() {{ return null; }},
+  querySelectorAll() {{ return []; }},
+  getBoundingClientRect: () => ({{ width: 600, height: 100 }}),
+}});
+const responseOne = makeResponse('resp-1', 'first fragment');
+const responseTwo = makeResponse('resp-2', 'second fragment');
+const userQuery = {{
+  tagName: 'USER-QUERY',
+  textContent: 'draw it',
+  innerHTML: 'draw it',
+  closest(selector) {{ return selector === '[data-turn-key]' ? turnScope : null; }},
+  querySelectorAll() {{ return []; }},
+}};
+const generatedContainer = {{
+  tagName: 'GENERATED-IMAGE',
+  parentElement: responseTwo,
+  getAttribute(name) {{ return name === 'data-artifact-id' ? 'art-1' : ''; }},
+  matches: () => false,
+  closest: () => null,
+  querySelectorAll() {{ return []; }},
+}};
+const generatedImage = {{
+  tagName: 'IMG',
+  complete: true,
+  naturalWidth: 512,
+  naturalHeight: 512,
+  currentSrc: 'https://lh3.googleusercontent.com/generated-1.png',
+  src: 'https://lh3.googleusercontent.com/generated-1.png',
+  parentElement: generatedContainer,
+  getAttribute(name) {{ return name === 'src' ? this.src : ''; }},
+  getBoundingClientRect: () => ({{ width: 512, height: 512 }}),
+  closest: () => null,
+}};
+responseTwo.querySelectorAll = (selector) => (
+  String(selector).includes('generated-image') ? [generatedImage] : []
+);
+turnScope.querySelectorAll = (selector) => {{
+  if (String(selector).includes('[data-response-id]') || String(selector).includes('[data-artifact-id]')) {{
+    return [responseOne, responseTwo, generatedContainer];
+  }}
+  return [];
+}};
+const document = {{
+  querySelector: () => null,
+  querySelectorAll(selector) {{
+    if (selector === 'model-response') return [responseOne, responseTwo];
+    if (selector === 'user-query') return [userQuery];
+    return [];
+  }},
+}};
+const context = {{
+  URL,
+  document,
+  window: {{
+    location: {{
+      origin: 'https://gemini.google.com',
+      pathname: '/app/conv-1',
+      href: 'https://gemini.google.com/app/conv-1',
+    }},
+    document,
+    __ask_bridge_response_owner_v1: 'response-token',
+    getComputedStyle: () => ({{ display: 'block', visibility: 'visible', opacity: '1' }}),
+  }},
+}};
+const probe = vm.runInNewContext({probe_json}, context)();
+const expected = {{
+  turn_id: probe.turn_id,
+  conversation_id: probe.conversation_id,
+  user_count: probe.user_count,
+  assistant_count: probe.assistant_count,
+  artifact_ids: probe.artifact_ids,
+  image_candidates: probe.image_candidates,
+}};
+const verify = vm.runInNewContext(helpers.buildVerifyProjectionExpression(expected), context);
+console.log(JSON.stringify({{ probe, verify }}));
+"#,
+            download_module = download_module,
+            probe_json = probe_json,
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .env("ASK_BRIDGE_DOWNLOAD_NO_AUTORUN", "1")
+            .output()
+            .expect("run shared Gemini turn grouping test");
+        assert!(
+            output.status.success(),
+            "node shared grouping test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse shared grouping output");
+        assert_eq!(parsed["probe"]["assistant_count"], 1, "parsed={parsed}");
+        assert_eq!(parsed["probe"]["user_count"], 1, "parsed={parsed}");
+        assert_eq!(parsed["probe"]["turn_id"], "turn-shared", "parsed={parsed}");
+        assert_eq!(
+            parsed["probe"]["artifact_ids"],
+            serde_json::json!(["art-1", "resp-1", "resp-2"]),
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["probe"]["image_candidates"],
+            serde_json::json!([{
+                "artifactId": "art-1",
+                "src": "https://lh3.googleusercontent.com/generated-1.png",
+                "naturalWidth": 512,
+                "naturalHeight": 512,
+            }]),
+            "parsed={parsed}"
+        );
+        assert_eq!(parsed["verify"]["ok"], true, "parsed={parsed}");
+        assert_eq!(parsed["verify"]["turnId"], "turn-shared", "parsed={parsed}");
+        assert_eq!(
+            parsed["verify"]["artifactIds"], parsed["probe"]["artifact_ids"],
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["verify"]["candidates"], parsed["probe"]["image_candidates"],
+            "parsed={parsed}"
+        );
     }
 
     #[test]
@@ -10346,46 +10996,9 @@ fn download_gemini_images(
         )
     })?;
 
-    if output.status.code() == Some(2) {
-        return Err(ImageDownloadError::ResponseIdentityChanged);
-    }
-    if !output.status.success() {
-        if verbose {
-            eprintln!(
-                "Gemini image download diagnostic: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        return Err(ImageDownloadError::DownloadFailed(
-            "Gemini safe image download failed".to_string(),
-        ));
-    }
-
-    let parsed: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-        ImageDownloadError::DownloadFailed(
-            "Gemini image downloader returned invalid JSON".to_string(),
-        )
-    })?;
-    if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
-        if parsed.get("error").and_then(Value::as_str) == Some("response_identity_changed") {
-            return Err(ImageDownloadError::ResponseIdentityChanged);
-        }
-        return Err(ImageDownloadError::DownloadFailed(
-            "Gemini safe image download failed".to_string(),
-        ));
-    }
-    let files = parsed
-        .get("files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ImageDownloadError::DownloadFailed(
-                "Gemini image downloader missing files array".to_string(),
-            )
-        })?;
-    for file in files {
-        if let Some(path) = file.as_str() {
-            println!("Downloaded and saved generated image to: {}", path);
-        }
+    let files = interpret_gemini_download_output(&output, verbose)?;
+    for path in &files {
+        println!("Downloaded and saved generated image to: {}", path);
     }
     Ok(files.len())
 }
@@ -15042,8 +15655,12 @@ __GEMINI_TURN_PROJECTION_JS__
                     const match = window.location.pathname.match(/^\/(?:c|app)\/([^/?#]+)/);
                     return match ? `conversation:${match[1]}` : `home:${window.location.origin}`;
                 })();
-            const assistantGroups = turnGroups(assistantSelector);
-            const userGroups = turnGroups(userSelector);
+            const assistantGroups = isGemini
+                ? geminiTurnGroups(document, GEMINI_ASSISTANT_SELECTOR)
+                : turnGroups(assistantSelector);
+            const userGroups = isGemini
+                ? geminiTurnGroups(document, GEMINI_USER_SELECTOR)
+                : turnGroups(userSelector);
             const latestGroup = assistantGroups[assistantGroups.length - 1] || null;
             const contentNodes = latestGroup ? latestGroup.nodes : [];
             const latest = contentNodes[contentNodes.length - 1] || null;
@@ -17236,6 +17853,10 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             .map(|identity| (&response_baseline, identity)),
         command_verbose,
     );
+    let download_recovery_detail = match &download_result {
+        Err(ImageDownloadError::PublishRollbackIncomplete(detail)) => Some(detail.clone()),
+        _ => None,
+    };
     let downloaded_image_count = if expected_output_type == ExpectedOutputType::Image {
         match enforce_download_contract(expected_output_type, download_result) {
             Ok(count) => count,
@@ -17246,10 +17867,19 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                     ResponseCompletion::Completed
                 };
                 if let Some(path) = receipt_path.as_deref() {
-                    record_session_response_outcome(path, completion, 0, Some(code))
-                        .map_err(|_| "Image download failed, and receipt audit also failed")?;
+                    record_session_response_outcome(path, completion, 0, Some(code)).map_err(
+                        |_| {
+                            format_image_download_receipt_audit_failure(
+                                download_recovery_detail.as_deref(),
+                            )
+                        },
+                    )?;
                 }
-                return Err(format!("Verified image response download failed ({code})").into());
+                return Err(format_verified_image_download_failure(
+                    code,
+                    download_recovery_detail.as_deref(),
+                )
+                .into());
             }
         }
     } else {
@@ -17258,6 +17888,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => {
                 if command_verbose {
                     eprintln!("Warning: Optional image download failed: {}", error);
+                } else if let ImageDownloadError::PublishRollbackIncomplete(detail) = &error {
+                    eprintln!("{}", detail);
                 }
                 0
             }
