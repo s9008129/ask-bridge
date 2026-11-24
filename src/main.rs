@@ -42,6 +42,7 @@ const BACKGROUND_LOGIN_LAUNCH_CAPABILITY: &str = "background_login_launch_v1";
 const SESSION_RECEIPT_SCHEMA_VERSION: u8 = 2;
 const AUTH_FAILURE_STAGE: &str = "auth";
 const GEMINI_AUTH_FAILURE_CODE: &str = "GEMINI_AUTH_NOT_CONFIRMED";
+const CHATGPT_AUTH_FAILURE_CODE: &str = "CHATGPT_AUTH_NOT_CONFIRMED";
 const ATTACHMENT_VERIFICATION_FAILURE_CODE: &str = "ATTACHMENT_VERIFICATION_FAILED";
 const MODEL_SELECTION_FAILURE_CODE: &str = "CHATGPT_MODEL_SELECTION_FAILED";
 const GEMINI_MODEL_SELECTION_FAILURE_CODE: &str = "GEMINI_MODEL_SELECTION_FAILED";
@@ -260,6 +261,7 @@ const TURN_IDENTITY_JS: &str = r#"
 /// `RESPONSE_POLL_INTERVAL`; the backend probe is a full same-origin HTTP
 /// round-trip and only needs to run every few seconds.
 const BACKEND_RESPONSE_POLL_TICKS: usize = 4;
+const BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS: usize = 5;
 /// Abort a single backend conversation fetch after this long so one slow
 /// request can never stall the response wait loop.
 const BACKEND_RESPONSE_FETCH_TIMEOUT_MS: u64 = 10_000;
@@ -1149,6 +1151,10 @@ struct BackendResponseProbe {
     /// contributes exactly one; the wait may only complete on one, and more
     /// than one fails closed as an identity change.
     answers_after_last_user: usize,
+    #[serde(default)]
+    has_image_after_last_user: bool,
+    #[serde(default)]
+    has_in_progress_after_last_user: bool,
     last_assistant_id: String,
     last_assistant_status: String,
     last_assistant_text: String,
@@ -1219,6 +1225,43 @@ fn assess_backend_response_probe(
         return BackendResponseDecision::Pending;
     }
     BackendResponseDecision::Completed(probe.last_assistant_text.clone())
+}
+
+fn is_backend_finished_text_without_image(
+    probe: &BackendResponseProbe,
+    initial_user_count: usize,
+    dom_generating: bool,
+    dom_loaded_images: usize,
+) -> bool {
+    probe.ok
+        && !probe.conversation_id.is_empty()
+        && probe.user_count == initial_user_count.saturating_add(1)
+        && probe.answers_after_last_user == 1
+        && probe.last_assistant_status == "finished_successfully"
+        && !probe.last_assistant_text.trim().is_empty()
+        && !probe.has_image_after_last_user
+        && !probe.has_in_progress_after_last_user
+        && !dom_generating
+        && dom_loaded_images == 0
+}
+
+fn advance_backend_image_text_only_streak(
+    last_assistant_id: &mut Option<String>,
+    polls: &mut usize,
+    eligible: bool,
+    candidate_id: &str,
+) {
+    if !eligible {
+        *last_assistant_id = None;
+        *polls = 0;
+        return;
+    }
+    if last_assistant_id.as_deref() == Some(candidate_id) {
+        *polls = polls.saturating_add(1);
+    } else {
+        *last_assistant_id = Some(candidate_id.to_string());
+        *polls = 1;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6633,6 +6676,132 @@ console.log(JSON.stringify(results));
         );
     }
 
+    #[test]
+    fn chatgpt_response_probe_detects_short_refusal_without_generation_or_json_false_positives() {
+        let script = build_response_probe_script(
+            Provider::ChatGpt,
+            &ResponseBaseline {
+                initial_user_count: 0,
+                initial_assistant_count: 0,
+                ownership_token: "response-token".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(script.contains("chatGptRefusalPattern"));
+        assert!(script.contains("generationTransitionPattern"));
+        assert!(script.contains("generationControlVisible"));
+        assert!(script.contains("normalizedLatestBody.length <= 400"));
+        assert!(script.contains("!normalizedLatestBody.startsWith('{')"));
+
+        let refusal = "I can't generate that image.";
+        let texts = serde_json::to_string(&serde_json::json!({
+            "refusal": refusal,
+            "zh_refusal": "無法為你生成這張圖片。",
+            "transition": "正在建立圖像，error creating image",
+            "json": serde_json::json!({ "message": refusal }).to_string(),
+            "long": format!("{refusal}{}", "。".repeat(401)),
+        }))
+        .unwrap();
+        let probe_source = serde_json::to_string(&script).unwrap();
+        let assistant_selector =
+            serde_json::to_string(Provider::ChatGpt.assistant_selector()).unwrap();
+        let user_selector = serde_json::to_string(Provider::ChatGpt.user_selector()).unwrap();
+        let js = r#"
+const vm = require('node:vm');
+const probeSource = __PROBE_SOURCE__;
+const assistantSelector = __ASSISTANT_SELECTOR__;
+const userSelector = __USER_SELECTOR__;
+const texts = __TEXTS__;
+const makeTurnNode = (text, turnKey) => {
+  const node = {
+    tagName: 'DIV',
+    textContent: text,
+    innerText: text,
+    innerHTML: text,
+    children: [],
+    childNodes: [],
+    classList: [],
+    getAttribute(name) {
+      if (name === 'data-turn-key') return turnKey;
+      if (name === 'data-turn-id') return `turn-${turnKey}`;
+      if (name === 'data-chatgpt-selection-message-id') return `message-${turnKey}`;
+      return '';
+    },
+    closest(selector) {
+      return selector === '[data-turn-key]' ? node : null;
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getBoundingClientRect: () => ({ width: 600, height: 100 }),
+  };
+  return node;
+};
+const runProbe = (text) => {
+  const assistant = makeTurnNode(text, 'assistant-refusal');
+  const user = makeTurnNode('make an image', 'user-refusal');
+  const document = {
+    querySelector: () => null,
+    querySelectorAll(selector) {
+      if (selector === assistantSelector) return [assistant];
+      if (selector === userSelector) return [user];
+      return [];
+    },
+  };
+  return vm.runInNewContext(probeSource, {
+    URL,
+    document,
+    window: {
+      location: {
+        origin: 'https://chatgpt.com',
+        pathname: '/c/conv-chatgpt-refusal',
+        href: 'https://chatgpt.com/c/conv-chatgpt-refusal',
+      },
+      document,
+      __ask_bridge_response_owner_v1: 'response-token',
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    },
+  })();
+};
+const results = {};
+for (const [name, text] of Object.entries(texts)) {
+  results[name] = runProbe(text);
+}
+console.log(JSON.stringify(results));
+"#
+        .replace("__PROBE_SOURCE__", &probe_source)
+        .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+        .replace("__USER_SELECTOR__", &user_selector)
+        .replace("__TEXTS__", &texts);
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run ChatGPT refusal probe test");
+        assert!(
+            output.status.success(),
+            "node ChatGPT refusal probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse ChatGPT refusal probe output");
+        for key in ["refusal", "zh_refusal"] {
+            assert_eq!(
+                parsed[key]["provider_failure_visible"], true,
+                "parsed={parsed}"
+            );
+            assert_eq!(
+                parsed[key]["generation_control_visible"], false,
+                "parsed={parsed}"
+            );
+        }
+        for key in ["transition", "json", "long"] {
+            assert_eq!(
+                parsed[key]["provider_failure_visible"], false,
+                "parsed={parsed}"
+            );
+        }
+    }
+
     /// Shipped source of one top-level function, resolved by bare name and a
     /// leading newline so no string literal inside this test module can shadow
     /// the real definition.  The response baseline and the image download
@@ -7912,6 +8081,8 @@ console.log(JSON.stringify(results));
             user_count: 1,
             answer_count: 1,
             answers_after_last_user: 1,
+            has_image_after_last_user: false,
+            has_in_progress_after_last_user: false,
             last_assistant_id: "08299039-d17c-4de7-9d94-857e41784792".to_string(),
             last_assistant_status: "finished_successfully".to_string(),
             last_assistant_text: "{\"schema_version\":\"2.0\"}".to_string(),
@@ -8004,6 +8175,283 @@ console.log(JSON.stringify(results));
         assert_eq!(
             assess_backend_response_probe(&failed_probe, 0),
             BackendResponseDecision::Pending
+        );
+    }
+
+    #[test]
+    fn backend_finished_text_without_image_requires_every_gate_and_a_stable_assistant_id() {
+        let finished = BackendResponseProbe {
+            ok: true,
+            conversation_id: "conversation-1".to_string(),
+            user_count: 1,
+            answer_count: 1,
+            answers_after_last_user: 1,
+            has_image_after_last_user: false,
+            has_in_progress_after_last_user: false,
+            last_assistant_id: "assistant-1".to_string(),
+            last_assistant_status: "finished_successfully".to_string(),
+            last_assistant_text: "finished text".to_string(),
+            reason: String::new(),
+        };
+        assert!(is_backend_finished_text_without_image(
+            &finished, 0, false, 0
+        ));
+        assert_eq!(BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS, 5);
+        for probe in [
+            BackendResponseProbe {
+                ok: false,
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                conversation_id: String::new(),
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                user_count: 2,
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                answers_after_last_user: 0,
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                last_assistant_status: "in_progress".to_string(),
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                last_assistant_text: "  ".to_string(),
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                has_image_after_last_user: true,
+                ..finished.clone()
+            },
+            BackendResponseProbe {
+                has_in_progress_after_last_user: true,
+                ..finished.clone()
+            },
+        ] {
+            assert!(!is_backend_finished_text_without_image(&probe, 0, false, 0));
+        }
+        assert!(!is_backend_finished_text_without_image(
+            &finished, 0, true, 0
+        ));
+        assert!(!is_backend_finished_text_without_image(
+            &finished, 0, false, 1
+        ));
+
+        let mut last_assistant_id = None;
+        let mut polls = 0;
+        advance_backend_image_text_only_streak(
+            &mut last_assistant_id,
+            &mut polls,
+            true,
+            "assistant-1",
+        );
+        assert_eq!(last_assistant_id.as_deref(), Some("assistant-1"));
+        assert_eq!(polls, 1);
+        advance_backend_image_text_only_streak(
+            &mut last_assistant_id,
+            &mut polls,
+            true,
+            "assistant-1",
+        );
+        assert_eq!(polls, 2);
+        advance_backend_image_text_only_streak(
+            &mut last_assistant_id,
+            &mut polls,
+            true,
+            "assistant-2",
+        );
+        assert_eq!(last_assistant_id.as_deref(), Some("assistant-2"));
+        assert_eq!(polls, 1);
+        advance_backend_image_text_only_streak(
+            &mut last_assistant_id,
+            &mut polls,
+            false,
+            "assistant-2",
+        );
+        assert_eq!(last_assistant_id, None);
+        assert_eq!(polls, 0);
+    }
+
+    #[test]
+    fn backend_mapping_scan_excludes_the_user_image_and_finds_sibling_images_and_progress() {
+        let probe_source =
+            serde_json::to_string(&build_backend_response_probe_script(Provider::ChatGpt).unwrap())
+                .unwrap();
+        let js = r#"
+const vm = require('node:vm');
+const probeSource = __PROBE_SOURCE__;
+const userNode = (id, parent) => ({
+  id,
+  parent,
+  message: {
+    id,
+    author: { role: 'user' },
+    create_time: 1,
+    status: 'finished_successfully',
+    content: {
+      content_type: 'multimodal_text',
+      parts: [{ asset_pointer: 'file-service://S01.png' }],
+    },
+    metadata: { attachments: [{ mime_type: 'image/png' }] },
+  },
+});
+const textAnswer = (id, parent) => ({
+  id,
+  parent,
+  message: {
+    id,
+    author: { role: 'assistant' },
+    create_time: 2,
+    end_turn: true,
+    status: 'finished_successfully',
+    content: { content_type: 'text', parts: ['已完成'] },
+    metadata: {},
+  },
+});
+const imageSibling = (id, parent, authorRole) => ({
+  id,
+  parent,
+  message: {
+    id,
+    author: { role: authorRole },
+    create_time: 1.5,
+    status: 'finished_successfully',
+    content: authorRole === 'tool'
+      ? { content_type: 'text', parts: [{ asset_pointer: 'file-service://candidate-a.png' }] }
+      : { content_type: 'multimodal_text', parts: ['候選圖'] },
+    metadata: authorRole === 'assistant'
+      ? { attachments: [{ mime_type: 'image/png' }] }
+      : {},
+  },
+});
+const inProgressSibling = (id, parent) => ({
+  id,
+  parent,
+  message: {
+    id,
+    author: { role: 'assistant' },
+    create_time: 1.5,
+    status: 'in_progress',
+    content: { content_type: 'text', parts: ['仍在處理'] },
+    metadata: {},
+  },
+});
+const nullDalleAnswer = (id, parent) => ({
+  id,
+  parent,
+  message: {
+    id,
+    author: { role: 'assistant' },
+    create_time: 2,
+    end_turn: true,
+    status: 'finished_successfully',
+    content: { content_type: 'text', parts: ['已完成'] },
+    metadata: { dalle: null },
+  },
+});
+const makeData = (kind) => {
+  const mapping = {
+    u1: userNode('u1', null),
+    a1: textAnswer('a1', 'u1'),
+  };
+  if (kind === 'sibling_images') {
+    mapping.tool1 = imageSibling('tool1', 'u1', 'tool');
+    mapping.b1 = imageSibling('b1', 'u1', 'assistant');
+  }
+  if (kind === 'sibling_in_progress') {
+    mapping.b1 = inProgressSibling('b1', 'u1');
+  }
+  if (kind === 'null_dalle') {
+    mapping.a1 = nullDalleAnswer('a1', 'u1');
+  }
+  return { mapping, current_node: 'a1' };
+};
+const runProbe = async (kind) => {
+  const data = makeData(kind);
+  const context = {
+    window: {
+      location: { pathname: '/c/conv-backend-image' },
+      __ask_bridge_backend_token_v1: 'test-token',
+    },
+    fetch: async (url) => {
+      if (url !== '/backend-api/conversation/conv-backend-image') {
+        throw new Error(`unexpected fetch: ${url}`);
+      }
+      return { ok: true, status: 200, json: async () => data };
+    },
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    URL,
+  };
+  const probe = vm.runInNewContext(probeSource, context);
+  return await probe();
+};
+(async () => {
+  const results = {
+    user_image: await runProbe('user_image'),
+    sibling_images: await runProbe('sibling_images'),
+    sibling_in_progress: await runProbe('sibling_in_progress'),
+    null_dalle: await runProbe('null_dalle'),
+  };
+  console.log(JSON.stringify(results));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"#
+        .replace("__PROBE_SOURCE__", &probe_source);
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run ChatGPT backend mapping probe test");
+        assert!(
+            output.status.success(),
+            "node ChatGPT backend mapping probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("parse ChatGPT backend mapping probe output");
+        assert_eq!(
+            parsed["user_image"]["has_image_after_last_user"], false,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["user_image"]["has_in_progress_after_last_user"], false,
+            "parsed={parsed}"
+        );
+        assert_eq!(parsed["user_image"]["user_count"], 1, "parsed={parsed}");
+        assert_eq!(
+            parsed["user_image"]["answers_after_last_user"], 1,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["user_image"]["last_assistant_text"], "已完成",
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["sibling_images"]["has_image_after_last_user"], true,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["sibling_images"]["has_in_progress_after_last_user"], false,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["sibling_in_progress"]["has_in_progress_after_last_user"], true,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["sibling_in_progress"]["has_image_after_last_user"], false,
+            "parsed={parsed}"
+        );
+        assert_eq!(
+            parsed["null_dalle"]["has_image_after_last_user"], false,
+            "parsed={parsed}"
         );
     }
 
@@ -8368,6 +8816,128 @@ console.log(JSON.stringify(results));
         assert!(script.contains("uploading"));
         assert!(script.contains("has_error"));
         assert!(script.contains("same.md"));
+    }
+
+    #[test]
+    fn chatgpt_attachment_probes_exclude_image_chips_and_keep_document_fail_closed() {
+        let expected_documents = ["source-test.md".to_string()];
+        let baseline = AttachmentBaseline::default();
+        let baseline_script =
+            build_attachment_baseline_script(Provider::ChatGpt, &expected_documents).unwrap();
+        let typed_script = build_typed_attachment_probe_script_with_baseline(
+            Provider::ChatGpt,
+            &expected_documents,
+            &baseline,
+        )
+        .unwrap();
+        let scripts = serde_json::to_string(&serde_json::json!({
+            "baseline": baseline_script,
+            "typed": typed_script,
+        }))
+        .unwrap();
+        let js = r#"
+const vm = require('node:vm');
+const scripts = __SCRIPTS__;
+const makeImage = (src) => ({
+  currentSrc: src,
+  src,
+  complete: true,
+  naturalWidth: 512,
+  naturalHeight: 512,
+  getBoundingClientRect: () => ({ width: 50, height: 50 }),
+});
+const makeTile = (label, text = '', imgs = []) => ({
+  innerText: text,
+  textContent: text,
+  getAttribute: (name) => (name === 'aria-label' ? label : ''),
+  getBoundingClientRect: () => ({ width: 50, height: 50 }),
+  querySelector: (selector) => (selector === 'img' ? imgs[0] || null : null),
+  querySelectorAll: (selector) => (selector === 'img' ? imgs : []),
+  contains: () => false,
+});
+const makeTiles = (kind) => {
+  const tiles = [
+    makeTile('', 'source-test.md'),
+    makeTile('S01(20261124-032909).png', '', [makeImage('blob:https://chatgpt.com/S01')]),
+  ];
+  if (kind === 'pdf') {
+    tiles.push(makeTile('', 'unexpected.pdf', [makeImage('blob:https://chatgpt.com/unexpected-pdf')]));
+  }
+  if (kind === 'extra_png') {
+    tiles.push(makeTile('extra.png', '', [makeImage('blob:https://chatgpt.com/extra-png')]));
+  }
+  return tiles;
+};
+const runProbe = (source, kind) => {
+  const tiles = makeTiles(kind);
+  const root = {
+    querySelectorAll(selector) {
+      if (selector.includes('group/composer-attachment') || selector.includes('file-chip')) return tiles;
+      if (selector.includes('[data-testid*="image"]') || selector.includes('uploader-image-preview')) return tiles;
+      return [];
+    },
+  };
+  const composer = {
+    getBoundingClientRect: () => ({ width: 300, height: 80 }),
+    closest: () => root,
+    parentElement: root,
+  };
+  const document = {
+    body: {},
+    documentElement: {},
+    querySelector: () => composer,
+  };
+  return vm.runInNewContext(source, {
+    document,
+    window: {
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    },
+  })();
+};
+const results = {};
+for (const kind of ['clean', 'pdf', 'extra_png']) {
+  results[kind] = {
+    baseline: runProbe(scripts.baseline, kind),
+    typed: runProbe(scripts.typed, kind),
+  };
+}
+console.log(JSON.stringify(results));
+"#
+        .replace("__SCRIPTS__", &scripts);
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run ChatGPT attachment probe test");
+        assert!(
+            output.status.success(),
+            "node ChatGPT attachment probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("parse ChatGPT attachment probe output");
+        assert_eq!(
+            parsed["clean"]["baseline"]["document_counts"]["source-test.md"],
+            1
+        );
+        assert_eq!(parsed["clean"]["baseline"]["unmatched_doc_count"], 0);
+        assert_eq!(parsed["clean"]["baseline"]["image_count"], 1);
+        assert_eq!(parsed["clean"]["typed"]["document_count"], 1);
+        assert_eq!(parsed["clean"]["typed"]["missing_documents"], 0);
+        assert_eq!(parsed["clean"]["typed"]["unexpected_documents"], 0);
+        assert_eq!(parsed["clean"]["typed"]["image_count"], 1);
+        assert_eq!(parsed["clean"]["typed"]["image_loaded"], true);
+        assert_eq!(parsed["pdf"]["baseline"]["unmatched_doc_count"], 1);
+        assert_eq!(parsed["pdf"]["typed"]["document_count"], 1);
+        assert_eq!(parsed["pdf"]["typed"]["unexpected_documents"], 1);
+        assert_eq!(parsed["extra_png"]["typed"]["document_count"], 1);
+        assert_eq!(parsed["extra_png"]["typed"]["unexpected_documents"], 0);
+        assert_eq!(parsed["extra_png"]["typed"]["image_count"], 2);
+
+        let verify_source = shipped_function_source("verify_typed_attachment_completion");
+        assert!(verify_source.contains(
+            "Typed attachment verification timeout diagnostic: docs={} missing={} unexpected={} images={} loaded={} uploading={} error={}"
+        ));
     }
 
     #[test]
@@ -10511,6 +11081,33 @@ console.log(JSON.stringify({{ probe, verify }}));
     }
 
     #[test]
+    fn chatgpt_auth_failure_receipt_records_the_provider_specific_failure_code() {
+        let root = make_test_dir("chatgpt_auth_failed_receipt");
+        let path = root.join("receipt.json");
+        write_private_json(
+            &path,
+            &SessionReceipt::new_for_provider(Provider::ChatGpt, 1, 128, ExpectedOutputType::Image),
+        )
+        .unwrap();
+        record_auth_failed(&path, CHATGPT_AUTH_FAILURE_CODE).unwrap();
+        let receipt = read_session_receipt(&path).unwrap();
+        assert_eq!(receipt.provider.as_deref(), Some("chatgpt"));
+        assert_eq!(receipt.failure_stage.as_deref(), Some("auth"));
+        assert_eq!(
+            receipt.failure_code.as_deref(),
+            Some(CHATGPT_AUTH_FAILURE_CODE)
+        );
+        assert_eq!(
+            receipt.attachment_verification,
+            AttachmentVerification::Pending
+        );
+        assert_eq!(receipt.prompt_submission, PromptSubmission::NotStarted);
+        assert_eq!(receipt.response_completion, ResponseCompletion::Pending);
+        assert_eq!(receipt.downloaded_image_count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gemini_upload_and_download_contracts_forbid_legacy_fallbacks() {
         assert_eq!(
             document_upload_policy(Provider::Gemini),
@@ -12356,9 +12953,30 @@ __GEMINI_ATTACHMENT_PROJECTION_JS__
             el.innerText, el.textContent,
             el.getAttribute('aria-label'), el.getAttribute('title')
         ].filter(Boolean).join(' ').trim();
+        const matchesExpected = (text, name) => {
+            if (text.includes(name)) return true;
+            const dot = name.lastIndexOf('.');
+            if (dot < 0) return false;
+            const escape = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
+        };
+        const isImageOnlyTile = (candidate) => {
+            const text = textFor(candidate);
+            const hasNonAvatarImage = Array.from(candidate.querySelectorAll('img') || []).some((img) => {
+                const src = String(img.currentSrc || img.src || '');
+                return !/avatar|profile/i.test(src);
+            });
+            if (!hasNonAvatarImage) return false;
+            if (expectedNames.some((name) => matchesExpected(text, name))) return false;
+            const extensions = Array.from(text.matchAll(/\.([a-z0-9]{1,8})\b/gi), (match) => match[0]);
+            return extensions.length === 0 || extensions.every((extension) =>
+                /^\.(?:png|jpe?g|webp|gif|bmp|avif|heic|heif|tiff?)$/i.test(extension)
+            );
+        };
         const document_counts = {};
         let unmatched_doc_count = 0;
         for (const candidate of docCandidates) {
+            if (isImageOnlyTile(candidate)) continue;
             const text = textFor(candidate);
             const matches = expectedNames
                 .filter((name) => text.includes(name))
@@ -12903,13 +13521,23 @@ __GEMINI_ATTACHMENT_PROJECTION_JS__
             const escape = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             return new RegExp(escape(name.slice(0, dot)) + '\\((?:[1-9][0-9]*|[0-9]{8}-[0-9]{6})\\)' + escape(name.slice(dot))).test(text);
         };
+        const isImageOnlyTile = (candidate) => {
+            const text = textFor(candidate);
+            const hasNonAvatarImage = Array.from(candidate.querySelectorAll('img') || []).some((img) => {
+                const src = String(img.currentSrc || img.src || '');
+                return !/avatar|profile/i.test(src);
+            });
+            if (!hasNonAvatarImage) return false;
+            if (expectedNames.some((name) => matchesExpected(text, name))) return false;
+            const extensions = Array.from(text.matchAll(/\.([a-z0-9]{1,8})\b/gi), (match) => match[0]);
+            return extensions.length === 0 || extensions.every((extension) =>
+                /^\.(?:png|jpe?g|webp|gif|bmp|avif|heic|heif|tiff?)$/i.test(extension)
+            );
+        };
         const observedCounts = new Map();
         let unmatchedDocs = 0;
         for (const candidate of docCandidates) {
-            const hasOnlyImageChild = Boolean(candidate.querySelector('img'))
-                && !expectedNames.some((n) => matchesExpected(textFor(candidate), n))
-                && !/\.([a-z0-9]{1,8})\b/i.test(textFor(candidate));
-            if (hasOnlyImageChild) continue;
+            if (isImageOnlyTile(candidate)) continue;
             const text = textFor(candidate);
             const matches = Array.from(expectedCounts.keys())
                 .filter((name) => matchesExpected(text, name))
@@ -13086,6 +13714,18 @@ fn verify_typed_attachment_completion(
             .phase_timeout(verify_timeout, "typed attachment verification poll")
             .map_err(|_| ATTACHMENT_VERIFICATION_FAILURE_CODE.to_string())?;
         if remaining <= ATTACHMENT_VERIFY_POLL_INTERVAL {
+            if verbose {
+                println!(
+                    "Typed attachment verification timeout diagnostic: docs={} missing={} unexpected={} images={} loaded={} uploading={} error={}",
+                    probe.document_count,
+                    probe.missing_documents,
+                    probe.unexpected_documents,
+                    probe.image_count,
+                    u8::from(probe.image_loaded),
+                    u8::from(probe.uploading),
+                    u8::from(probe.provider_error)
+                );
+            }
             return Err(format!(
                 "{}:verification_timeout",
                 ATTACHMENT_VERIFICATION_FAILURE_CODE
@@ -16382,6 +17022,8 @@ __GEMINI_TURN_PROJECTION_JS__
             const latestText = contentNodes.map((node) => node.textContent || '').join('\n');
             const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i;
             const geminiRefusalPattern = /(?:身为一个语言模型|身為一個語言模型|作为一个语言模型|作為一個語言模型|(?:没|沒)办法提供这方面的(?:帮|幫)助|(?:沒|没)辦法提供這方面的(?:幫助|協助)|無法提供這方面的(?:協助|幫助)|(?:無法|不能|无法)(?:為你|为您|幫你|帮你)?(?:生成|建立|製作|制作|繪製|绘制)(?:這張|这张|此|該|该)?(?:圖|图)(?:片|像)|i(?:'m| am) (?:just )?a language model|as (?:an? )?(?:ai )?language model|i (?:can't|cannot) help with that|i (?:can't|cannot|am unable to) (?:generate|create) (?:that |this |an? )?image)/i;
+            const chatGptRefusalPattern = /(?:無法(?:為你|幫你)?(?:生成|建立|製作|繪製).*圖|違反.*內容政策|圖像生成失敗|圖片生成失敗|i (?:'m|am) (?:unable|not able) to (?:generate|create)|i (?:can't|cannot) (?:generate|create) (?:that |this |an? )?image|error (?:creating|generating) (?:the )?image|violates? our content polic|doesn't follow our content polic)/i;
+            const generationTransitionPattern = /(?:正在建立圖|正在生成圖|creating image|generating image|getting started)/i;
             const visibleProviderAlerts = Array.from(document.querySelectorAll('[role="alert"]'))
                 .filter(isVisibleControl)
                 .map((element) => String(element.innerText || element.textContent || '').trim())
@@ -16400,9 +17042,19 @@ __GEMINI_TURN_PROJECTION_JS__
                 && geminiRefusalPattern.test(normalizedLatestBody)
                 ? normalizedLatestBody
                 : '';
+            const latestChatGptRefusal = !isGemini
+                && loadedImages.length === 0
+                && !generationControlVisible
+                && normalizedLatestBody.length > 0
+                && normalizedLatestBody.length <= 400
+                && !normalizedLatestBody.startsWith('{')
+                && !generationTransitionPattern.test(normalizedLatestBody)
+                && chatGptRefusalPattern.test(normalizedLatestBody)
+                ? normalizedLatestBody
+                : '';
             const providerFailureText = visibleProviderAlerts
                 .filter((text) => providerFailurePattern.test(text))
-                .join('\n') || latestProviderFailure || latestGeminiRefusal;
+                .join('\n') || latestProviderFailure || latestGeminiRefusal || latestChatGptRefusal;
             const providerFailureVisible = Boolean(providerFailureText.trim());
             let providerUrlOwned = false;
             try {
@@ -16466,6 +17118,8 @@ fn build_backend_response_probe_script(provider: Provider) -> Result<String, Str
                 user_count: 0,
                 answer_count: 0,
                 answers_after_last_user: 0,
+                has_image_after_last_user: false,
+                has_in_progress_after_last_user: false,
                 last_assistant_id: '',
                 last_assistant_status: '',
                 last_assistant_text: ''
@@ -16514,18 +17168,19 @@ fn build_backend_response_probe_script(provider: Provider) -> Result<String, Str
                 }}
                 const data = await response.json();
                 const mapping = (data && data.mapping) || {{}};
-                const chain = [];
+                const chainNodes = [];
                 const seen = new Set();
                 let nodeId = data && data.current_node;
                 while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {{
                     seen.add(nodeId);
-                    chain.push(mapping[nodeId]);
+                    chainNodes.push({{ id: nodeId, node: mapping[nodeId] }});
                     nodeId = mapping[nodeId].parent;
                 }}
-                const messages = chain
-                    .filter((node) => node && node.message)
-                    .map((node) => node.message);
-                messages.sort((left, right) => (left.create_time || 0) - (right.create_time || 0));
+                const chainEntries = chainNodes
+                    .filter((entry) => entry.node && entry.node.message)
+                    .map((entry) => ({{ id: entry.id, message: entry.node.message }}));
+                chainEntries.sort((left, right) => (left.message.create_time || 0) - (right.message.create_time || 0));
+                const messages = chainEntries.map((entry) => entry.message);
                 const isUserPrompt = (message) => Boolean(
                     message.author
                     && message.author.role === 'user'
@@ -16541,11 +17196,60 @@ fn build_backend_response_probe_script(provider: Provider) -> Result<String, Str
                     && message.end_turn === true
                 );
                 let lastUserIndex = -1;
-                messages.forEach((message, index) => {{
-                    if (isUserPrompt(message)) {{
+                let lastUserNodeId = '';
+                chainEntries.forEach((entry, index) => {{
+                    if (isUserPrompt(entry.message)) {{
                         lastUserIndex = index;
+                        lastUserNodeId = entry.id;
                     }}
                 }});
+                if (lastUserNodeId) {{
+                    const isStrictDescendant = (candidateId, ancestorId) => {{
+                        const visited = new Set();
+                        let parentId = mapping[candidateId] && mapping[candidateId].parent;
+                        while (parentId && !visited.has(parentId)) {{
+                            if (parentId === ancestorId) return true;
+                            visited.add(parentId);
+                            parentId = mapping[parentId] && mapping[parentId].parent;
+                        }}
+                        return false;
+                    }};
+                    for (const [candidateId, node] of Object.entries(mapping)) {{
+                        if (!node || !node.message || candidateId === lastUserNodeId
+                            || !isStrictDescendant(candidateId, lastUserNodeId)) continue;
+                        const message = node.message;
+                        const role = message.author && message.author.role;
+                        if (role === 'user') continue;
+                        if (String(message.status || '') === 'in_progress') {{
+                            result.has_in_progress_after_last_user = true;
+                        }}
+                        const content = message.content || {{}};
+                        const metadata = message.metadata || {{}};
+                        const contentType = String(content.content_type || '').toLowerCase();
+                        const parts = Array.isArray(content.parts) ? content.parts : [];
+                        const hasImagePart = parts.some((part) => Boolean(
+                            part
+                            && typeof part === 'object'
+                            && (part.asset_pointer
+                                || part.image_url
+                                || String(part.content_type || '').toLowerCase().includes('image'))
+                        ));
+                        const attachments = Array.isArray(metadata.attachments)
+                            ? metadata.attachments
+                            : [];
+                        const hasImageAttachment = attachments.some((attachment) => Boolean(
+                            attachment
+                            && String(attachment.mime_type || '').toLowerCase().startsWith('image/')
+                        ));
+                        if (contentType === 'multimodal_text'
+                            || contentType.includes('image')
+                            || hasImagePart
+                            || Boolean(metadata.dalle)
+                            || hasImageAttachment) {{
+                            result.has_image_after_last_user = true;
+                        }}
+                    }}
+                }}
                 const answersAfterLastUser = messages.filter(
                     (message, index) => index > lastUserIndex && isAnswer(message)
                 );
@@ -18182,13 +18886,20 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     match check_login_status(&config_path, provider, command_verbose) {
         Ok(LoginState::LoggedIn) => {}
         Ok(LoginState::LoggedOut) => {
-            if provider == Provider::Gemini && safe_session_id.is_some() {
+            if matches!(provider, Provider::Gemini | Provider::ChatGpt) && safe_session_id.is_some()
+            {
+                let failure_code = if provider == Provider::Gemini {
+                    GEMINI_AUTH_FAILURE_CODE
+                } else {
+                    CHATGPT_AUTH_FAILURE_CODE
+                };
                 if let Some(path) = receipt_path.as_deref() {
-                    let _ = record_auth_failed(path, GEMINI_AUTH_FAILURE_CODE);
+                    let _ = record_auth_failed(path, failure_code);
                 }
                 eprintln!(
-                    "Error: {}: Gemini login state is logged_out.",
-                    GEMINI_AUTH_FAILURE_CODE
+                    "Error: {}: {} login state is logged_out.",
+                    failure_code,
+                    provider.display_name()
                 );
             } else {
                 eprintln!(
@@ -18415,17 +19126,18 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         response_baseline.initial_user_count,
         response_baseline.initial_assistant_count,
     );
-    // Text responses are harvested through ChatGPT's own conversation
-    // backend as well: long final answers render lazily in the client and
-    // never materialise in a background tab, so the DOM probe alone can
-    // wait forever even though the server already finished the answer.
-    let backend_probe_script =
-        if expected_output_type == ExpectedOutputType::Text && provider == Provider::ChatGpt {
-            Some(build_backend_response_probe_script(provider)?)
-        } else {
-            None
-        };
+    // ChatGPT's own conversation backend is authoritative for both rendered
+    // text and image turns.  It supplies long text that the background DOM
+    // never materialises, and it can prove that an image request finished as
+    // text-only without relying on a renderer.
+    let backend_probe_script = if provider == Provider::ChatGpt {
+        Some(build_backend_response_probe_script(provider)?)
+    } else {
+        None
+    };
     let mut backend_probe_tick: usize = 0;
+    let mut backend_image_text_only_id: Option<String> = None;
+    let mut backend_image_text_only_polls: usize = 0;
     let response_outcome = loop {
         if is_terminal {
             let frame = spinner_frames[spinner_idx % spinner_frames.len()];
@@ -18468,41 +19180,83 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         };
+        let dom_generating = probe.generation_control_visible;
+        let dom_loaded_images = probe.loaded_large_image_count;
         match response_tracker.observe(probe) {
             ResponseTrackerDecision::Pending => {}
             terminal => break response_wait_outcome(terminal),
         }
+        if expected_output_type == ExpectedOutputType::Image
+            && (dom_generating || dom_loaded_images > 0)
+        {
+            advance_backend_image_text_only_streak(
+                &mut backend_image_text_only_id,
+                &mut backend_image_text_only_polls,
+                false,
+                "",
+            );
+        }
 
         if let Some(backend_probe_script) = backend_probe_script.as_deref() {
             backend_probe_tick = backend_probe_tick.saturating_add(1);
-            if backend_probe_tick.is_multiple_of(BACKEND_RESPONSE_POLL_TICKS)
-                && let Ok(backend_probe) = fetch_backend_response_probe(
+            if backend_probe_tick.is_multiple_of(BACKEND_RESPONSE_POLL_TICKS) {
+                match fetch_backend_response_probe(
                     &config_path,
                     backend_probe_script,
                     Some(response_deadline),
-                )
-            {
-                match assess_backend_response_probe(
-                    &backend_probe,
-                    response_baseline.initial_user_count,
                 ) {
-                    BackendResponseDecision::Pending => {}
-                    BackendResponseDecision::Completed(text) => {
-                        break ResponseWaitOutcome::BackendText(text);
-                    }
-                    BackendResponseDecision::Unknown(code) => {
-                        if command_verbose {
-                            eprintln!(
-                                "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
-                                code,
-                                backend_probe.user_count,
-                                backend_probe.answer_count,
-                                backend_probe.answers_after_last_user,
-                                backend_probe.last_assistant_status
+                    Ok(backend_probe) if expected_output_type == ExpectedOutputType::Image => {
+                        let text_only_finished = is_backend_finished_text_without_image(
+                            &backend_probe,
+                            response_baseline.initial_user_count,
+                            dom_generating,
+                            dom_loaded_images,
+                        );
+                        advance_backend_image_text_only_streak(
+                            &mut backend_image_text_only_id,
+                            &mut backend_image_text_only_polls,
+                            text_only_finished,
+                            &backend_probe.last_assistant_id,
+                        );
+                        if backend_image_text_only_polls >= BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS {
+                            break ResponseWaitOutcome::Unknown(
+                                ResponseFailureCode::ProviderRejected,
                             );
                         }
-                        break ResponseWaitOutcome::Unknown(code);
                     }
+                    Ok(backend_probe) => {
+                        match assess_backend_response_probe(
+                            &backend_probe,
+                            response_baseline.initial_user_count,
+                        ) {
+                            BackendResponseDecision::Pending => {}
+                            BackendResponseDecision::Completed(text) => {
+                                break ResponseWaitOutcome::BackendText(text);
+                            }
+                            BackendResponseDecision::Unknown(code) => {
+                                if command_verbose {
+                                    eprintln!(
+                                        "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
+                                        code,
+                                        backend_probe.user_count,
+                                        backend_probe.answer_count,
+                                        backend_probe.answers_after_last_user,
+                                        backend_probe.last_assistant_status
+                                    );
+                                }
+                                break ResponseWaitOutcome::Unknown(code);
+                            }
+                        }
+                    }
+                    Err(_) if expected_output_type == ExpectedOutputType::Image => {
+                        advance_backend_image_text_only_streak(
+                            &mut backend_image_text_only_id,
+                            &mut backend_image_text_only_polls,
+                            false,
+                            "",
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
             // A failed backend poll is never terminal on its own: the
@@ -18672,7 +19426,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        if last_markdown.trim().is_empty()
+        if expected_output_type == ExpectedOutputType::Text
+            && last_markdown.trim().is_empty()
             && let Some(backend_probe_script) = backend_probe_script.as_deref()
             && let Ok(backend_probe) = fetch_backend_response_probe(
                 &config_path,
