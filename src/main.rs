@@ -256,12 +256,13 @@ const TURN_IDENTITY_JS: &str = r#"
             };
 "#;
 
-/// Cadence (in DOM-probe ticks) of the ChatGPT backend conversation probe
-/// used to harvest text responses.  The DOM probe runs at
-/// `RESPONSE_POLL_INTERVAL`; the backend probe is a full same-origin HTTP
-/// round-trip and only needs to run every few seconds.
+/// Cadence (in DOM-probe ticks) of the ChatGPT backend conversation probe.
+/// Text and image waits use separate cadences because image generation can
+/// stay active for minutes, while the DOM already exposes its completion and
+/// failure states.  The backend probe is a full same-origin HTTP round-trip.
 const BACKEND_RESPONSE_POLL_TICKS: usize = 4;
-const BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS: usize = 5;
+const BACKEND_IMAGE_RESPONSE_POLL_TICKS: usize = 20;
+const BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS: usize = 3;
 /// Abort a single backend conversation fetch after this long so one slow
 /// request can never stall the response wait loop.
 const BACKEND_RESPONSE_FETCH_TIMEOUT_MS: u64 = 10_000;
@@ -1261,6 +1262,26 @@ fn advance_backend_image_text_only_streak(
     } else {
         *last_assistant_id = Some(candidate_id.to_string());
         *polls = 1;
+    }
+}
+
+fn should_poll_backend_for_image(
+    dom_generating: bool,
+    dom_loaded_images: usize,
+    conversation_id: &str,
+) -> bool {
+    !dom_generating && dom_loaded_images == 0 && conversation_id.starts_with("conversation:")
+}
+
+fn is_backend_rate_limited_reason(reason: &str) -> bool {
+    matches!(reason, "conversation_http_429" | "session_http_429")
+}
+
+fn next_backend_429_backoff(consecutive_429: u32) -> Duration {
+    match consecutive_429 {
+        0 | 1 => Duration::from_secs(30),
+        2 => Duration::from_secs(60),
+        _ => Duration::from_secs(120),
     }
 }
 
@@ -6802,6 +6823,267 @@ console.log(JSON.stringify(results));
         }
     }
 
+    #[test]
+    fn chatgpt_response_probe_detects_turn_level_image_generation_failure_without_assistant_node() {
+        let script = build_response_probe_script(
+            Provider::ChatGpt,
+            &ResponseBaseline {
+                initial_user_count: 0,
+                initial_assistant_count: 0,
+                ownership_token: "response-token".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(script.contains("chatGptTurnFailurePattern"));
+        for failure_text in [
+            "圖像生成失敗",
+            "图像生成失败",
+            "image generation failed",
+            "failed to generate (?:an? )?image",
+            "something went wrong",
+            "出了點問題",
+            "出了点问题",
+        ] {
+            assert!(
+                script.contains(failure_text),
+                "missing failure text: {failure_text}"
+            );
+        }
+
+        let probe_source = serde_json::to_string(&script).unwrap();
+        let assistant_selector =
+            serde_json::to_string(Provider::ChatGpt.assistant_selector()).unwrap();
+        let user_selector = serde_json::to_string(Provider::ChatGpt.user_selector()).unwrap();
+        let js = r#"
+const vm = require('node:vm');
+const probeSource = __PROBE_SOURCE__;
+const assistantSelector = __ASSISTANT_SELECTOR__;
+const userSelector = __USER_SELECTOR__;
+const makeTurnNode = (text, turnKey, image) => {
+  const node = {
+    tagName: 'DIV',
+    textContent: text,
+    innerText: text,
+    innerHTML: text,
+    children: [],
+    childNodes: [],
+    classList: [],
+    getAttribute(name) {
+      if (name === 'data-turn-key') return turnKey;
+      if (name === 'data-turn-id') return `turn-${turnKey}`;
+      if (name === 'data-chatgpt-selection-message-id') return `message-${turnKey}`;
+      return '';
+    },
+    closest(selector) {
+      return selector === '[data-turn-key]' ? node : null;
+    },
+    querySelector() { return null; },
+    querySelectorAll(selector) {
+      return selector === 'img' && image ? [image] : [];
+    },
+    getBoundingClientRect: () => ({ width: 600, height: 100 }),
+  };
+  return node;
+};
+const makeChild = (text, boundary) => ({
+  innerText: text,
+  textContent: text,
+  matches() { return false; },
+  querySelector(selector) {
+    if (boundary === 'user' && selector.includes('user')) return {};
+    if (boundary === 'assistant'
+        && (selector.includes('assistant') || selector.includes('generated-image-gallery'))) {
+      return {};
+    }
+    return null;
+  },
+  getBoundingClientRect: () => ({ width: 600, height: 100 }),
+});
+const makeTurnRoot = (state, children) => ({
+  getAttribute(name) {
+    return name === 'data-talvt-turn-state' ? state : '';
+  },
+  children,
+});
+const makeProbe = ({ state, children, assistantText = '', image = null }) => {
+  const turnRoot = makeTurnRoot(state, children);
+  const user = makeTurnNode('make an image', 'user-turn');
+  const assistant = assistantText || image
+    ? makeTurnNode(assistantText, 'assistant-turn', image)
+    : null;
+  const document = {
+    querySelector: () => null,
+    querySelectorAll(selector) {
+      if (selector === '[data-talvt-turn-state]') return [turnRoot];
+      if (selector === assistantSelector) return assistant ? [assistant] : [];
+      if (selector === userSelector) return [user];
+      return [];
+    },
+  };
+  return vm.runInNewContext(probeSource, {
+    URL,
+    document,
+    window: {
+      location: {
+        origin: 'https://chatgpt.com',
+        pathname: '/c/conv-image-failed',
+        href: 'https://chatgpt.com/c/conv-image-failed',
+      },
+      document,
+      __ask_bridge_response_owner_v1: 'response-token',
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    },
+  })();
+};
+const image = {
+  complete: true,
+  naturalWidth: 512,
+  naturalHeight: 512,
+  currentSrc: 'https://chatgpt.com/generated-image.png',
+  src: 'https://chatgpt.com/generated-image.png',
+};
+const failureChildren = [
+  makeChild('make an image', 'user'),
+  makeChild('圖像生成失敗\n再試一次'),
+];
+const results = {
+  failure_zh: makeProbe({ state: 'complete', children: failureChildren }),
+  failure_en: makeProbe({
+    state: 'complete',
+    children: [makeChild('make an image', 'user'), makeChild('Image generation failed\nTry again')],
+  }),
+  injection: makeProbe({
+    state: 'complete',
+    children: [makeChild('圖像生成失敗\n再試一次', 'user'), makeChild('')],
+  }),
+  normal: makeProbe({
+    state: 'complete',
+    assistantText: '正常完成',
+    children: [makeChild('正常完成', 'assistant'), makeChild(''), makeChild('')],
+  }),
+  in_progress: makeProbe({ state: 'in_progress', children: failureChildren }),
+  loaded_image: makeProbe({
+    state: 'complete',
+    image,
+    children: failureChildren,
+  }),
+  transition: makeProbe({
+    state: 'complete',
+    children: [makeChild('make an image', 'user'), makeChild('正在建立圖像，error creating image')],
+  }),
+};
+console.log(JSON.stringify(results));
+"#
+        .replace("__PROBE_SOURCE__", &probe_source)
+        .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
+        .replace("__USER_SELECTOR__", &user_selector);
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(js)
+            .output()
+            .expect("run ChatGPT turn-level image failure probe test");
+        assert!(
+            output.status.success(),
+            "node ChatGPT turn-level image failure probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("parse ChatGPT turn-level image failure probe output");
+        for key in ["failure_zh", "failure_en"] {
+            assert_eq!(
+                parsed[key]["provider_failure_visible"], true,
+                "parsed={parsed}"
+            );
+            assert!(
+                parsed[key]["provider_failure_signature"]
+                    .as_str()
+                    .is_some_and(|signature| !signature.is_empty()),
+                "parsed={parsed}"
+            );
+            assert_eq!(parsed[key]["assistant_count"], 0, "parsed={parsed}");
+            assert_eq!(parsed[key]["user_count"], 1, "parsed={parsed}");
+            assert_eq!(
+                parsed[key]["loaded_large_image_count"], 0,
+                "parsed={parsed}"
+            );
+            assert_eq!(
+                parsed[key]["generation_control_visible"], false,
+                "parsed={parsed}"
+            );
+            assert_eq!(
+                parsed[key]["artifact_ids"].as_array().map(Vec::len),
+                Some(0),
+                "parsed={parsed}"
+            );
+        }
+        for key in [
+            "injection",
+            "normal",
+            "in_progress",
+            "loaded_image",
+            "transition",
+        ] {
+            assert_eq!(
+                parsed[key]["provider_failure_visible"], false,
+                "parsed={parsed}"
+            );
+        }
+
+        let failure_probe: ResponseDomProbe = serde_json::from_value(parsed["failure_zh"].clone())
+            .expect("deserialize turn-level image failure probe");
+        let mut tracker = ResponseCompletionTracker::new_for_provider(
+            Provider::ChatGpt,
+            ExpectedOutputType::Image,
+            0,
+            0,
+        );
+        assert_eq!(
+            tracker.observe(failure_probe.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(failure_probe.clone()),
+            ResponseTrackerDecision::Pending
+        );
+        assert_eq!(
+            tracker.observe(failure_probe),
+            ResponseTrackerDecision::Unknown(ResponseFailureCode::ProviderRejected)
+        );
+    }
+
+    #[test]
+    fn backend_polling_suppresses_active_image_generation_and_backs_off_on_http_429() {
+        assert_eq!(BACKEND_RESPONSE_POLL_TICKS, 4);
+        assert_eq!(BACKEND_IMAGE_RESPONSE_POLL_TICKS, 20);
+        assert_eq!(BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS, 3);
+        assert!(should_poll_backend_for_image(
+            false,
+            0,
+            "conversation:conv-image"
+        ));
+        assert!(!should_poll_backend_for_image(
+            true,
+            0,
+            "conversation:conv-image"
+        ));
+        assert!(!should_poll_backend_for_image(
+            false,
+            1,
+            "conversation:conv-image"
+        ));
+        assert!(!should_poll_backend_for_image(false, 0, "home:chatgpt.com"));
+
+        assert!(is_backend_rate_limited_reason("conversation_http_429"));
+        assert!(is_backend_rate_limited_reason("session_http_429"));
+        for reason in ["conversation_http_404", "session_http_500", ""] {
+            assert!(!is_backend_rate_limited_reason(reason));
+        }
+        assert_eq!(next_backend_429_backoff(1), Duration::from_secs(30));
+        assert_eq!(next_backend_429_backoff(2), Duration::from_secs(60));
+        assert_eq!(next_backend_429_backoff(3), Duration::from_secs(120));
+        assert_eq!(next_backend_429_backoff(4), Duration::from_secs(120));
+    }
+
     /// Shipped source of one top-level function, resolved by bare name and a
     /// leading newline so no string literal inside this test module can shadow
     /// the real definition.  The response baseline and the image download
@@ -8196,7 +8478,7 @@ console.log(JSON.stringify(results));
         assert!(is_backend_finished_text_without_image(
             &finished, 0, false, 0
         ));
-        assert_eq!(BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS, 5);
+        assert_eq!(BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS, 3);
         for probe in [
             BackendResponseProbe {
                 ok: false,
@@ -17013,8 +17295,11 @@ __GEMINI_TURN_PROJECTION_JS__
             // answer is complete. The stop button can disappear before the last
             // tokens render, so the turn state is part of the same signal.
             const turnStates = isGemini ? [] : document.querySelectorAll('[data-talvt-turn-state]');
-            const latestTurnState = turnStates.length > 0
-                ? turnStates[turnStates.length - 1].getAttribute('data-talvt-turn-state')
+            const latestTurnRoot = turnStates.length > 0
+                ? turnStates[turnStates.length - 1]
+                : null;
+            const latestTurnState = latestTurnRoot
+                ? latestTurnRoot.getAttribute('data-talvt-turn-state')
                 : '';
             const generationControlVisible = isGemini
                 ? isGeminiGenerating(document, latestGroup, stopSelectors, isVisibleControl)
@@ -17022,8 +17307,11 @@ __GEMINI_TURN_PROJECTION_JS__
             const latestText = contentNodes.map((node) => node.textContent || '').join('\n');
             const providerFailurePattern = /(?:你提交的訊息太長|訊息太長|消息過長|message\s+(?:is\s+)?too\s+long|prompt\s+(?:is\s+)?too\s+long|content policy|內容政策|too many requests|太多要求|temporarily limited|暫時限制)/i;
             const geminiRefusalPattern = /(?:身为一个语言模型|身為一個語言模型|作为一个语言模型|作為一個語言模型|(?:没|沒)办法提供这方面的(?:帮|幫)助|(?:沒|没)辦法提供這方面的(?:幫助|協助)|無法提供這方面的(?:協助|幫助)|(?:無法|不能|无法)(?:為你|为您|幫你|帮你)?(?:生成|建立|製作|制作|繪製|绘制)(?:這張|这张|此|該|该)?(?:圖|图)(?:片|像)|i(?:'m| am) (?:just )?a language model|as (?:an? )?(?:ai )?language model|i (?:can't|cannot) help with that|i (?:can't|cannot|am unable to) (?:generate|create) (?:that |this |an? )?image)/i;
-            const chatGptRefusalPattern = /(?:無法(?:為你|幫你)?(?:生成|建立|製作|繪製).*圖|違反.*內容政策|圖像生成失敗|圖片生成失敗|i (?:'m|am) (?:unable|not able) to (?:generate|create)|i (?:can't|cannot) (?:generate|create) (?:that |this |an? )?image|error (?:creating|generating) (?:the )?image|violates? our content polic|doesn't follow our content polic)/i;
+            const chatGptTurnFailurePattern = /(?:圖像生成失敗|圖片生成失敗|图像生成失败|图片生成失败|image generation failed|failed to generate (?:an? )?image|error (?:creating|generating) (?:the )?image|unable to generate (?:that |this |an? )?image|couldn't generate (?:that |this |an? )?image|something went wrong|發生錯誤|发生错误|出了點問題|出了点问题)/i;
+            const chatGptRefusalPattern = /(?:無法(?:為你|幫你)?(?:生成|建立|製作|繪製).*圖|違反.*內容政策|圖像生成失敗|圖片生成失敗|图像生成失败|图片生成失败|image generation failed|failed to generate (?:an? )?image|error (?:creating|generating) (?:the )?image|unable to generate (?:that |this |an? )?image|couldn't generate (?:that |this |an? )?image|something went wrong|發生錯誤|发生错误|出了點問題|出了点问题|i (?:'m|am) (?:unable|not able) to (?:generate|create)|i (?:can't|cannot) (?:generate|create) (?:that |this |an? )?image|violates? our content polic|doesn't follow our content polic)/i;
             const generationTransitionPattern = /(?:正在建立圖|正在生成圖|creating image|generating image|getting started)/i;
+            const turnUserBoundary = '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"], [data-conversation-role="user"]';
+            const turnAssistantBoundary = '[data-chatgpt-search-unit-key$=":assistant"], [data-message-author-role="assistant"], [data-conversation-role="assistant"], [data-testid="generated-image-gallery"]';
             const visibleProviderAlerts = Array.from(document.querySelectorAll('[role="alert"]'))
                 .filter(isVisibleControl)
                 .map((element) => String(element.innerText || element.textContent || '').trim())
@@ -17052,9 +17340,27 @@ __GEMINI_TURN_PROJECTION_JS__
                 && chatGptRefusalPattern.test(normalizedLatestBody)
                 ? normalizedLatestBody
                 : '';
+            const latestChatGptTurnFailure = !isGemini
+                && latestTurnRoot
+                && latestTurnState === 'complete'
+                && loadedImages.length === 0
+                && !generationControlVisible
+                ? Array.from(latestTurnRoot.children || [])
+                    .filter(isVisibleControl)
+                    .filter((child) => !(child.matches?.(turnUserBoundary)
+                        || child.querySelector?.(turnUserBoundary)
+                        || child.matches?.(turnAssistantBoundary)
+                        || child.querySelector?.(turnAssistantBoundary)))
+                    .map((child) => String(child.innerText || child.textContent || '').trim())
+                    .find((text) => text.length > 0
+                        && text.length <= 400
+                        && !text.startsWith('{')
+                        && !generationTransitionPattern.test(text)
+                        && chatGptTurnFailurePattern.test(text)) || ''
+                : '';
             const providerFailureText = visibleProviderAlerts
                 .filter((text) => providerFailurePattern.test(text))
-                .join('\n') || latestProviderFailure || latestGeminiRefusal || latestChatGptRefusal;
+                .join('\n') || latestProviderFailure || latestGeminiRefusal || latestChatGptRefusal || latestChatGptTurnFailure;
             const providerFailureVisible = Boolean(providerFailureText.trim());
             let providerUrlOwned = false;
             try {
@@ -19138,6 +19444,8 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let mut backend_probe_tick: usize = 0;
     let mut backend_image_text_only_id: Option<String> = None;
     let mut backend_image_text_only_polls: usize = 0;
+    let mut backend_429_consecutive: u32 = 0;
+    let mut backend_429_backoff_until: Option<Instant> = None;
     let response_outcome = loop {
         if is_terminal {
             let frame = spinner_frames[spinner_idx % spinner_frames.len()];
@@ -19182,6 +19490,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         };
         let dom_generating = probe.generation_control_visible;
         let dom_loaded_images = probe.loaded_large_image_count;
+        let dom_conversation_id = probe.conversation_id.clone();
         match response_tracker.observe(probe) {
             ResponseTrackerDecision::Pending => {}
             terminal => break response_wait_outcome(terminal),
@@ -19196,67 +19505,116 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 "",
             );
         }
+        let backend_poll_allowed = expected_output_type != ExpectedOutputType::Image
+            || should_poll_backend_for_image(
+                dom_generating,
+                dom_loaded_images,
+                &dom_conversation_id,
+            );
+        if expected_output_type == ExpectedOutputType::Image && !backend_poll_allowed {
+            backend_probe_tick = 0;
+        }
 
         if let Some(backend_probe_script) = backend_probe_script.as_deref() {
-            backend_probe_tick = backend_probe_tick.saturating_add(1);
-            if backend_probe_tick.is_multiple_of(BACKEND_RESPONSE_POLL_TICKS) {
-                match fetch_backend_response_probe(
-                    &config_path,
-                    backend_probe_script,
-                    Some(response_deadline),
-                ) {
-                    Ok(backend_probe) if expected_output_type == ExpectedOutputType::Image => {
-                        let text_only_finished = is_backend_finished_text_without_image(
-                            &backend_probe,
-                            response_baseline.initial_user_count,
-                            dom_generating,
-                            dom_loaded_images,
-                        );
-                        advance_backend_image_text_only_streak(
-                            &mut backend_image_text_only_id,
-                            &mut backend_image_text_only_polls,
-                            text_only_finished,
-                            &backend_probe.last_assistant_id,
-                        );
-                        if backend_image_text_only_polls >= BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS {
-                            break ResponseWaitOutcome::Unknown(
-                                ResponseFailureCode::ProviderRejected,
-                            );
-                        }
-                    }
-                    Ok(backend_probe) => {
-                        match assess_backend_response_probe(
-                            &backend_probe,
-                            response_baseline.initial_user_count,
-                        ) {
-                            BackendResponseDecision::Pending => {}
-                            BackendResponseDecision::Completed(text) => {
-                                break ResponseWaitOutcome::BackendText(text);
+            if backend_poll_allowed {
+                backend_probe_tick = backend_probe_tick.saturating_add(1);
+                let backend_poll_ticks = if expected_output_type == ExpectedOutputType::Image {
+                    BACKEND_IMAGE_RESPONSE_POLL_TICKS
+                } else {
+                    BACKEND_RESPONSE_POLL_TICKS
+                };
+                let in_429_backoff =
+                    backend_429_backoff_until.is_some_and(|until| Instant::now() < until);
+                if backend_probe_tick.is_multiple_of(backend_poll_ticks) && !in_429_backoff {
+                    backend_429_backoff_until = None;
+                    match fetch_backend_response_probe(
+                        &config_path,
+                        backend_probe_script,
+                        Some(response_deadline),
+                    ) {
+                        Ok(backend_probe)
+                            if !backend_probe.ok
+                                && is_backend_rate_limited_reason(&backend_probe.reason) =>
+                        {
+                            backend_429_consecutive = backend_429_consecutive.saturating_add(1);
+                            let backoff = next_backend_429_backoff(backend_429_consecutive);
+                            backend_429_backoff_until = Some(Instant::now() + backoff);
+                            if command_verbose {
+                                eprintln!(
+                                    "Backend response probe rate limited; consecutive={} backoff_seconds={}",
+                                    backend_429_consecutive,
+                                    backoff.as_secs()
+                                );
                             }
-                            BackendResponseDecision::Unknown(code) => {
-                                if command_verbose {
-                                    eprintln!(
-                                        "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
-                                        code,
-                                        backend_probe.user_count,
-                                        backend_probe.answer_count,
-                                        backend_probe.answers_after_last_user,
-                                        backend_probe.last_assistant_status
+                            if expected_output_type == ExpectedOutputType::Image {
+                                advance_backend_image_text_only_streak(
+                                    &mut backend_image_text_only_id,
+                                    &mut backend_image_text_only_polls,
+                                    false,
+                                    "",
+                                );
+                            }
+                        }
+                        Ok(backend_probe) => {
+                            if backend_probe.ok {
+                                backend_429_consecutive = 0;
+                                backend_429_backoff_until = None;
+                            }
+                            if expected_output_type == ExpectedOutputType::Image {
+                                let text_only_finished = is_backend_finished_text_without_image(
+                                    &backend_probe,
+                                    response_baseline.initial_user_count,
+                                    dom_generating,
+                                    dom_loaded_images,
+                                );
+                                advance_backend_image_text_only_streak(
+                                    &mut backend_image_text_only_id,
+                                    &mut backend_image_text_only_polls,
+                                    text_only_finished,
+                                    &backend_probe.last_assistant_id,
+                                );
+                                if backend_image_text_only_polls
+                                    >= BACKEND_IMAGE_TEXT_ONLY_REQUIRED_POLLS
+                                {
+                                    break ResponseWaitOutcome::Unknown(
+                                        ResponseFailureCode::ProviderRejected,
                                     );
                                 }
-                                break ResponseWaitOutcome::Unknown(code);
+                            } else {
+                                match assess_backend_response_probe(
+                                    &backend_probe,
+                                    response_baseline.initial_user_count,
+                                ) {
+                                    BackendResponseDecision::Pending => {}
+                                    BackendResponseDecision::Completed(text) => {
+                                        break ResponseWaitOutcome::BackendText(text);
+                                    }
+                                    BackendResponseDecision::Unknown(code) => {
+                                        if command_verbose {
+                                            eprintln!(
+                                                "Backend response probe failed closed: code={} user_count={} answers={} answers_after_last_user={} last_status={}",
+                                                code,
+                                                backend_probe.user_count,
+                                                backend_probe.answer_count,
+                                                backend_probe.answers_after_last_user,
+                                                backend_probe.last_assistant_status
+                                            );
+                                        }
+                                        break ResponseWaitOutcome::Unknown(code);
+                                    }
+                                }
                             }
                         }
+                        Err(_) if expected_output_type == ExpectedOutputType::Image => {
+                            advance_backend_image_text_only_streak(
+                                &mut backend_image_text_only_id,
+                                &mut backend_image_text_only_polls,
+                                false,
+                                "",
+                            );
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) if expected_output_type == ExpectedOutputType::Image => {
-                        advance_backend_image_text_only_streak(
-                            &mut backend_image_text_only_id,
-                            &mut backend_image_text_only_polls,
-                            false,
-                            "",
-                        );
-                    }
-                    Err(_) => {}
                 }
             }
             // A failed backend poll is never terminal on its own: the
